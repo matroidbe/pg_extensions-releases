@@ -1,0 +1,11 @@
+# Python test dependencies for pg_kafka protocol compatibility tests
+#
+# Install with: pip install -r requirements.txt
+# Run tests with: pytest -v
+
+# kafka-python-ng is the maintained fork for Python 3.12+
+# Original kafka-python is unmaintained since 2020
+kafka-python-ng>=2.2.0
+
+# Test framework
+pytest>=7.0.0

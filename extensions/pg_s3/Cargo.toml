@@ -1,0 +1,42 @@
+[package]
+name = "pg_s3"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "S3-compatible object storage with metadata in PostgreSQL and binary content on disk"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_s3"
+path = "src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg16"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "pg_spi/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "pg_spi/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "pg_spi/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "pg_spi/pg17"]
+pg_test = []
+
+[dependencies]
+pgrx.workspace = true
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time", "fs"] }
+thiserror.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid = { version = "1", features = ["v4"] }
+socket2 = { version = "0.5", features = ["all"] }
+pg_spi = { git = "https://github.com/matroidbe/pg_extensions", default-features = false }
+
+[dev-dependencies]
+pgrx-tests = "0.16"
+tokio-postgres.workspace = true
+aws-sdk-s3 = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

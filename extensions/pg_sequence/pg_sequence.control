@@ -1,0 +1,6 @@
+comment = 'ERP document numbering with formatted, scoped, auto-incrementing sequences'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_sequence'
+relocatable = false
+superuser = false
+schema = pgsequence

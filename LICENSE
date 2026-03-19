@@ -1,0 +1,133 @@
+Matroid Source Available License v1.0
+
+Copyright (c) 2025 Matroid BVBA. All rights reserved.
+
+Acceptance
+
+By using the Software, you agree to all of the terms and conditions below.
+
+Copyright License
+
+The Licensor grants you a non-exclusive, royalty-free, worldwide,
+non-sublicensable, non-transferable license to use, copy, distribute,
+make available, and prepare derivative works of the Software, in each
+case subject to the limitations below.
+
+Limitations
+
+You may use the Software only for Internal Use without a separate
+commercial license from the Licensor.
+
+"Internal Use" means using the Software solely to operate your own
+business processes, manage your own data, and support your own
+operations — where you are the primary beneficiary of the Software's
+functionality and you are not making the Software's functionality
+available to third parties in any form.
+
+Any use beyond Internal Use constitutes a "Commercial Use" and requires
+a commercial license. Commercial Use includes, but is not limited to:
+
+(a) Providing the Software to third parties as a hosted or managed
+    service, including as part of a database-as-a-service or
+    platform-as-a-service offering.
+
+(b) Embedding or incorporating the Software into a software product,
+    application, or platform that is sold, licensed, or offered as a
+    service to third parties.
+
+(c) Using the Software to provide outsourced business process services
+    (such as ERP, accounting, manufacturing, or warehouse management)
+    to third parties on a subscription, consumption, or fee basis.
+
+(d) Redistributing the Software or derivative works as part of a
+    commercial product or offering.
+
+For the avoidance of doubt: a consulting firm may deploy and configure
+the Software on behalf of a client, provided the client holds the
+installation and the client's own use qualifies as Internal Use.
+
+For commercial licensing inquiries, contact the Licensor.
+
+You may not alter, remove, or obscure any licensing, copyright, or other
+notices of the Licensor in the Software. Any use of the Licensor's
+trademarks is subject to applicable law.
+
+Intellectual Property
+
+All intellectual property rights in and to the Software, including
+patents, copyrights, trademarks, and trade secrets, are and shall remain
+the exclusive property of Matroid BVBA.
+
+Contributions
+
+By submitting any contribution to this project, you irrevocably assign
+all intellectual property rights in your contribution to Matroid BVBA.
+You represent that you have the legal right to make such assignment.
+Matroid BVBA may use, modify, sublicense, and distribute your contribution
+under any terms. You waive any moral rights in your contribution to the
+extent permitted by applicable law.
+
+Patents
+
+The Licensor grants you a license, under any patent claims the Licensor
+can license or becomes able to license, to make, have made, use, sell,
+offer for sale, import and have imported the Software, in each case
+subject to the limitations and conditions in this License. This license
+does not cover any patent claims that you cause to be infringed by
+modifications or additions to the Software. If you or your company make
+any written claim that the Software infringes or contributes to
+infringement of any patent, your patent license for the Software granted
+under these terms ends immediately.
+
+Notices
+
+You must ensure that anyone who gets a copy of any part of the Software
+from you also gets a copy of these terms.
+
+If you modify the Software, you must include in any modified copies of
+the Software prominent notices stating that you have modified the Software.
+
+No Other Rights
+
+These terms do not imply any licenses other than those expressly granted
+in these terms.
+
+Termination
+
+If you use the Software in violation of these terms, such use is not
+licensed, and your licenses will automatically terminate. If the Licensor
+provides you with a notice of your violation, and you cease all violation
+of this License no later than 30 days after you receive that notice, your
+licenses will be reinstated retroactively. However, if you violate these
+terms after such reinstatement, any additional violation of these terms
+will cause your licenses to terminate automatically and permanently.
+
+No Liability
+
+AS FAR AS THE LAW ALLOWS, THE SOFTWARE COMES AS IS, WITHOUT ANY WARRANTY
+OR CONDITION, AND THE LICENSOR WILL NOT BE LIABLE TO YOU FOR ANY DAMAGES
+ARISING OUT OF THESE TERMS OR THE USE OR NATURE OF THE SOFTWARE, UNDER
+ANY KIND OF LEGAL CLAIM.
+
+Definitions
+
+The "Licensor" is Matroid BVBA.
+
+The "Software" means the pg_extensions project and all PostgreSQL
+extensions, source code, documentation, and related materials made
+available by the Licensor under these terms.
+
+A "contribution" means any code, documentation, or other material
+submitted to the Licensor for inclusion in the Software, whether via
+pull request, patch, email, or any other method.
+
+Governing Law
+
+This License shall be governed by and construed in accordance with the
+laws of Belgium.
+
+---
+
+Contact
+
+For commercial licensing inquiries: tom@matroid.be

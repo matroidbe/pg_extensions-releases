@@ -1,0 +1,6 @@
+comment = 'S3-compatible object storage with metadata in PostgreSQL and binary on disk'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_s3'
+relocatable = false
+superuser = true
+schema = pgs3

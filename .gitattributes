@@ -1,0 +1,18 @@
+# Internal tooling — excluded from git archive / release exports
+.claude/                export-ignore
+.githooks/              export-ignore
+.planning/              export-ignore
+.github/                export-ignore
+ideas/                  export-ignore
+design/                 export-ignore
+CLAUDE.md               export-ignore
+PUBLISH.md              export-ignore
+executed.md             export-ignore
+scripts/                export-ignore
+
+# Dev-machine config — contains local paths and tooling (mold, sccache)
+.vscode/                export-ignore
+.cargo/                 export-ignore
+
+# Extension-level internal files
+**/test.sh              export-ignore

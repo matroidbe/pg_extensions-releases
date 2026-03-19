@@ -1,0 +1,22 @@
+[package]
+name = "pg_observability"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared observability infrastructure for PostgreSQL extensions"
+
+[features]
+# Empty features for workspace compatibility with pgrx extensions
+pg14 = []
+pg15 = []
+pg16 = []
+pg17 = []
+pg18 = []
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

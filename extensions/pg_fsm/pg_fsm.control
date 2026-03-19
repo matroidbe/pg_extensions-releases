@@ -1,0 +1,6 @@
+comment = 'Transactional finite state machine for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_fsm'
+relocatable = false
+superuser = false
+schema = pgfsm

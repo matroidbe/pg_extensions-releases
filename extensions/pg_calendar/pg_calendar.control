@@ -1,0 +1,6 @@
+comment = 'Working calendar with culture-specific working days, holidays, and exceptions'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_calendar'
+relocatable = false
+superuser = false
+schema = pgcalendar

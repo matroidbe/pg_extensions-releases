@@ -1,0 +1,6 @@
+comment = 'Schema registry for PostgreSQL extensions with JSON Schema support'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_registry'
+relocatable = false
+superuser = true
+schema = pgregistry

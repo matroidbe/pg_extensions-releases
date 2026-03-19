@@ -1,0 +1,79 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');
+FILE_NAME('minimal_building.ifc','2024-01-01T00:00:00',('Test'),('Test'),'','','');
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+
+/* --- Units & Context --- */
+#1=IFCPROJECT('0001_PROJECT__GUID',#2,'TestProject',$,$,$,$,(#16),#9);
+#2=IFCOWNERHISTORY(#3,#6,$,.NOCHANGE.,$,$,$,0);
+#3=IFCPERSONANDORGANIZATION(#4,#5,$);
+#4=IFCPERSON($,'Doe','John',$,$,$,$,$);
+#5=IFCORGANIZATION($,'Test Org',$,$,$);
+#6=IFCAPPLICATION(#5,'1.0','TestApp','TestApp');
+
+/* SI Units */
+#7=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#8=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.);
+#9=IFCUNITASSIGNMENT((#7,#8));
+
+/* Geometric Context */
+#10=IFCCARTESIANPOINT((0.,0.,0.));
+#11=IFCDIRECTION((0.,0.,1.));
+#12=IFCDIRECTION((1.,0.,0.));
+#13=IFCAXIS2PLACEMENT3D(#10,#11,#12);
+#14=IFCDIRECTION((0.,1.));
+#15=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.0E-5,#13,#14);
+#16=IFCGEOMETRICREPRESENTATIONSUBCONTEXT('Body','Model',*,*,*,*,#15,$,.MODEL_VIEW.,$);
+
+/* --- Spatial Structure --- */
+#20=IFCSITE('0002_SITE_____GUID',#2,'TestSite',$,$,#21,$,$,.ELEMENT.,$,$,$,$,$);
+#21=IFCLOCALPLACEMENT($,#13);
+#22=IFCBUILDING('0003_BUILDING_GUID',#2,'TestBuilding',$,$,#23,$,$,.ELEMENT.,$,$,$);
+#23=IFCLOCALPLACEMENT(#21,#13);
+#24=IFCBUILDINGSTOREY('0004_STOREY__GUID',#2,'Ground Floor',$,$,#25,$,$,.ELEMENT.,0.0);
+#25=IFCLOCALPLACEMENT(#23,#13);
+
+/* Aggregation: Project -> Site -> Building -> Storey */
+#30=IFCRELAGGREGATES('0010_RELAGG01_GUID',#2,$,$,#1,(#20));
+#31=IFCRELAGGREGATES('0011_RELAGG02_GUID',#2,$,$,#20,(#22));
+#32=IFCRELAGGREGATES('0012_RELAGG03_GUID',#2,$,$,#22,(#24));
+
+/* --- Wall with Extruded Area Solid --- */
+/* Profile: Rectangle 6000 x 200 mm */
+#40=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,6.0,0.2);
+
+/* Extrusion direction (Z-up) and depth 3000mm = 3.0m */
+#41=IFCDIRECTION((0.,0.,1.));
+#42=IFCEXTRUDEDAREASOLID(#40,$,#41,3.0);
+
+/* Shape representation */
+#43=IFCSHAPEREPRESENTATION(#16,'Body','SweptSolid',(#42));
+#44=IFCPRODUCTDEFINITIONSHAPE($,$,(#43));
+
+/* Wall placement */
+#45=IFCCARTESIANPOINT((10.,0.,0.));
+#46=IFCAXIS2PLACEMENT3D(#45,#11,#12);
+#47=IFCLOCALPLACEMENT(#25,#46);
+
+/* The wall itself */
+#50=IFCWALL('0005_WALL_____GUID',#2,'Wall-01','A test wall',$,#47,#44,$);
+
+/* Containment: Storey contains Wall */
+#60=IFCRELCONTAINEDINSPATIALSTRUCTURE('0020_RELCONT__GUID',#2,$,$,(#50),#24);
+
+/* --- Property Set --- */
+#70=IFCPROPERTYSINGLEVALUE('FireRating',$,IFCLABEL('2HR'),$);
+#71=IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);
+#72=IFCPROPERTYSINGLEVALUE('ThermalTransmittance',$,IFCREAL(0.25),$);
+#73=IFCPROPERTYSET('0030_PSET_____GUID',#2,'Pset_WallCommon',$,(#70,#71,#72));
+#74=IFCRELDEFINESBYPROPERTIES('0031_RELDEFP__GUID',#2,$,$,(#50),#73);
+
+/* --- Material --- */
+#80=IFCMATERIAL('Concrete');
+#81=IFCRELASSOCIATESMATERIAL('0040_RELMAT___GUID',#2,$,$,(#50),#80);
+
+ENDSEC;
+END-ISO-10303-21;

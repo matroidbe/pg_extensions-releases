@@ -1,0 +1,45 @@
+# =============================================================================
+# Docker Compose for TechMart Retail Forecasting Example
+# =============================================================================
+#
+# Usage:
+#   docker compose up -d              # Start PostgreSQL with extensions
+#   docker compose logs -f postgres   # View logs
+#   docker compose exec postgres psql -U postgres  # Connect to database
+#   docker compose down -v            # Stop and remove volumes
+#
+# After startup, copy/paste SQL from retail-forecasting.sqlbook
+# or open it in VS Code and run cells directly.
+#
+# =============================================================================
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PG_VERSION: "16"
+    image: retail-forecasting:latest
+    container_name: retail-forecasting
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Mount schema.yaml for reference
+      - ./schema.yaml:/docker-entrypoint-initdb.d/schema.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    driver: local

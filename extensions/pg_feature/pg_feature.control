@@ -1,0 +1,6 @@
+comment = 'pg_feature: Automated feature engineering for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_feature'
+schema = 'pgft'
+relocatable = false
+superuser = false

@@ -1,0 +1,17 @@
+[project]
+name = "pg_ml"
+version = "0.1.0"
+description = "Python dependencies for pg_ml PostgreSQL extension"
+requires-python = ">=3.11,<3.13"  # Pin to 3.11-3.12 for PyCaret/catboost compatibility
+dependencies = [
+    "pycaret[full]>=3.3.0",
+    "mlflow>=2.0,<2.10",  # Pin to 2.9.x for PyCaret 3.3 compatibility (2.10+ breaks _active_run_stack)
+    "mapie>=0.8.0",  # Conformal prediction for prediction intervals
+    "dask<2025",  # Pin to 2024.x; dask 2025+ removed dask.dataframe.core.DataFrame which sktime 0.26 needs
+    "setuptools<81",  # PyCaret 3.3 uses distutils via setuptools; 81+ removes pkg_resources/distutils shim
+]
+
+[tool.uv]
+# Only resolve for Linux since pg_ml is a PostgreSQL extension (Linux-only in production)
+environments = ["sys_platform == 'linux'"]
+

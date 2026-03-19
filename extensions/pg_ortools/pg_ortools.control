@@ -1,0 +1,6 @@
+comment = 'Constraint optimization using HiGHS MIP solver with async background worker'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_ortools'
+relocatable = false
+superuser = false
+schema = pgortools

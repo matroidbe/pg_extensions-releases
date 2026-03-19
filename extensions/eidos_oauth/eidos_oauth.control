@@ -1,0 +1,6 @@
+comment = 'OAuth 2.0 JWT validator module for PostgreSQL 18'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/eidos_oauth'
+relocatable = false
+superuser = true
+schema = eidos_oauth

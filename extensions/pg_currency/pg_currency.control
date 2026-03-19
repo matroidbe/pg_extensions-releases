@@ -1,0 +1,6 @@
+comment = 'Multi-currency exchange rates with base-relative triangulation for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_currency'
+relocatable = false
+superuser = false
+schema = pgcurrency

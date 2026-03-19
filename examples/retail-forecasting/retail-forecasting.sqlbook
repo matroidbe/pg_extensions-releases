@@ -1,0 +1,1190 @@
+-- SQLBook: Code
+-- Active: 1767444812203@@127.0.0.1@5432@postgres
+-- Active: 1767444812203@@127.0.0.1@5432@postgres@public
+-- ============================================================================
+-- TechMart Retail Forecasting with Uncertainty
+-- ============================================================================
+-- End-to-end example demonstrating four pg_extensions working together:
+-- - pg_migrate: Declarative schema management from YAML
+-- - pg_feature: Automated feature engineering (Deep Feature Synthesis)
+-- - pg_ml: Machine learning with conformal prediction
+-- - pg_prob: Probabilistic P&L with Monte Carlo simulation
+--
+-- Business Problem:
+-- Predict monthly sales revenue with uncertainty quantification and build
+-- a P&L statement that propagates uncertainty through all calculations.
+--
+-- Questions Answered:
+-- - "What's the probability we hit our $80K revenue target?"
+-- - "What's our worst-case scenario (Value at Risk)?"
+-- - "If marketing spend increases, how does profit uncertainty change?"
+-- ============================================================================
+
+-- SQLBook: Markup
+-- # 1. Extensions Setup
+--
+-- Install and configure the four extensions required for this demo.
+--
+-- **Extensions:**
+-- | Extension | Schema | Purpose |
+-- |-----------|--------|---------|
+-- | pg_migrate | pgmigrate | Declarative schema from YAML |
+-- | pg_feature | pgft | Automated feature engineering |
+-- | pg_ml | pgml | ML training with uncertainty |
+-- | pg_prob | pgprob | Probabilistic calculations |
+
+-- SQLBook: Code
+-- Active: 1767444812203@@127.0.0.1@5432@postgres
+-- Active: 1766137197353@@127.0.0.1@5432
+-- ----------------------------------------------------------------------------
+-- Install Extensions
+-- ----------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_migrate;
+CREATE EXTENSION IF NOT EXISTS pg_feature;
+CREATE EXTENSION IF NOT EXISTS pg_ml;
+CREATE EXTENSION IF NOT EXISTS pg_prob;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Verify Installation
+-- ----------------------------------------------------------------------------
+SELECT extname, extversion
+FROM pg_extension
+WHERE extname IN ('pg_migrate', 'pg_feature', 'pg_ml', 'pg_prob')
+ORDER BY extname;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- pg_ml: Setup Virtual Environment (if needed)
+-- ----------------------------------------------------------------------------
+-- This creates a Python venv with PyCaret - may take a few minutes on first run
+SELECT pgml.setup_venv();
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- pg_ml: Verify Status
+-- ----------------------------------------------------------------------------
+SELECT pgml.status();
+SELECT pgml.python_info();
+
+-- SQLBook: Markup
+-- # 2. Schema Setup with pgmigrate CLI
+--
+-- Create the retail schema using the pgmigrate CLI tool.
+-- This demonstrates "schema as code" - the schema definition lives in `schema.yaml`.
+--
+-- **Tables:**
+-- - `retail.customers` - Customer master data
+-- - `retail.products` - Product catalog with costs
+-- - `retail.orders` - Order headers
+-- - `retail.order_items` - Order line items
+-- - `retail.monthly_category_sales` - Aggregated monthly sales
+-- - `retail.ml_features` - Feature engineering output
+-- - `retail.revenue_predictions` - ML predictions with uncertainty
+-- - `retail.pnl_forecast` - Probabilistic P&L statement
+--
+-- **CLI Commands:**
+-- ```bash
+-- # Install pgmigrate CLI (one-time)
+-- curl -sSL https://raw.githubusercontent.com/matroidbe/pgmigrate/main/install.sh | bash
+--
+-- # Set database connection
+-- export DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
+--
+-- # Preview changes (Terraform-like plan)
+-- pgmigrate plan schema.yaml
+--
+-- # Apply changes
+-- pgmigrate apply schema.yaml --auto-approve
+-- ```
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Preview Migration Plan (via CLI)
+-- ----------------------------------------------------------------------------
+-- Run from terminal:
+--   pgmigrate plan schema.yaml
+--
+-- Example output:
+--   pg_migrate will perform the following actions:
+--
+--     + CREATE SCHEMA retail
+--     + CREATE TABLE retail.customers
+--     + CREATE TABLE retail.products
+--     + CREATE TABLE retail.orders
+--     + CREATE TABLE retail.order_items
+--     + CREATE TABLE retail.monthly_category_sales
+--     + CREATE TABLE retail.ml_features
+--
+--   Plan: 7 to add, 0 to destroy, 0 breaking.
+
+-- For SQL clients, we can still use the extension directly:
+SELECT pgmigrate.load(pg_read_file('/home/ubuntu/dev/pg_extensions/examples/retail-forecasting/schema.yaml'));
+SELECT * FROM pgmigrate.plan();
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Apply Schema Changes (via CLI)
+-- ----------------------------------------------------------------------------
+-- Run from terminal:
+--   pgmigrate apply schema.yaml --auto-approve
+--
+-- Or interactively (with confirmation):
+--   pgmigrate apply schema.yaml
+
+-- For SQL clients, use the extension:
+SELECT pgmigrate.apply();
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Create Tables with pg_prob Types (manual - not supported in YAML)
+-- ----------------------------------------------------------------------------
+-- These use pg_prob's custom distribution type
+
+CREATE TABLE IF NOT EXISTS retail.revenue_predictions (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(50) NOT NULL,
+    year_month DATE NOT NULL,
+    predicted_revenue pgprob.dist NOT NULL,
+    predicted_cogs pgprob.dist NOT NULL,
+    prediction_date TIMESTAMPTZ DEFAULT NOW(),
+    model_name VARCHAR(100),
+    UNIQUE(category, year_month)
+);
+
+CREATE TABLE IF NOT EXISTS retail.pnl_forecast (
+    id SERIAL PRIMARY KEY,
+    line_item VARCHAR(50) NOT NULL UNIQUE,
+    description TEXT,
+    amount pgprob.dist NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Verify Schema Creation
+-- ----------------------------------------------------------------------------
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'retail'
+ORDER BY table_name;
+
+-- SQLBook: Markup
+-- # 3. Sample Data Generation
+--
+-- Generate 2+ years of realistic e-commerce data with:
+-- - 100 customers (20% premium)
+-- - 20 products across 4 categories
+-- - ~2,500 orders with seasonal patterns
+-- - Higher Q4 sales, premium customer spending
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Clear Existing Data
+-- ----------------------------------------------------------------------------
+TRUNCATE retail.order_items, retail.orders, retail.customers, retail.products,
+         retail.monthly_category_sales, retail.ml_features,
+         retail.revenue_predictions, retail.pnl_forecast
+CASCADE;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Create Products (4 Categories)
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.products (product_name, category, unit_price, cost_price) VALUES
+    -- Electronics (high margin tech)
+    ('Wireless Earbuds', 'Electronics', 79.99, 35.00),
+    ('Bluetooth Speaker', 'Electronics', 49.99, 22.00),
+    ('Phone Charger', 'Electronics', 24.99, 8.00),
+    ('USB Hub', 'Electronics', 34.99, 15.00),
+    ('Webcam HD', 'Electronics', 89.99, 40.00),
+    -- Home & Garden
+    ('Plant Pot Set', 'Home & Garden', 29.99, 12.00),
+    ('LED Desk Lamp', 'Home & Garden', 44.99, 18.00),
+    ('Storage Bins', 'Home & Garden', 19.99, 7.00),
+    ('Wall Clock', 'Home & Garden', 34.99, 14.00),
+    ('Throw Blanket', 'Home & Garden', 39.99, 16.00),
+    -- Sports & Outdoors
+    ('Yoga Mat', 'Sports & Outdoors', 29.99, 10.00),
+    ('Water Bottle', 'Sports & Outdoors', 19.99, 6.00),
+    ('Resistance Bands', 'Sports & Outdoors', 14.99, 4.00),
+    ('Fitness Tracker', 'Sports & Outdoors', 59.99, 25.00),
+    ('Camping Lantern', 'Sports & Outdoors', 24.99, 9.00),
+    -- Books & Media
+    ('Bestseller Novel', 'Books & Media', 16.99, 7.00),
+    ('Cookbook', 'Books & Media', 24.99, 10.00),
+    ('Journal Set', 'Books & Media', 12.99, 4.00),
+    ('Audiobook Card', 'Books & Media', 29.99, 15.00),
+    ('Magazine Sub', 'Books & Media', 9.99, 3.00);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Create Customers
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.customers (customer_name, email, country, signup_date, is_premium)
+SELECT
+    'Customer ' || i,
+    'customer' || i || '@example.com',
+    CASE (i % 5)
+        WHEN 0 THEN 'USA'
+        WHEN 1 THEN 'Canada'
+        WHEN 2 THEN 'UK'
+        WHEN 3 THEN 'Germany'
+        ELSE 'Australia'
+    END,
+    DATE '2022-01-01' + (random() * 365)::int,
+    (random() < 0.2)  -- 20% premium customers
+FROM generate_series(1, 100) i;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Generate Orders (2+ Years of History)
+-- ----------------------------------------------------------------------------
+-- Create realistic order patterns with seasonality
+
+INSERT INTO retail.orders (customer_id, order_date, status)
+SELECT
+    -- Weighted toward premium customers (they order more)
+    CASE WHEN random() < 0.4
+        THEN (SELECT customer_id FROM retail.customers WHERE is_premium ORDER BY random() LIMIT 1)
+        ELSE (SELECT customer_id FROM retail.customers ORDER BY random() LIMIT 1)
+    END,
+    -- Generate dates from Jan 2022 to Nov 2024
+    DATE '2022-01-01' + (random() * 1050)::int
+        + (interval '1 hour' * (random() * 12)::int),
+    'completed'
+FROM generate_series(1, 2500);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Generate Order Items
+-- ----------------------------------------------------------------------------
+-- Each order gets 1-4 items with seasonal patterns
+
+INSERT INTO retail.order_items (order_id, product_id, quantity, unit_price, cost_price, discount_percent)
+SELECT
+    o.order_id,
+    p.product_id,
+    1 + (random() * 3)::int,  -- 1-4 quantity
+    p.unit_price,
+    p.cost_price,
+    CASE
+        WHEN random() < 0.1 THEN 10  -- 10% get discount
+        WHEN random() < 0.05 THEN 15
+        ELSE 0
+    END
+FROM retail.orders o
+CROSS JOIN LATERAL (
+    -- Select 1-3 random products per order
+    -- Boost Electronics in Q4 (holiday season)
+    SELECT product_id, unit_price, cost_price
+    FROM retail.products
+    WHERE CASE
+        WHEN EXTRACT(MONTH FROM o.order_date) IN (10, 11, 12)
+             AND category = 'Electronics'
+        THEN random() < 0.5  -- 50% chance electronics in Q4
+        ELSE random() < 0.3  -- 30% chance otherwise
+    END
+    ORDER BY random()
+    LIMIT 1 + (random() * 2)::int
+) p;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Update Order Totals
+-- ----------------------------------------------------------------------------
+UPDATE retail.orders o
+SET total_amount = (
+    SELECT COALESCE(SUM(quantity * unit_price * (1 - discount_percent/100)), 0)
+    FROM retail.order_items oi
+    WHERE oi.order_id = o.order_id
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Aggregate to Monthly Category Sales
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.monthly_category_sales
+    (category, year_month, revenue, cost_of_goods, order_count, item_count, avg_order_value, unique_customers)
+SELECT
+    p.category,
+    DATE_TRUNC('month', o.order_date)::date as year_month,
+    SUM(oi.quantity * oi.unit_price * (1 - oi.discount_percent/100)) as revenue,
+    SUM(oi.quantity * oi.cost_price) as cost_of_goods,
+    COUNT(DISTINCT o.order_id) as order_count,
+    SUM(oi.quantity) as item_count,
+    AVG(o.total_amount) as avg_order_value,
+    COUNT(DISTINCT o.customer_id) as unique_customers
+FROM retail.orders o
+JOIN retail.order_items oi ON o.order_id = oi.order_id
+JOIN retail.products p ON oi.product_id = p.product_id
+WHERE o.status = 'completed'
+GROUP BY p.category, DATE_TRUNC('month', o.order_date)
+ORDER BY year_month, category;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Verify Data Generation
+-- ----------------------------------------------------------------------------
+SELECT
+    'Customers' as entity, COUNT(*)::text as count FROM retail.customers
+UNION ALL
+SELECT 'Products', COUNT(*)::text FROM retail.products
+UNION ALL
+SELECT 'Orders', COUNT(*)::text FROM retail.orders
+UNION ALL
+SELECT 'Order Items', COUNT(*)::text FROM retail.order_items
+UNION ALL
+SELECT 'Monthly Sales Records', COUNT(*)::text FROM retail.monthly_category_sales;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Preview Monthly Sales
+-- ----------------------------------------------------------------------------
+SELECT category, year_month,
+       revenue::numeric(12,2),
+       order_count,
+       unique_customers
+FROM retail.monthly_category_sales
+ORDER BY year_month DESC, category
+LIMIT 20;
+
+-- SQLBook: Markup
+-- # 4. Feature Engineering with pg_feature (DFS)
+--
+-- Use pg_feature's Deep Feature Synthesis (DFS) to automatically generate features.
+-- DFS traverses relationships and applies aggregation/transform primitives.
+--
+-- **DFS Workflow:**
+-- 1. Discover relationships (auto-detects foreign keys)
+-- 2. Set time indexes (for temporal awareness)
+-- 3. Generate features at each relationship level
+--
+-- **Why DFS?**
+-- - Automated feature generation from relational structure
+-- - No manual SQL for common aggregations
+-- - Captures entity behavior patterns (e.g., customer ordering behavior)
+-- - Time-aware cutoffs prevent data leakage
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Discover Relationships (for pg_feature)
+-- ----------------------------------------------------------------------------
+-- pg_feature auto-discovers foreign key relationships in the schema
+SELECT pgft.discover_relationships('retail');
+
+-- View discovered relationships
+SELECT * FROM pgft.list_relationships();
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Set Time Indexes (for temporal feature generation)
+-- ----------------------------------------------------------------------------
+-- Time indexes tell DFS which column represents "when data became known"
+-- This enables time-aware aggregations and prevents data leakage
+
+SELECT pgft.set_time_index('retail.orders', 'order_date');
+SELECT pgft.set_time_index('retail.order_items', 'created_at');
+SELECT pgft.set_time_index('retail.monthly_category_sales', 'year_month');
+
+-- Verify time indexes
+SELECT * FROM pgft.list_time_indexes();
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Generate Customer Features using DFS (Depth 1)
+-- ----------------------------------------------------------------------------
+-- Target: customers (entity we're building features for)
+-- Relationships traversed:
+--   customers → orders (COUNT, SUM, MEAN of order values)
+--
+-- This generates features like:
+--   - orders_COUNT (how many orders per customer)
+--   - orders_SUM_total_amount (total spend per customer)
+--   - orders_MAX_total_amount (largest order per customer)
+
+SELECT * FROM pgft.synthesize_features(
+    'retail_customer_features',           -- project_name
+    'retail.customers',                   -- target_table (entity to featurize)
+    'customer_id',                        -- target_id (primary key)
+    agg_primitives := ARRAY['count', 'sum', 'mean', 'max', 'min'],
+    trans_primitives := ARRAY['year', 'month', 'weekday'],
+    max_depth := 1,                       -- DFS depth 1 (direct child aggregations)
+    output_name := 'retail.customer_features',
+    output_type := 'table',
+    if_exists := 'replace'
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Generate Order Features using DFS (Depth 1)
+-- ----------------------------------------------------------------------------
+-- Target: orders (for order-level aggregations from order_items)
+-- This creates features like:
+--   - order_items_COUNT (number of line items per order)
+--   - order_items_SUM_quantity (total units per order)
+
+SELECT * FROM pgft.synthesize_features(
+    'retail_order_features',              -- project_name
+    'retail.orders',                      -- target_table
+    'order_id',                           -- target_id
+    agg_primitives := ARRAY['count', 'sum', 'mean', 'max', 'min'],
+    trans_primitives := ARRAY['year', 'month', 'weekday'],
+    max_depth := 1,
+    output_name := 'retail.order_features',
+    output_type := 'table',
+    if_exists := 'replace'
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- View Generated Features
+-- ----------------------------------------------------------------------------
+SELECT * FROM pgft.list_features('retail_customer_features')
+ORDER BY depth, feature_name
+LIMIT 10;
+
+SELECT * FROM pgft.list_features('retail_order_features')
+ORDER BY depth, feature_name
+LIMIT 10;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Preview Customer Features Table
+-- ----------------------------------------------------------------------------
+-- DFS generates features with naming pattern: {child_table}_{PRIMITIVE}_{column}
+SELECT customer_id,
+       "orders_COUNT_order_id" as order_count,
+       "orders_SUM_total_amount" as total_spend,
+       "orders_MAX_total_amount" as largest_order,
+       "orders_MEAN_total_amount" as avg_order_value
+FROM retail.customer_features
+LIMIT 10;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Build ML Features Table (combining DFS + Time Series)
+-- ----------------------------------------------------------------------------
+-- For monthly sales forecasting, we need:
+-- 1. Base metrics from monthly_category_sales
+-- 2. Time-series features (lags, moving averages) - using SQL window functions
+-- 3. Temporal features (month, quarter) - generated via transform primitives
+--
+-- Note: DFS excels at entity-level aggregations (customer features).
+-- For time-series forecasting on pre-aggregated data, we combine DFS temporal
+-- transforms with SQL window functions for lag/MA features.
+
+INSERT INTO retail.ml_features (
+    category, year_month, revenue, cost_of_goods, order_count,
+    revenue_lag1, revenue_lag2, revenue_lag3,
+    revenue_ma3, revenue_ma6,
+    order_count_lag1, cogs_ratio,
+    month_num, quarter, is_q4, revenue_yoy_growth
+)
+SELECT
+    category,
+    year_month,
+    revenue,
+    cost_of_goods,
+    order_count,
+    -- Lag features (previous months' revenue) - time-series specific
+    LAG(revenue, 1) OVER w as revenue_lag1,
+    LAG(revenue, 2) OVER w as revenue_lag2,
+    LAG(revenue, 3) OVER w as revenue_lag3,
+    -- Moving averages - time-series specific
+    AVG(revenue) OVER (PARTITION BY category ORDER BY year_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as revenue_ma3,
+    AVG(revenue) OVER (PARTITION BY category ORDER BY year_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) as revenue_ma6,
+    -- Order count lag
+    LAG(order_count, 1) OVER w as order_count_lag1,
+    -- COGS ratio
+    CASE WHEN revenue > 0 THEN cost_of_goods / revenue ELSE 0 END as cogs_ratio,
+    -- Temporal features (these could also come from DFS transform primitives)
+    EXTRACT(MONTH FROM year_month)::int as month_num,
+    EXTRACT(QUARTER FROM year_month)::int as quarter,
+    EXTRACT(QUARTER FROM year_month) = 4 as is_q4,
+    -- Year-over-year growth
+    CASE
+        WHEN LAG(revenue, 12) OVER w > 0
+        THEN (revenue - LAG(revenue, 12) OVER w) / LAG(revenue, 12) OVER w
+        ELSE NULL
+    END as revenue_yoy_growth
+FROM retail.monthly_category_sales
+WINDOW w AS (PARTITION BY category ORDER BY year_month)
+ORDER BY category, year_month;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Preview Feature Table
+-- ----------------------------------------------------------------------------
+SELECT category, year_month,
+       revenue::numeric(10,2),
+       revenue_lag1::numeric(10,2),
+       revenue_ma3::numeric(10,2),
+       month_num, is_q4
+FROM retail.ml_features
+WHERE revenue_lag3 IS NOT NULL  -- Exclude rows without enough history
+ORDER BY year_month DESC, category
+LIMIT 16;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Feature Statistics
+-- ----------------------------------------------------------------------------
+SELECT
+    COUNT(*) as total_rows,
+    COUNT(*) FILTER (WHERE revenue_lag3 IS NOT NULL) as rows_with_full_history,
+    COUNT(DISTINCT category) as categories,
+    MIN(year_month) as earliest_month,
+    MAX(year_month) as latest_month
+FROM retail.ml_features;
+
+-- SQLBook: Markup
+-- # 5. Model Training with pg_ml
+--
+-- Train an XGBoost model with conformal prediction to get uncertainty estimates.
+-- The model predicts revenue given historical features.
+--
+-- **Key Concepts:**
+-- - Conformal prediction provides calibrated prediction intervals
+-- - We use 80% confidence intervals (coverage_target = 0.80)
+-- - Model outputs include point prediction + interval bounds
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Create Training View (exclude incomplete feature rows)
+-- ----------------------------------------------------------------------------
+-- Note: pg_ml requires float8 (double precision) types for all numeric columns.
+-- We cast all features to float8 and exclude non-numeric metadata columns.
+CREATE OR REPLACE VIEW retail.ml_training_data AS
+SELECT
+    revenue::float8 as target,
+    revenue_lag1::float8,
+    revenue_lag2::float8,
+    revenue_lag3::float8,
+    revenue_ma3::float8,
+    revenue_ma6::float8,
+    order_count_lag1::float8,
+    cogs_ratio::float8,
+    month_num::float8,
+    quarter::float8,
+    (is_q4::int)::float8 as is_q4_int,
+    COALESCE(revenue_yoy_growth, 0)::float8 as revenue_yoy_growth
+FROM retail.ml_features
+WHERE revenue_lag3 IS NOT NULL  -- Need 3 months history
+  AND year_month < DATE '2024-09-01';  -- Hold out recent months for testing
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Check Training Data
+-- ----------------------------------------------------------------------------
+SELECT COUNT(*) as training_rows,
+       MIN(year_month) as from_date,
+       MAX(year_month) as to_date
+FROM retail.ml_training_data;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Setup ML Experiment
+-- ----------------------------------------------------------------------------
+-- IMPORTANT: setup() and create_model() must run in SAME database connection
+-- Disable statement timeout for training (can take several minutes)
+SET statement_timeout = 0;
+
+SELECT * FROM pgml.setup(
+    'retail.ml_training_data',
+    'target',
+    project_name => 'retail_revenue_forecast',
+    task => 'regression'
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Train XGBoost Model with Conformal Prediction
+-- ----------------------------------------------------------------------------
+-- conformal => true enables conformal prediction intervals
+-- conformal_method: 'plus' (default) or 'minmax'
+-- conformal_cv: number of CV folds for calibration (default 5)
+SELECT * FROM pgml.create_model(
+    'retail_revenue_forecast',
+    'xgboost',
+    conformal => true
+);
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Verify Model was Created
+-- ----------------------------------------------------------------------------
+SELECT p.name as project_name, m.algorithm, m.created_at, m.metrics
+FROM pgml.models m
+JOIN pgml.projects p ON m.project_id = p.id
+WHERE p.name = 'retail_revenue_forecast'
+ORDER BY m.created_at DESC
+LIMIT 1;
+
+-- SQLBook: Markup
+-- # 6. Probabilistic Predictions
+--
+-- Generate revenue predictions as probability distributions using pg_prob.
+-- Each prediction becomes a `pgprob.dist` type that can be used in calculations.
+--
+-- **Approach:**
+-- - Use pg_ml's prediction intervals (from conformal prediction)
+-- - Convert to triangular distributions: (lower, point_estimate, upper)
+-- - COGS is derived as a percentage of revenue
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Generate Predictions for Forecast Period (Q4 2024)
+-- ----------------------------------------------------------------------------
+-- We predict for Oct, Nov, Dec 2024
+
+TRUNCATE retail.revenue_predictions;
+
+INSERT INTO retail.revenue_predictions (category, year_month, predicted_revenue, predicted_cogs, model_name)
+SELECT
+    f.category,
+    f.year_month,
+    -- predict_dist returns pgprob.dist directly (triangular distribution from conformal intervals)
+    pgml.predict_dist(
+        'retail_revenue_forecast',
+        ARRAY[
+            f.revenue_lag1, f.revenue_lag2, f.revenue_lag3,
+            f.revenue_ma3, f.revenue_ma6,
+            f.order_count_lag1, f.cogs_ratio,
+            f.month_num, f.quarter, f.is_q4_int,
+            f.revenue_yoy_growth
+        ]::float8[]
+    )::pgprob.dist as predicted_revenue,
+    -- COGS as percentage of revenue (with some uncertainty)
+    -- Scale the revenue distribution by the COGS ratio
+    pgml.predict_dist(
+        'retail_revenue_forecast',
+        ARRAY[
+            f.revenue_lag1, f.revenue_lag2, f.revenue_lag3,
+            f.revenue_ma3, f.revenue_ma6,
+            f.order_count_lag1, f.cogs_ratio,
+            f.month_num, f.quarter, f.is_q4_int,
+            f.revenue_yoy_growth
+        ]::float8[]
+    )::pgprob.dist OPERATOR(pgprob.*) f.cogs_ratio::float8 as predicted_cogs,
+    'xgboost_conformal' as model_name
+FROM (
+    -- Features for forecast months
+    SELECT
+        category,
+        year_month,
+        revenue_lag1, revenue_lag2, revenue_lag3,
+        revenue_ma3, revenue_ma6,
+        order_count_lag1, cogs_ratio,
+        month_num, quarter, is_q4::int as is_q4_int,
+        COALESCE(revenue_yoy_growth, 0) as revenue_yoy_growth
+    FROM retail.ml_features
+    WHERE year_month >= DATE '2024-09-01'  -- Forecast period
+) f;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Preview Predictions (with Uncertainty Bands)
+-- ----------------------------------------------------------------------------
+SELECT
+    category,
+    year_month,
+    '$' || TO_CHAR(pgprob.percentile(predicted_revenue, 0.10, 10000)::numeric, 'FM999,999') as p10,
+    '$' || TO_CHAR(pgprob.mean(predicted_revenue, 10000)::numeric, 'FM999,999') as expected,
+    '$' || TO_CHAR(pgprob.percentile(predicted_revenue, 0.90, 10000)::numeric, 'FM999,999') as p90
+FROM retail.revenue_predictions
+ORDER BY year_month, category;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Validate Prediction Coverage (Backtesting)
+-- ----------------------------------------------------------------------------
+-- Check if actuals fall within prediction intervals
+
+SELECT
+    'Coverage Check' as metric,
+    COUNT(*) as total_predictions,
+    COUNT(*) FILTER (
+        WHERE mcs.revenue BETWEEN
+            pgprob.percentile(predicted_revenue, 0.10, 10000) AND
+            pgprob.percentile(predicted_revenue, 0.90, 10000)
+    ) as within_80pct_interval,
+    ROUND(
+        COUNT(*) FILTER (
+            WHERE mcs.revenue BETWEEN
+                pgprob.percentile(predicted_revenue, 0.10, 10000) AND
+                pgprob.percentile(predicted_revenue, 0.90, 10000)
+        )::numeric / COUNT(*) * 100, 1
+    ) as coverage_pct
+FROM retail.revenue_predictions rp
+JOIN retail.monthly_category_sales mcs
+    ON rp.category = mcs.category AND rp.year_month = mcs.year_month;
+
+-- SQLBook: Markup
+-- # 7. Probabilistic P&L Statement
+--
+-- Build a complete Profit & Loss statement where every line item is a
+-- probability distribution. Arithmetic operations automatically propagate
+-- uncertainty through Monte Carlo simulation.
+--
+-- **P&L Structure:**
+-- ```
+-- Revenue
+-- - COGS
+-- = Gross Profit
+-- - Operating Expenses (Marketing, Salaries, Rent, Other)
+-- = Operating Income (EBIT)
+-- - Taxes
+-- = Net Income
+-- ```
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Clear Previous P&L
+-- ----------------------------------------------------------------------------
+TRUNCATE retail.pnl_forecast;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Calculate Total Revenue (Sum of All Category Predictions)
+-- ----------------------------------------------------------------------------
+WITH total_revenue AS (
+    SELECT pgprob.sum(predicted_revenue) as revenue_dist
+    FROM retail.revenue_predictions
+)
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'revenue',
+    'Total Revenue (All Categories, Forecast Period)',
+    revenue_dist
+FROM total_revenue;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Calculate Total COGS
+-- ----------------------------------------------------------------------------
+WITH total_cogs AS (
+    SELECT pgprob.sum(predicted_cogs) as cogs_dist
+    FROM retail.revenue_predictions
+)
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'cogs',
+    'Cost of Goods Sold',
+    cogs_dist
+FROM total_cogs;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Calculate Gross Profit = Revenue - COGS
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'gross_profit',
+    'Gross Profit (Revenue - COGS)',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue')
+    OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'cogs');
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Operating Expenses (Each with Uncertainty)
+-- ----------------------------------------------------------------------------
+
+-- Marketing: 10-15% of revenue (uncertain spend)
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'marketing',
+    'Marketing Expense (10-15% of Revenue)',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue')
+    OPERATOR(pgprob.*) pgprob.uniform(0.10, 0.15);
+
+-- Salaries: Fixed with small uncertainty
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+VALUES (
+    'salaries',
+    'Salaries & Wages (Forecast Period)',
+    pgprob.normal(45000, 2000)  -- $45k +/- $2k
+);
+
+-- Rent & Utilities: Mostly fixed
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+VALUES (
+    'rent',
+    'Rent & Utilities (Forecast Period)',
+    pgprob.normal(9000, 300)  -- $9k +/- $300
+);
+
+-- Other OpEx: Variable
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+VALUES (
+    'other_opex',
+    'Other Operating Expenses',
+    pgprob.triangular(3000, 5000, 8000)
+);
+
+-- Total Operating Expenses
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'total_opex',
+    'Total Operating Expenses',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'marketing')
+    OPERATOR(pgprob.+) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'salaries')
+    OPERATOR(pgprob.+) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'rent')
+    OPERATOR(pgprob.+) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'other_opex');
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Operating Income (EBIT) = Gross Profit - Operating Expenses
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'operating_income',
+    'Operating Income (EBIT)',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'gross_profit')
+    OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'total_opex');
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Taxes (25% of Operating Income)
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'taxes',
+    'Income Taxes (25% estimated)',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'operating_income')
+    OPERATOR(pgprob.*) 0.25;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Net Income = Operating Income - Taxes
+-- ----------------------------------------------------------------------------
+INSERT INTO retail.pnl_forecast (line_item, description, amount)
+SELECT
+    'net_income',
+    'Net Income (Bottom Line)',
+    (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'operating_income')
+    OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'taxes');
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Display Full P&L with Uncertainty Bands
+-- ----------------------------------------------------------------------------
+SELECT
+    CASE line_item
+        WHEN 'revenue' THEN '  Revenue'
+        WHEN 'cogs' THEN '- COGS'
+        WHEN 'gross_profit' THEN '= GROSS PROFIT'
+        WHEN 'marketing' THEN '  Marketing'
+        WHEN 'salaries' THEN '  Salaries'
+        WHEN 'rent' THEN '  Rent & Utilities'
+        WHEN 'other_opex' THEN '  Other OpEx'
+        WHEN 'total_opex' THEN '- TOTAL OPEX'
+        WHEN 'operating_income' THEN '= OPERATING INCOME'
+        WHEN 'taxes' THEN '- Taxes'
+        WHEN 'net_income' THEN '= NET INCOME'
+    END as line,
+    LPAD('$' || TO_CHAR(pgprob.percentile(amount, 0.05, 10000)::numeric, 'FM999,999,999'), 15) as "Pessimistic (P5)",
+    LPAD('$' || TO_CHAR(pgprob.mean(amount, 10000)::numeric, 'FM999,999,999'), 15) as "Expected",
+    LPAD('$' || TO_CHAR(pgprob.percentile(amount, 0.95, 10000)::numeric, 'FM999,999,999'), 15) as "Optimistic (P95)"
+FROM retail.pnl_forecast
+ORDER BY
+    CASE line_item
+        WHEN 'revenue' THEN 1
+        WHEN 'cogs' THEN 2
+        WHEN 'gross_profit' THEN 3
+        WHEN 'marketing' THEN 4
+        WHEN 'salaries' THEN 5
+        WHEN 'rent' THEN 6
+        WHEN 'other_opex' THEN 7
+        WHEN 'total_opex' THEN 8
+        WHEN 'operating_income' THEN 9
+        WHEN 'taxes' THEN 10
+        WHEN 'net_income' THEN 11
+    END;
+
+-- SQLBook: Markup
+-- # 8. Business Analysis Queries
+--
+-- Now we can answer powerful business questions using probabilistic data.
+-- Instead of "we expect $X", we can say "there's a Y% chance of hitting $X".
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q1: Probability of Hitting Revenue Targets
+-- ----------------------------------------------------------------------------
+SELECT
+    target::money as revenue_target,
+    ROUND(pgprob.prob_above(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue'),
+        target,
+        10000
+    )::numeric * 100, 1) as probability_pct
+FROM (VALUES (70000), (80000), (90000), (100000), (110000)) as targets(target)
+ORDER BY target;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q2: Probability of Profitability
+-- ----------------------------------------------------------------------------
+SELECT
+    'Probability of profitable quarter' as question,
+    ROUND(pgprob.prob_above(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        0,
+        10000
+    )::numeric * 100, 1) || '%' as answer;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q3: Value at Risk (VaR) Analysis
+-- ----------------------------------------------------------------------------
+SELECT
+    'Net Income' as metric,
+    '$' || TO_CHAR(pgprob.percentile(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        0.05, 10000
+    )::numeric, 'FM999,999') as "VaR (95% confidence)",
+    '$' || TO_CHAR(pgprob.percentile(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        0.01, 10000
+    )::numeric, 'FM999,999') as "VaR (99% confidence)",
+    ROUND(pgprob.prob_below(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        0, 10000
+    )::numeric * 100, 1) || '%' as "Prob of Loss";
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q4: What-If Analysis - Marketing Budget Scenarios
+-- ----------------------------------------------------------------------------
+WITH scenarios AS (
+    SELECT
+        scenario_name,
+        marketing_rate,
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'gross_profit')
+        OPERATOR(pgprob.-) ((SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue') OPERATOR(pgprob.*) marketing_rate::float8)
+        OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'salaries')
+        OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'rent')
+        OPERATOR(pgprob.-) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'other_opex')
+        as operating_income
+    FROM (VALUES
+        ('Cut to 8%', 0.08),
+        ('Current (10-15%)', 0.125),
+        ('Increase to 18%', 0.18)
+    ) as s(scenario_name, marketing_rate)
+)
+SELECT
+    scenario_name,
+    '$' || TO_CHAR(pgprob.mean(operating_income, 10000)::numeric, 'FM999,999') as expected_ebit,
+    '$' || TO_CHAR(pgprob.percentile(operating_income, 0.05, 10000)::numeric, 'FM999,999') as ebit_p5,
+    '$' || TO_CHAR(pgprob.percentile(operating_income, 0.95, 10000)::numeric, 'FM999,999') as ebit_p95
+FROM scenarios
+ORDER BY marketing_rate;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q5: Category Revenue Uncertainty Contribution
+-- ----------------------------------------------------------------------------
+SELECT
+    category,
+    '$' || TO_CHAR(pgprob.mean(cat_revenue, 10000)::numeric, 'FM999,999') as expected_revenue,
+    '$' || TO_CHAR((
+        pgprob.percentile(cat_revenue, 0.95, 10000)
+        - pgprob.percentile(cat_revenue, 0.05, 10000)
+    )::numeric, 'FM999,999') as "90% Range",
+    ROUND((
+        (pgprob.percentile(cat_revenue, 0.95, 10000) - pgprob.percentile(cat_revenue, 0.05, 10000))
+        / NULLIF(pgprob.mean(cat_revenue, 10000), 0) * 100
+    )::numeric, 1) || '%' as "Relative Uncertainty"
+FROM (
+    SELECT category, pgprob.sum(predicted_revenue) as cat_revenue
+    FROM retail.revenue_predictions
+    GROUP BY category
+) sub
+ORDER BY pgprob.mean(cat_revenue, 10000) DESC;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q6: Key Metrics with Confidence Intervals
+-- ----------------------------------------------------------------------------
+SELECT
+    metric,
+    '$' || TO_CHAR(p5::numeric, 'FM999,999') as "P5 (Pessimistic)",
+    '$' || TO_CHAR(expected::numeric, 'FM999,999') as "Expected",
+    '$' || TO_CHAR(p95::numeric, 'FM999,999') as "P95 (Optimistic)"
+FROM (
+    SELECT 'Total Revenue' as metric,
+           pgprob.percentile(amount, 0.05, 10000) as p5,
+           pgprob.mean(amount, 10000) as expected,
+           pgprob.percentile(amount, 0.95, 10000) as p95
+    FROM retail.pnl_forecast WHERE line_item = 'revenue'
+    UNION ALL
+    SELECT 'Gross Profit',
+           pgprob.percentile(amount, 0.05, 10000),
+           pgprob.mean(amount, 10000),
+           pgprob.percentile(amount, 0.95, 10000)
+    FROM retail.pnl_forecast WHERE line_item = 'gross_profit'
+    UNION ALL
+    SELECT 'Operating Income',
+           pgprob.percentile(amount, 0.05, 10000),
+           pgprob.mean(amount, 10000),
+           pgprob.percentile(amount, 0.95, 10000)
+    FROM retail.pnl_forecast WHERE line_item = 'operating_income'
+    UNION ALL
+    SELECT 'Net Income',
+           pgprob.percentile(amount, 0.05, 10000),
+           pgprob.mean(amount, 10000),
+           pgprob.percentile(amount, 0.95, 10000)
+    FROM retail.pnl_forecast WHERE line_item = 'net_income'
+) as metrics
+ORDER BY
+    CASE metric
+        WHEN 'Total Revenue' THEN 1
+        WHEN 'Gross Profit' THEN 2
+        WHEN 'Operating Income' THEN 3
+        WHEN 'Net Income' THEN 4
+    END;
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Q7: Scenario - 5% COGS Increase
+-- ----------------------------------------------------------------------------
+WITH cogs_increase_scenario AS (
+    SELECT
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue')
+        OPERATOR(pgprob.-) ((SELECT amount FROM retail.pnl_forecast WHERE line_item = 'cogs') OPERATOR(pgprob.*) 1.05::float8)
+        as new_gross_profit
+)
+SELECT
+    'Gross Profit (Current)' as scenario,
+    '$' || TO_CHAR(pgprob.mean(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'gross_profit'),
+        10000
+    )::numeric, 'FM999,999') as expected
+UNION ALL
+SELECT
+    'Gross Profit (+5% COGS)',
+    '$' || TO_CHAR(pgprob.mean(new_gross_profit, 10000)::numeric, 'FM999,999')
+FROM cogs_increase_scenario
+UNION ALL
+SELECT
+    'Impact (Reduction)',
+    '$' || TO_CHAR((
+        pgprob.mean((SELECT amount FROM retail.pnl_forecast WHERE line_item = 'gross_profit'), 10000)
+        - pgprob.mean(new_gross_profit, 10000)
+    )::numeric, 'FM999,999')
+FROM cogs_increase_scenario;
+
+-- SQLBook: Markup
+-- # 9. Executive Summary
+--
+-- A dashboard view of key financial projections and probabilities.
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Executive Summary: Key Financial Projections
+-- ----------------------------------------------------------------------------
+SELECT
+    'Expected Revenue' as metric,
+    '$' || TO_CHAR(pgprob.mean(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue'), 10000
+    )::numeric, 'FM999,999') as value
+UNION ALL
+SELECT 'Expected Net Income',
+    '$' || TO_CHAR(pgprob.mean(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'), 10000
+    )::numeric, 'FM999,999')
+UNION ALL
+SELECT 'Worst Case Net Income (5%)',
+    '$' || TO_CHAR(pgprob.percentile(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'), 0.05, 10000
+    )::numeric, 'FM999,999')
+UNION ALL
+SELECT 'Best Case Net Income (95%)',
+    '$' || TO_CHAR(pgprob.percentile(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'), 0.95, 10000
+    )::numeric, 'FM999,999');
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Executive Summary: Key Probabilities
+-- ----------------------------------------------------------------------------
+SELECT
+    'Prob of Hitting $80K Revenue' as question,
+    ROUND(pgprob.prob_above(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue'),
+        80000, 10000
+    )::numeric * 100, 1) || '%' as answer
+UNION ALL
+SELECT 'Prob of Profitable Quarter',
+    ROUND(pgprob.prob_above(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        0, 10000
+    )::numeric * 100, 1) || '%'
+UNION ALL
+SELECT 'Prob of $15K+ Net Income',
+    ROUND(pgprob.prob_above(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'net_income'),
+        15000, 10000
+    )::numeric * 100, 1) || '%';
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Executive Summary: Gross Margin
+-- ----------------------------------------------------------------------------
+SELECT
+    ROUND(pgprob.mean(
+        (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'gross_profit')
+        OPERATOR(pgprob./) (SELECT amount FROM retail.pnl_forecast WHERE line_item = 'revenue'),
+        10000
+    )::numeric * 100, 1) || '%' as expected_gross_margin;
+
+-- SQLBook: Markup
+-- # Summary
+--
+-- This example demonstrated how four pg_extensions work together:
+--
+-- | Extension | Role |
+-- |-----------|------|
+-- | **pg_migrate + pgmigrate CLI** | Terraform-like schema management (plan/apply) |
+-- | **pg_feature** | Deep Feature Synthesis (DFS) for automated feature engineering |
+-- | **pg_ml** | ML model training with conformal prediction |
+-- | **pg_prob** | Probabilistic P&L with Monte Carlo simulation |
+--
+-- **pgmigrate CLI Workflow:**
+-- ```bash
+-- pgmigrate plan schema.yaml     # Preview changes (Terraform-style diff)
+-- pgmigrate apply schema.yaml    # Apply with confirmation
+-- pgmigrate dump retail          # Export existing schema to YAML
+-- ```
+--
+-- **pg_feature Deep Feature Synthesis (DFS):**
+-- - Automatic feature generation from relational structure
+-- - Customer features from orders (COUNT, SUM, MEAN, MAX, MIN)
+-- - Order features from order_items
+-- - Time-aware cutoffs prevent data leakage
+--
+-- **Key Insights:**
+-- - Traditional forecasting: "We expect $85,000 revenue"
+-- - Probabilistic forecasting: "We expect $85,000 revenue with 90% confidence
+--   between $72,000 and $98,000. There's a 65% chance of hitting our $80K target."
+--
+-- **All computation happened inside PostgreSQL - no external tools needed!**
+
+-- SQLBook: Code
+-- ----------------------------------------------------------------------------
+-- Cleanup (uncomment to run)
+-- ----------------------------------------------------------------------------
+-- DROP TABLE IF EXISTS retail.pnl_forecast;
+-- DROP TABLE IF EXISTS retail.revenue_predictions;
+-- DROP TABLE IF EXISTS retail.ml_features;
+-- DROP TABLE IF EXISTS retail.monthly_category_sales;
+-- DROP TABLE IF EXISTS retail.order_items;
+-- DROP TABLE IF EXISTS retail.orders;
+-- DROP TABLE IF EXISTS retail.products;
+-- DROP TABLE IF EXISTS retail.customers;
+-- DROP SCHEMA IF EXISTS retail CASCADE;
+-- DROP EXTENSION IF EXISTS pg_prob CASCADE;
+-- DROP EXTENSION IF EXISTS pg_ml CASCADE;
+-- DROP EXTENSION IF EXISTS pg_feature CASCADE;
+-- DROP EXTENSION IF EXISTS pg_migrate CASCADE;

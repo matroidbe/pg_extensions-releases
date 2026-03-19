@@ -1,0 +1,224 @@
+# =============================================================================
+# TechMart Retail Schema - pg_migrate YAML Definition
+# =============================================================================
+# This file defines the retail schema declaratively. Use pg_migrate to apply:
+#
+#   SELECT pgmigrate.load(pg_read_file('/path/to/schema.yaml'));
+#   SELECT pgmigrate.plan();
+#   SELECT pgmigrate.apply();
+#
+# Note: The pnl_forecast table uses pg_prob.dist type and is created
+#       separately in 01-schema.sql after extensions are loaded.
+# =============================================================================
+
+version: "1.0"
+managed_schemas:
+  - retail
+
+schemas:
+  - retail
+
+tables:
+  # ===========================================================================
+  # Customers - Target entity for feature generation
+  # ===========================================================================
+  retail.customers:
+    columns:
+      - name: customer_id
+        type: serial
+        primary_key: true
+      - name: customer_name
+        type: varchar(100)
+        not_null: true
+      - name: email
+        type: varchar(255)
+      - name: country
+        type: varchar(50)
+        not_null: true
+      - name: signup_date
+        type: date
+        not_null: true
+      - name: is_premium
+        type: boolean
+        default: "false"
+      - name: created_at
+        type: timestamptz
+        default: "now()"
+
+  # ===========================================================================
+  # Products - Reference/dimension table with cost for P&L
+  # ===========================================================================
+  retail.products:
+    columns:
+      - name: product_id
+        type: serial
+        primary_key: true
+      - name: product_name
+        type: varchar(200)
+        not_null: true
+      - name: category
+        type: varchar(100)
+        not_null: true
+      - name: unit_price
+        type: decimal(10,2)
+        not_null: true
+      - name: cost_price
+        type: decimal(10,2)
+        not_null: true
+      - name: is_active
+        type: boolean
+        default: "true"
+      - name: created_at
+        type: timestamptz
+        default: "now()"
+
+  # ===========================================================================
+  # Orders - Child of customers
+  # ===========================================================================
+  retail.orders:
+    columns:
+      - name: order_id
+        type: serial
+        primary_key: true
+      - name: customer_id
+        type: integer
+        not_null: true
+        references: "retail.customers.customer_id"
+      - name: order_date
+        type: timestamptz
+        not_null: true
+      - name: status
+        type: varchar(20)
+        not_null: true
+        default: "'pending'"
+      - name: shipping_country
+        type: varchar(50)
+      - name: total_amount
+        type: decimal(10,2)
+      - name: is_cancelled
+        type: boolean
+        default: "false"
+      - name: created_at
+        type: timestamptz
+        default: "now()"
+    indexes:
+      - name: idx_orders_customer
+        columns: [customer_id]
+      - name: idx_orders_date
+        columns: [order_date]
+
+  # ===========================================================================
+  # Order Items - Child of orders, grandchild of customers
+  # ===========================================================================
+  retail.order_items:
+    columns:
+      - name: item_id
+        type: serial
+        primary_key: true
+      - name: order_id
+        type: integer
+        not_null: true
+        references: "retail.orders.order_id"
+      - name: product_id
+        type: integer
+        not_null: true
+        references: "retail.products.product_id"
+      - name: quantity
+        type: integer
+        not_null: true
+        default: "1"
+      - name: unit_price
+        type: decimal(10,2)
+        not_null: true
+      - name: cost_price
+        type: decimal(10,2)
+        not_null: true
+      - name: discount_percent
+        type: decimal(5,2)
+        default: "0"
+      - name: created_at
+        type: timestamptz
+        default: "now()"
+    indexes:
+      - name: idx_order_items_order
+        columns: [order_id]
+      - name: idx_order_items_product
+        columns: [product_id]
+
+  # ===========================================================================
+  # Monthly Category Sales - Aggregated target for ML prediction
+  # ===========================================================================
+  retail.monthly_category_sales:
+    columns:
+      - name: id
+        type: serial
+        primary_key: true
+      - name: category
+        type: varchar(50)
+        not_null: true
+      - name: year_month
+        type: date
+        not_null: true
+      - name: revenue
+        type: numeric(12,2)
+      - name: cost_of_goods
+        type: numeric(12,2)
+      - name: order_count
+        type: integer
+      - name: item_count
+        type: integer
+      - name: avg_order_value
+        type: numeric(10,2)
+      - name: unique_customers
+        type: integer
+    indexes:
+      - name: idx_monthly_sales_category_month
+        columns: [category, year_month]
+        unique: true
+
+  # ===========================================================================
+  # ML Features - Feature engineering output for ML training
+  # ===========================================================================
+  retail.ml_features:
+    columns:
+      - name: id
+        type: serial
+        primary_key: true
+      - name: category
+        type: varchar(50)
+        not_null: true
+      - name: year_month
+        type: date
+        not_null: true
+      - name: revenue
+        type: numeric(12,2)
+      - name: cost_of_goods
+        type: numeric(12,2)
+      - name: order_count
+        type: integer
+      - name: revenue_lag1
+        type: numeric(12,2)
+      - name: revenue_lag2
+        type: numeric(12,2)
+      - name: revenue_lag3
+        type: numeric(12,2)
+      - name: revenue_ma3
+        type: numeric(12,2)
+      - name: revenue_ma6
+        type: numeric(12,2)
+      - name: order_count_lag1
+        type: integer
+      - name: cogs_ratio
+        type: numeric(5,4)
+      - name: month_num
+        type: integer
+      - name: quarter
+        type: integer
+      - name: is_q4
+        type: boolean
+      - name: revenue_yoy_growth
+        type: numeric(8,4)
+    indexes:
+      - name: idx_ml_features_category_month
+        columns: [category, year_month]
+        unique: true

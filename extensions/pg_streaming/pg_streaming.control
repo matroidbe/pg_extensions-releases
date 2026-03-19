@@ -1,0 +1,6 @@
+comment = 'Declarative stream processing engine inside PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_streaming'
+relocatable = false
+superuser = true
+schema = pgstreams

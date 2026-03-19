@@ -1,0 +1,6 @@
+comment = 'MQTT 5.0 broker backed by PostgreSQL tables'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_mqtt'
+relocatable = false
+superuser = true
+schema = pgmqtt

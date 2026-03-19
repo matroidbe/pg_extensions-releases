@@ -1,0 +1,6 @@
+comment = '3D solid geometry powered by OpenCASCADE'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_solid'
+relocatable = false
+superuser = false
+schema = pgsolid

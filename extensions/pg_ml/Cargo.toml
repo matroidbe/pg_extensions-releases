@@ -1,0 +1,42 @@
+[package]
+name = "pg_ml"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_ml"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg16"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx.workspace = true
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+which = "7"
+thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Arrow for zero-copy data transfer to Python
+arrow = { version = "54", default-features = false, features = ["ffi"] }
+pyo3-arrow = "0.7"
+
+# HTTP client for external embedding APIs (OpenAI, Voyage AI)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[dev-dependencies]
+pgrx-tests = "0.16"

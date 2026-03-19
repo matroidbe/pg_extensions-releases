@@ -1,0 +1,6 @@
+comment = 'Unit of measure conversions with dimensional analysis for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_uom'
+relocatable = false
+superuser = false
+schema = pguom

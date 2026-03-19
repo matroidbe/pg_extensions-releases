@@ -1,0 +1,7 @@
+comment = 'pg_ml: Machine learning in PostgreSQL using PyCaret'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_ml'
+schema = 'pgml'
+relocatable = false
+superuser = true
+trusted = false

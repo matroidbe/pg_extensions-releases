@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = ["extensions/*", "crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "LicenseRef-Matroid-SAL-1.0"
+repository = "https://github.com/matroidbe/pg_extensions"
+authors = ["Tom Michiels <tom@matroid.be>"]
+
+[workspace.dependencies]
+pgrx = "0.16"
+pgrx-tests = "0.16"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio-postgres = "0.7"
+thiserror = "1"
+bytes = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+jsonschema = "0.29"
+sha2 = "0.10"
+
+# Observability dependencies
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+
+# Delta Lake / Arrow dependencies
+deltalake = { version = "0.22", default-features = false, features = ["datafusion"] }
+deltalake-aws = "0.6"
+deltalake-azure = "0.6"
+deltalake-gcp = "0.6"
+arrow = { version = "53", default-features = false, features = ["prettyprint"] }
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
+object_store = { version = "0.11", features = ["aws", "azure", "gcp"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+
+# =============================================================================
+# Build Profiles - Optimized for development speed
+# =============================================================================
+
+[profile.dev]
+# Faster incremental builds with reduced debug info
+debug = "line-tables-only"  # Enough for backtraces, faster than full debug
+incremental = true
+# More codegen units = faster compilation, slower runtime (fine for dev)
+codegen-units = 256
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev mode (they rarely change)
+# This makes your code run faster without slowing incremental builds
+opt-level = 2
+debug = false
+
+# pgrx crates benefit from optimization even in dev
+[profile.dev.package.pgrx]
+opt-level = 2
+[profile.dev.package.pgrx-pg-sys]
+opt-level = 2
+
+[profile.release]
+# Keep release profile standard
+lto = "thin"
+codegen-units = 1
+
+# =============================================================================
+# Patch Section - Override git dependencies with local crates for development
+# =============================================================================
+# When building in the workspace, use local crates instead of fetching from git.
+# This allows fast iteration during development while extensions remain
+# self-contained when checked out standalone.
+
+[patch."https://github.com/matroidbe/pg_extensions"]
+pg_spi = { path = "crates/pg_spi" }
+pg_observability = { path = "crates/pg_observability" }

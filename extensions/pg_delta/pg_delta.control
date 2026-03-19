@@ -1,0 +1,6 @@
+comment = 'Delta Lake streaming integration for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_delta'
+relocatable = false
+superuser = true
+schema = delta

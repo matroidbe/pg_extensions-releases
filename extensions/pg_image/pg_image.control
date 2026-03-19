@@ -1,0 +1,6 @@
+comment = 'Image processing, EXIF, transforms, object detection (ONNX) for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_image'
+relocatable = false
+superuser = false
+schema = pgimg
