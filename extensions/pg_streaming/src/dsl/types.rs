@@ -43,7 +43,17 @@ pub enum InputConfig {
     Kafka(KafkaInputConfig),
     Table(TableInputConfig),
     Cdc(CdcInputConfig),
-    // Future phases: Mqtt, Http, Broker, Generate
+    /// OpenDAL-backed source (fs/s3/gcs/azblob/sftp/ftp/webdav/http).
+    /// Config is passed through unparsed; see
+    /// `crate::connector::input::opendal_source::OpendalSourceConfig`.
+    Opendal(serde_json::Value),
+    /// Paginated REST API source. Strategies: next_url_in_body,
+    /// page_number, link_header. Auth: none, basic, bearer, api_key_header.
+    /// See `crate::connector::input::http_paginated::HttpPaginatedConfig`.
+    HttpPaginated(serde_json::Value),
+    /// Reference to a custom source registered via `pg_streaming_sdk`.
+    Custom(CustomConnectorConfig),
+    // Future phases: Webhook, Ldes, Mqtt, Broker, Generate
 }
 
 /// Kafka input connector
@@ -120,7 +130,22 @@ pub enum OutputConfig {
     Table(TableOutputConfig),
     Drop(DropConfig),
     Branch(BranchOutputConfig),
+    /// OpenDAL-backed sink. Config passed through; see
+    /// `crate::connector::output::opendal_sink::OpendalSinkConfig`.
+    Opendal(serde_json::Value),
+    /// Reference to a custom sink registered via `pg_streaming_sdk`.
+    Custom(CustomConnectorConfig),
     // Future phases: Http, Mqtt, Broker
+}
+
+/// Reference to a connector registered by a separate pgrx extension.
+/// The engine looks up `name` in the process-global registry at compile
+/// time and instantiates the connector with `config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomConnectorConfig {
+    pub name: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 /// Kafka output connector
@@ -208,6 +233,9 @@ pub enum ProcessorConfig {
     Unnest(UnnestConfig),
     /// Reference a reusable resource
     Resource(String),
+    /// Reference a processor registered via `pg_streaming_sdk` at
+    /// `_PG_init()` (e.g., `xarray_header` from `pg_streaming_xarray`).
+    Custom(CustomConnectorConfig),
     // Future phases: Branch, Switch, RateLimit
 }
 
@@ -865,6 +893,118 @@ mod tests {
                 assert_eq!(c.emit.len(), 2);
             }
             _ => panic!("expected cep processor"),
+        }
+    }
+
+    #[test]
+    fn test_parse_http_paginated_input() {
+        let json = r#"{
+            "input": {"http_paginated": {
+                "url": "https://api.example.com/orders",
+                "auth": {"type": "bearer", "token": "tok"},
+                "pagination": {
+                    "strategy": "page_number",
+                    "items_path": "data",
+                    "page_size": 100
+                },
+                "incremental": {
+                    "param": "updated_after",
+                    "field": "updated_at",
+                    "initial": "2025-01-01"
+                }
+            }},
+            "pipeline": {"processors": []},
+            "output": {"drop": {}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.input {
+            InputConfig::HttpPaginated(v) => {
+                assert_eq!(v["url"], "https://api.example.com/orders");
+                assert_eq!(v["pagination"]["strategy"], "page_number");
+                assert_eq!(v["pagination"]["page_size"], 100);
+                assert_eq!(v["incremental"]["param"], "updated_after");
+            }
+            _ => panic!("expected http_paginated input"),
+        }
+    }
+
+    #[test]
+    fn test_parse_opendal_input() {
+        let json = r#"{
+            "input": {"opendal": {
+                "service": "fs",
+                "root": "/tmp/data",
+                "path": "orders/*.csv",
+                "parse_as": "csv",
+                "codec": "gzip"
+            }},
+            "pipeline": {"processors": []},
+            "output": {"drop": {}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.input {
+            InputConfig::Opendal(v) => {
+                assert_eq!(v["service"], "fs");
+                assert_eq!(v["path"], "orders/*.csv");
+                assert_eq!(v["parse_as"], "csv");
+                assert_eq!(v["codec"], "gzip");
+            }
+            _ => panic!("expected opendal input"),
+        }
+    }
+
+    #[test]
+    fn test_parse_opendal_output() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"opendal": {
+                "service": "s3",
+                "path": "out/{seq}.ndjson",
+                "serialize_as": "ndjson"
+            }}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::Opendal(v) => {
+                assert_eq!(v["service"], "s3");
+                assert_eq!(v["serialize_as"], "ndjson");
+            }
+            _ => panic!("expected opendal output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_input() {
+        let json = r#"{
+            "input": {"custom": {"name": "acme_proto", "config": {"endpoint": "x"}}},
+            "pipeline": {"processors": []},
+            "output": {"drop": {}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.input {
+            InputConfig::Custom(c) => {
+                assert_eq!(c.name, "acme_proto");
+                assert_eq!(c.config["endpoint"], "x");
+            }
+            _ => panic!("expected custom input"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_output_with_default_config() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"custom": {"name": "my_sink"}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::Custom(c) => {
+                assert_eq!(c.name, "my_sink");
+                assert!(c.config.is_null());
+            }
+            _ => panic!("expected custom output"),
         }
     }
 

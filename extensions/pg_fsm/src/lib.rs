@@ -19,6 +19,8 @@ pgrx::pg_module_magic!();
 // =============================================================================
 
 pub static PG_FSM_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+pub static PG_FSM_DISABLE_DEFAULT_NOTIFY: pgrx::GucSetting<bool> =
+    pgrx::GucSetting::<bool>::new(false);
 
 // =============================================================================
 // Extension Initialization
@@ -31,6 +33,15 @@ pub extern "C-unwind" fn _PG_init() {
         c"Enable pg_fsm state transition enforcement",
         c"When false, skips transition validation in triggers.",
         &PG_FSM_ENABLED,
+        pgrx::GucContext::Suset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_bool_guc(
+        c"pg_fsm.disable_default_notify",
+        c"Disable the implicit NOTIFY pgfsm fired on every transition",
+        c"When true, only explicit add_action(..., 'notify', ...) actions fire.",
+        &PG_FSM_DISABLE_DEFAULT_NOTIFY,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
     );
@@ -740,6 +751,282 @@ mod tests {
         Spi::run("UPDATE public.orders SET status = 'delivered' WHERE id = 1").unwrap();
         // delivered is final — no transitions out
         Spi::run("UPDATE public.orders SET status = 'draft' WHERE id = 1").unwrap();
+    }
+
+    // =========================================================================
+    // P0/P1/P2: UI metadata, batch, NOTIFY, catalog helpers, ABAC, idempotency
+    // =========================================================================
+
+    #[pg_test]
+    fn test_add_transition_with_ui_metadata() {
+        set_search_path();
+        Spi::run("SELECT pgfsm.create_machine('ui_m', 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.add_state('ui_m', 'confirmed')").unwrap();
+        let tid = Spi::get_one::<i32>(
+            "SELECT pgfsm.add_transition('ui_m', 'draft', 'confirmed', 'confirm', NULL, NULL, 'Confirm', 'primary', 1, true)",
+        )
+        .unwrap()
+        .unwrap();
+
+        let label = Spi::get_one_with_args::<String>(
+            "SELECT label FROM pgfsm.transition WHERE id = $1",
+            &[tid.into()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(label, "Confirm");
+
+        let variant = Spi::get_one_with_args::<String>(
+            "SELECT variant FROM pgfsm.transition WHERE id = $1",
+            &[tid.into()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(variant, "primary");
+
+        let confirm_required = Spi::get_one_with_args::<bool>(
+            "SELECT confirm_required FROM pgfsm.transition WHERE id = $1",
+            &[tid.into()],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(confirm_required);
+    }
+
+    #[pg_test]
+    fn test_available_events_returns_metadata() {
+        set_search_path();
+        Spi::run("SELECT pgfsm.create_machine('me_m', 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.add_state('me_m', 'confirmed')").unwrap();
+        Spi::run(
+            "SELECT pgfsm.add_transition('me_m', 'draft', 'confirmed', 'confirm', NULL, NULL, 'Confirm', 'primary', 1, false)",
+        )
+        .unwrap();
+        Spi::run("CREATE TABLE public.me_orders (id serial, status text DEFAULT 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.bind_table('me_m', 'public.me_orders', 'status')").unwrap();
+        Spi::run("INSERT INTO public.me_orders (status) VALUES ('draft')").unwrap();
+
+        let label = Spi::get_one::<String>(
+            "SELECT label FROM pgfsm.available_events('public.me_orders', '1')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(label, "Confirm");
+
+        let variant = Spi::get_one::<String>(
+            "SELECT variant FROM pgfsm.available_events('public.me_orders', '1')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(variant, "primary");
+    }
+
+    #[pg_test]
+    fn test_available_events_batch() {
+        setup_order_machine();
+        setup_orders_table();
+        for _ in 0..5 {
+            Spi::run("INSERT INTO public.orders (status, amount) VALUES ('draft', 100)").unwrap();
+        }
+        Spi::run("UPDATE public.orders SET status = 'submitted' WHERE id IN (3, 4, 5)").unwrap();
+
+        // ids 1,2 are in 'draft' (1 event: submit); ids 3,4,5 are in 'submitted'
+        // (2 events: approve, reject) → 2 + 6 = 8 rows.
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.available_events_batch('public.orders', ARRAY[1,2,3,4,5]::bigint[])",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 8);
+
+        // For id=3 specifically, two events.
+        let count_3 = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.available_events_batch('public.orders', ARRAY[3]::bigint[])",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count_3, 2);
+    }
+
+    #[pg_test]
+    fn test_default_notify_can_be_disabled() {
+        // Just verify the GUC plumbing — actual NOTIFY observation needs a real
+        // backend with an open LISTEN connection, which #[pg_test] doesn't provide.
+        Spi::run("SET pg_fsm.disable_default_notify = true").unwrap();
+        setup_order_machine();
+        setup_orders_table();
+        Spi::run("INSERT INTO public.orders (status, amount) VALUES ('draft', 100)").unwrap();
+        Spi::run("UPDATE public.orders SET status = 'submitted' WHERE id = 1").unwrap();
+        let state = Spi::get_one::<String>("SELECT status FROM public.orders WHERE id = 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "submitted");
+        Spi::run("SET pg_fsm.disable_default_notify = false").unwrap();
+    }
+
+    #[pg_test]
+    fn test_list_machines() {
+        setup_order_machine();
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM pgfsm.list_machines()")
+            .unwrap()
+            .unwrap();
+        assert!(count >= 1);
+
+        let initial = Spi::get_one::<String>(
+            "SELECT initial_state FROM pgfsm.list_machines() WHERE name = 'order_flow'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial, "draft");
+    }
+
+    #[pg_test]
+    fn test_list_states_and_events() {
+        setup_order_machine();
+        let n_states = Spi::get_one::<i64>("SELECT count(*) FROM pgfsm.list_states('order_flow')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n_states, 6);
+
+        let events =
+            Spi::get_one::<i64>("SELECT array_length(pgfsm.list_events('order_flow'), 1)::bigint")
+                .unwrap()
+                .unwrap();
+        // submit, approve, reject, revise, ship, deliver
+        assert_eq!(events, 6);
+    }
+
+    #[pg_test]
+    fn test_list_transitions() {
+        setup_order_machine();
+        let n = Spi::get_one::<i64>("SELECT count(*) FROM pgfsm.list_transitions('order_flow')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 6);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "credit hold")]
+    fn test_before_action_aborts_transition() {
+        set_search_path();
+        Spi::run("SELECT pgfsm.create_machine('ba_m', 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.add_state('ba_m', 'confirmed')").unwrap();
+        let tid = Spi::get_one::<i32>(
+            "SELECT pgfsm.add_transition('ba_m', 'draft', 'confirmed', 'confirm')",
+        )
+        .unwrap()
+        .unwrap();
+        Spi::run("CREATE OR REPLACE FUNCTION public.ba_check() RETURNS void AS $$ BEGIN RAISE EXCEPTION 'credit hold'; END; $$ LANGUAGE plpgsql").unwrap();
+        Spi::run_with_args(
+            "SELECT pgfsm.add_action($1, 'function', 'public.ba_check()', 0, 'before')",
+            &[tid.into()],
+        )
+        .unwrap();
+        Spi::run(
+            "CREATE TABLE public.ba_orders (id serial, status text DEFAULT 'draft', amount numeric)",
+        )
+        .unwrap();
+        Spi::run("SELECT pgfsm.bind_table('ba_m', 'public.ba_orders', 'status')").unwrap();
+        Spi::run("INSERT INTO public.ba_orders (status, amount) VALUES ('draft', 100)").unwrap();
+        Spi::run("UPDATE public.ba_orders SET status = 'confirmed' WHERE id = 1").unwrap();
+    }
+
+    #[pg_test]
+    fn test_regclass_normalized_lookup() {
+        setup_order_machine();
+        // bind by qualified name
+        Spi::run("CREATE TABLE public.rc_orders (id serial, status text DEFAULT 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.bind_table('order_flow', 'public.rc_orders', 'status')").unwrap();
+        Spi::run("INSERT INTO public.rc_orders (status) VALUES ('draft')").unwrap();
+        // call transition by unqualified name — should resolve via regclass.
+        let new_state =
+            Spi::get_one::<String>("SELECT pgfsm.transition('rc_orders', '1', 'submit')")
+                .unwrap()
+                .unwrap();
+        assert_eq!(new_state, "submitted");
+    }
+
+    #[pg_test]
+    fn test_transition_allow_noop() {
+        setup_order_machine();
+        setup_orders_table();
+        Spi::run("INSERT INTO public.orders (status, amount) VALUES ('draft', 100)").unwrap();
+        Spi::run("UPDATE public.orders SET status = 'submitted' WHERE id = 1").unwrap();
+        Spi::run("UPDATE public.orders SET status = 'approved' WHERE id = 1").unwrap();
+
+        // Already 'approved'; firing 'approve' again is a no-op when allow_noop=true.
+        let state = Spi::get_one::<String>(
+            "SELECT pgfsm.transition('public.orders', '1', 'approve', 'status', true)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state, "approved");
+
+        // History should NOT have a duplicate approve entry.
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.history WHERE table_name = 'public.orders' AND event = 'approve'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[pg_test]
+    fn test_events_with_targets_includes_unavailable() {
+        setup_order_machine();
+        setup_orders_table();
+        Spi::run("INSERT INTO public.orders (status, amount) VALUES ('draft', 100)").unwrap();
+
+        // From 'draft' the only available event is 'submit'. The other 5 events
+        // are unavailable with reason 'wrong_state'.
+        let total = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.events_with_targets('public.orders', '1')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(total, 6);
+
+        let available = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.events_with_targets('public.orders', '1') WHERE available = true",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(available, 1);
+
+        let wrong_state = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.events_with_targets('public.orders', '1') WHERE reason_unavailable = 'wrong_state'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wrong_state, 5);
+    }
+
+    #[pg_test]
+    fn test_machine_diagram_mermaid() {
+        setup_order_machine();
+        let mermaid = Spi::get_one::<String>("SELECT pgfsm.machine_diagram_mermaid('order_flow')")
+            .unwrap()
+            .unwrap();
+        assert!(mermaid.starts_with("stateDiagram-v2"));
+        assert!(mermaid.contains("[*] --> draft"));
+        assert!(mermaid.contains("draft --> submitted: submit"));
+        assert!(mermaid.contains("delivered --> [*]"));
+    }
+
+    #[pg_test]
+    fn test_history_for_paginated() {
+        setup_order_machine();
+        setup_orders_table();
+        Spi::run("INSERT INTO public.orders (status, amount) VALUES ('draft', 100)").unwrap();
+        Spi::run("UPDATE public.orders SET status = 'submitted' WHERE id = 1").unwrap();
+        Spi::run("UPDATE public.orders SET status = 'approved' WHERE id = 1").unwrap();
+
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.history_for_paginated('public.orders', '1', NULL, 2)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 2);
     }
 }
 

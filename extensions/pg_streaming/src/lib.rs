@@ -13,12 +13,15 @@
 use pgrx::prelude::*;
 
 mod config;
-mod connector;
+// `connector`, `processor`, `record` are public to allow companion
+// extensions (e.g., `pg_streaming_xarray`) to register custom
+// sinks/sources/processors via the SDK.
+pub mod connector;
 mod dsl;
 mod engine;
 mod pipeline;
-mod processor;
-mod record;
+pub mod processor;
+pub mod record;
 mod worker;
 
 // Re-export worker entry points so they appear as dynamic symbols
@@ -64,6 +67,71 @@ fn stop(name: &str) {
 #[pg_extern]
 fn restart(name: &str) {
     pipeline::lifecycle::restart_pipeline_impl(name);
+}
+
+// =============================================================================
+// SQL Functions — Secrets management
+// =============================================================================
+
+/// Create or replace a secret referenced by connector configs as `${secret:NAME}`.
+#[pg_extern]
+fn set_secret(name: &str, value: &str, description: default!(Option<&str>, "NULL")) {
+    connector::secrets::set_secret_impl(name, value, description);
+}
+
+/// Drop a secret. Returns true if it existed.
+#[pg_extern]
+fn drop_secret(name: &str) -> bool {
+    connector::secrets::drop_secret_impl(name)
+}
+
+/// List secret names (never values). Returns (name, description, created_at).
+#[pg_extern]
+fn list_secrets() -> TableIterator<
+    'static,
+    (
+        name!(name, String),
+        name!(description, Option<String>),
+        name!(created_at, pgrx::datum::TimestampWithTimeZone),
+    ),
+> {
+    TableIterator::new(connector::secrets::list_secrets_impl())
+}
+
+// =============================================================================
+// SQL Functions — Registry introspection
+//
+// Diagnostic view of what custom connectors are registered in the
+// process-global SDK registries. Useful for verifying that a
+// companion extension's _PG_init (e.g., pg_streaming's xarray
+// feature) actually registered its plugins.
+// =============================================================================
+
+/// List custom input source names registered via the SDK.
+#[pg_extern]
+fn list_custom_sources() -> TableIterator<'static, (name!(name, String),)> {
+    TableIterator::new(
+        connector::registry::list_sources()
+            .into_iter()
+            .map(|n| (n,)),
+    )
+}
+
+/// List custom output sink names registered via the SDK
+/// (covers both async and sync sinks).
+#[pg_extern]
+fn list_custom_sinks() -> TableIterator<'static, (name!(name, String),)> {
+    TableIterator::new(connector::registry::list_sinks().into_iter().map(|n| (n,)))
+}
+
+/// List custom processor names registered via the SDK.
+#[pg_extern]
+fn list_custom_processors() -> TableIterator<'static, (name!(name, String),)> {
+    TableIterator::new(
+        connector::registry::list_processors()
+            .into_iter()
+            .map(|n| (n,)),
+    )
 }
 
 // =============================================================================
@@ -279,6 +347,34 @@ CREATE TABLE pgstreams.metrics (
 );
 
 CREATE INDEX idx_metrics_pipeline ON pgstreams.metrics (pipeline, measured_at);
+
+-- Generic cursor state for non-Kafka connectors (opendal, http_paginated,
+-- webhook, ldes, custom). Per pipeline + connector role.
+CREATE TABLE pgstreams.connector_state (
+    pipeline       TEXT NOT NULL,
+    connector_role TEXT NOT NULL,
+    cursor         JSONB NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (pipeline, connector_role)
+);
+
+-- Named secrets referenced by connector configs as ${secret:NAME}.
+-- Values returned ONLY to engine code; never via observability functions.
+CREATE TABLE pgstreams.secrets (
+    name        TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- LDES member-IRI dedupe (used by the LDES source connector).
+CREATE TABLE pgstreams.ldes_seen_members (
+    stream_url    TEXT NOT NULL,
+    member_iri    TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_url, member_iri)
+);
 "#,
     name = "bootstrap_tables",
     bootstrap
@@ -298,6 +394,20 @@ use std::time::Duration;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // Built-in xarray connectors (only when `--features xarray`). These
+    // would normally live in a separate pgrx extension but two pgrx
+    // cdylibs can't statically link each other (Pg_magic_func / _PG_init
+    // collide), so we fold them in here behind a feature flag. Pipelines
+    // reference them in the DSL as { "custom": { "name": "..." } }.
+    #[cfg(feature = "xarray")]
+    {
+        connector::registry::register_sync_sink(
+            "xarray_index",
+            connector::output::xarray_index::factory,
+        );
+        connector::registry::register_processor("xarray_header", processor::xarray_header::factory);
+    }
+
     // Register GUC settings
     pgrx::GucRegistry::define_bool_guc(
         c"pg_streaming.enabled",
@@ -749,6 +859,98 @@ mod tests {
             }'::jsonb)",
         );
         assert!(id.unwrap().unwrap() > 0);
+    }
+
+    // =========================================================================
+    // Phase 1: Connector framework — state + secrets infrastructure
+    // =========================================================================
+
+    #[pg_test]
+    fn test_connector_state_table_exists() {
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM pgstreams.connector_state");
+        assert_eq!(count, Ok(Some(0)));
+    }
+
+    #[pg_test]
+    fn test_secrets_table_exists() {
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM pgstreams.secrets");
+        assert_eq!(count, Ok(Some(0)));
+    }
+
+    #[pg_test]
+    fn test_ldes_seen_members_table_exists() {
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM pgstreams.ldes_seen_members");
+        assert_eq!(count, Ok(Some(0)));
+    }
+
+    #[pg_test]
+    fn test_set_secret_and_list() {
+        Spi::run("SELECT pgstreams.set_secret('api_token', 'sek-42', 'test token')").unwrap();
+
+        let row = Spi::get_two::<String, String>(
+            "SELECT name, description FROM pgstreams.list_secrets() WHERE name = 'api_token'",
+        );
+        let (name, desc) = row.unwrap();
+        assert_eq!(name, Some("api_token".to_string()));
+        assert_eq!(desc, Some("test token".to_string()));
+
+        // list_secrets must NOT expose the value.
+        let value =
+            Spi::get_one::<String>("SELECT value FROM pgstreams.secrets WHERE name = 'api_token'");
+        assert_eq!(value, Ok(Some("sek-42".to_string())));
+    }
+
+    #[pg_test]
+    fn test_set_secret_overwrites() {
+        Spi::run("SELECT pgstreams.set_secret('rotate_me', 'v1', NULL)").unwrap();
+        Spi::run("SELECT pgstreams.set_secret('rotate_me', 'v2', NULL)").unwrap();
+
+        let value =
+            Spi::get_one::<String>("SELECT value FROM pgstreams.secrets WHERE name = 'rotate_me'");
+        assert_eq!(value, Ok(Some("v2".to_string())));
+    }
+
+    #[pg_test]
+    fn test_drop_secret_returns_true_if_existed() {
+        Spi::run("SELECT pgstreams.set_secret('temp', 'x', NULL)").unwrap();
+        let existed = Spi::get_one::<bool>("SELECT pgstreams.drop_secret('temp')").unwrap();
+        assert_eq!(existed, Some(true));
+
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*)::bigint FROM pgstreams.secrets WHERE name = 'temp'",
+        );
+        assert_eq!(count, Ok(Some(0)));
+    }
+
+    #[pg_test]
+    fn test_drop_secret_returns_false_if_missing() {
+        let existed =
+            Spi::get_one::<bool>("SELECT pgstreams.drop_secret('nonexistent_xyz')").unwrap();
+        assert_eq!(existed, Some(false));
+    }
+
+    #[pg_test]
+    fn test_connector_state_upsert() {
+        Spi::run(
+            "INSERT INTO pgstreams.connector_state (pipeline, connector_role, cursor) \
+             VALUES ('p1', 'input', '42'::jsonb)",
+        )
+        .unwrap();
+
+        Spi::run(
+            "INSERT INTO pgstreams.connector_state (pipeline, connector_role, cursor) \
+             VALUES ('p1', 'input', '100'::jsonb) \
+             ON CONFLICT (pipeline, connector_role) \
+             DO UPDATE SET cursor = EXCLUDED.cursor",
+        )
+        .unwrap();
+
+        let cursor = Spi::get_one::<pgrx::JsonB>(
+            "SELECT cursor FROM pgstreams.connector_state \
+             WHERE pipeline = 'p1' AND connector_role = 'input'",
+        )
+        .unwrap();
+        assert_eq!(cursor.unwrap().0, serde_json::json!(100));
     }
 }
 

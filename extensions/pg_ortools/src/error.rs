@@ -30,6 +30,9 @@ pub enum PgOrtoolsError {
 
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
+
+    #[error("{0}")]
+    Core(#[from] ortools_core::OrtoolsCoreError),
 }
 
 impl From<pgrx::spi::Error> for PgOrtoolsError {

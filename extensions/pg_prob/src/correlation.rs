@@ -16,7 +16,7 @@ use rand_distr::StandardNormal;
 // =============================================================================
 
 /// Error function approximation (Abramowitz & Stegun 7.1.26, max error 1.5e-7)
-fn erf_approx(x: f64) -> f64 {
+pub(crate) fn erf_approx(x: f64) -> f64 {
     let a = x.abs();
     let t = 1.0 / (1.0 + 0.3275911 * a);
     let poly = t
@@ -31,13 +31,13 @@ fn erf_approx(x: f64) -> f64 {
 }
 
 /// Standard normal CDF: Phi(x) = P(Z <= x)
-fn norm_cdf(x: f64) -> f64 {
+pub(crate) fn norm_cdf(x: f64) -> f64 {
     0.5 * (1.0 + erf_approx(x / std::f64::consts::SQRT_2))
 }
 
 /// Cholesky decomposition of a symmetric positive-definite matrix.
 /// Input: flat row-major NxN matrix. Output: flat row-major lower-triangular L.
-fn cholesky(matrix: &[f64], n: usize) -> Result<Vec<f64>, &'static str> {
+pub(crate) fn cholesky(matrix: &[f64], n: usize) -> Result<Vec<f64>, &'static str> {
     let mut l = vec![0.0; n * n];
     for i in 0..n {
         for j in 0..=i {

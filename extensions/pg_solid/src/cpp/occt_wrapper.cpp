@@ -33,8 +33,12 @@
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <TopAbs_State.hxx>
+#include <BRepBuilderAPI_GTransform.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <gp_GTrsf.hxx>
+#include <gp_Mat.hxx>
 #include <gp_Trsf.hxx>
+#include <gp_XYZ.hxx>
 #include <gp_Vec.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Dir.hxx>
@@ -451,16 +455,23 @@ int occt_shape_rotate(void* shape, double ax, double ay, double az,
 
 int occt_shape_transform(void* shape, const double* matrix, void** out) {
     try {
-        gp_Trsf trsf;
         // matrix is 12 doubles: row-major [R11 R12 R13 tx | R21 R22 R23 ty | R31 R32 R33 tz]
-        trsf.SetValues(
-            matrix[0], matrix[1], matrix[2],  matrix[3],
-            matrix[4], matrix[5], matrix[6],  matrix[7],
-            matrix[8], matrix[9], matrix[10], matrix[11]
-        );
-        BRepBuilderAPI_Transform xform(*as_shape(shape), trsf, true);
+        // We use gp_GTrsf + BRepBuilderAPI_GTransform so callers can pass
+        // *any* affine — including anisotropic scaling (e.g. tangent-plane
+        // metres -> degrees, where east and north have different scales).
+        // gp_Trsf::SetValues silently normalises to a rigid + uniform-scale
+        // transform and would corrupt the result.
+        gp_Mat linear(matrix[0], matrix[1], matrix[2],
+                      matrix[4], matrix[5], matrix[6],
+                      matrix[8], matrix[9], matrix[10]);
+        gp_XYZ translation(matrix[3], matrix[7], matrix[11]);
+        gp_GTrsf gtrsf;
+        gtrsf.SetVectorialPart(linear);
+        gtrsf.SetTranslationPart(translation);
+
+        BRepBuilderAPI_GTransform xform(*as_shape(shape), gtrsf, true);
         if (!xform.IsDone()) {
-            set_error("BRepBuilderAPI_Transform (transform) failed");
+            set_error("BRepBuilderAPI_GTransform failed");
             return 1;
         }
         *out = to_heap(xform.Shape());

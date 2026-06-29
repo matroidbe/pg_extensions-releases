@@ -79,6 +79,32 @@ fn validate_input(input: &InputConfig) -> Result<(), String> {
                 }
             }
         }
+        InputConfig::Opendal(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "input.opendal: config must be a JSON object".to_string())?;
+            for required in ["service", "path", "parse_as"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("input.opendal.{} is required", required));
+                }
+            }
+        }
+        InputConfig::HttpPaginated(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "input.http_paginated: config must be a JSON object".to_string())?;
+            if !obj.contains_key("url") {
+                return Err("input.http_paginated.url is required".to_string());
+            }
+            if !obj.contains_key("pagination") {
+                return Err("input.http_paginated.pagination is required".to_string());
+            }
+        }
+        InputConfig::Custom(c) => {
+            if c.name.is_empty() {
+                return Err("input.custom.name is required".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -285,6 +311,11 @@ fn validate_processor(index: usize, proc: &ProcessorConfig) -> Result<(), String
                 ));
             }
         }
+        ProcessorConfig::Custom(c) => {
+            if c.name.is_empty() {
+                return Err(format!("processor[{}].custom.name is required", index));
+            }
+        }
     }
     Ok(())
 }
@@ -346,6 +377,21 @@ fn validate_output(output: &OutputConfig) -> Result<(), String> {
                     }
                 }
                 validate_route_output(&route.output, i)?;
+            }
+        }
+        OutputConfig::Opendal(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "output.opendal: config must be a JSON object".to_string())?;
+            for required in ["service", "path"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("output.opendal.{} is required", required));
+                }
+            }
+        }
+        OutputConfig::Custom(c) => {
+            if c.name.is_empty() {
+                return Err("output.custom.name is required".to_string());
             }
         }
     }
@@ -915,6 +961,112 @@ mod tests {
         let result = validate_definition(&def);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("array expression is required"));
+    }
+
+    // =========================================================================
+    // Opendal + Custom validation
+    // =========================================================================
+
+    #[test]
+    fn test_validate_opendal_input_valid() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Opendal(serde_json::json!({
+            "service": "fs",
+            "path": "x.csv",
+            "parse_as": "csv"
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_opendal_input_missing_path() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Opendal(serde_json::json!({
+            "service": "fs",
+            "parse_as": "csv"
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("path is required"));
+    }
+
+    #[test]
+    fn test_validate_opendal_input_must_be_object() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Opendal(serde_json::json!("not an object"));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_validate_opendal_output_valid() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Opendal(serde_json::json!({
+            "service": "fs",
+            "path": "out.ndjson"
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_opendal_output_missing_service() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Opendal(serde_json::json!({"path": "x"}));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("service is required"));
+    }
+
+    #[test]
+    fn test_validate_custom_input_empty_name() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Custom(CustomConnectorConfig {
+            name: String::new(),
+            config: serde_json::Value::Null,
+        });
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("name is required"));
+    }
+
+    #[test]
+    fn test_validate_custom_input_valid() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Custom(CustomConnectorConfig {
+            name: "acme".into(),
+            config: serde_json::Value::Null,
+        });
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_paginated_valid() {
+        let mut def = minimal_def();
+        def.input = InputConfig::HttpPaginated(serde_json::json!({
+            "url": "https://api/x",
+            "pagination": {
+                "strategy": "page_number",
+                "items_path": "data"
+            }
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_paginated_missing_url() {
+        let mut def = minimal_def();
+        def.input = InputConfig::HttpPaginated(serde_json::json!({
+            "pagination": {"strategy": "page_number", "items_path": "data"}
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("url is required"));
+    }
+
+    #[test]
+    fn test_validate_http_paginated_missing_pagination() {
+        let mut def = minimal_def();
+        def.input = InputConfig::HttpPaginated(serde_json::json!({
+            "url": "https://api/x"
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("pagination is required"));
     }
 
     #[test]

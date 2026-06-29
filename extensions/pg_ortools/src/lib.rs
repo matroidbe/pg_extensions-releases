@@ -8,6 +8,7 @@ use pgrx::prelude::*;
 
 pub mod error;
 mod jobs;
+pub mod metaheuristic;
 mod solver;
 mod worker;
 
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS pgortools.variables (
     var_type TEXT DEFAULT 'int',
     domain_min BIGINT,
     domain_max BIGINT,
+    pinned BOOLEAN DEFAULT false,
     UNIQUE(problem_id, name)
 );
 
@@ -70,8 +72,9 @@ CREATE TABLE IF NOT EXISTS pgortools.constraints (
     id SERIAL PRIMARY KEY,
     problem_id INTEGER REFERENCES pgortools.problems(id) ON DELETE CASCADE,
     name TEXT,
-    expression TEXT NOT NULL,
-    constraint_type TEXT
+    expression TEXT,
+    constraint_type TEXT,
+    constraint_config JSONB
 );
 
 CREATE TABLE IF NOT EXISTS pgortools.solutions (
@@ -251,6 +254,26 @@ fn solve(problem: &str) -> i64 {
     }
 }
 
+/// Solve a problem asynchronously with a specific strategy.
+/// strategy: "mip", "hill_climbing", "tabu_search", "simulated_annealing",
+///           "late_acceptance", "auto"
+/// Returns a job_id that can be polled with solve_status().
+#[pg_extern]
+fn solve_with_strategy(
+    problem: &str,
+    strategy: &str,
+    time_limit_seconds: default!(i32, 30),
+) -> i64 {
+    let config = jobs::SolveJobConfig {
+        time_limit_seconds: Some(time_limit_seconds),
+        strategy: Some(strategy.to_string()),
+    };
+    match jobs::queue_solve_job(problem, &config) {
+        Ok(job_id) => job_id,
+        Err(e) => pgrx::error!("{}", e),
+    }
+}
+
 /// Solve a problem synchronously (blocks until complete).
 /// Use this for quick problems or testing. For larger problems, use solve().
 #[pg_extern]
@@ -268,6 +291,141 @@ fn solve_greedy(problem: &str) -> pgrx::JsonB {
     match solver::solve_problem(problem, true) {
         Ok(solution) => pgrx::JsonB(solution),
         Err(e) => pgrx::error!("{}", e),
+    }
+}
+
+/// Solve a problem using metaheuristic local search.
+/// Returns a JSONB solution with the same format as solve_sync.
+#[pg_extern]
+fn solve_local(
+    problem: &str,
+    algorithm: default!(&str, "'late_acceptance'"),
+    time_limit_seconds: default!(i32, 30),
+) -> pgrx::JsonB {
+    let algo = match metaheuristic::parse_algorithm(algorithm) {
+        Ok(a) => a,
+        Err(e) => pgrx::error!("{}", e),
+    };
+    let time_limit = std::time::Duration::from_secs(time_limit_seconds.max(1) as u64);
+    match metaheuristic::solve_from_db(problem, &algo, time_limit) {
+        Ok(solution) => pgrx::JsonB(solution),
+        Err(e) => pgrx::error!("{}", e),
+    }
+}
+
+/// Automatically choose between MIP and local search based on problem size.
+/// Small problems (< auto_threshold variables) use MIP, larger use local search.
+#[pg_extern]
+fn solve_auto(problem: &str, time_limit_seconds: default!(i32, 60)) -> pgrx::JsonB {
+    // Count variables for this problem
+    let var_count = Spi::get_one_with_args::<i64>(
+        "SELECT COUNT(*)::bigint FROM pgortools.variables v \
+         JOIN pgortools.problems p ON v.problem_id = p.id \
+         WHERE p.name = $1",
+        &[problem.into()],
+    );
+
+    let count = match var_count {
+        Ok(Some(c)) => c,
+        Ok(None) => 0,
+        Err(e) => pgrx::error!("Failed to count variables: {}", e),
+    };
+
+    let threshold = worker::get_auto_threshold() as i64;
+
+    if count < threshold {
+        // Small problem: use MIP
+        match solver::solve_problem(problem, false) {
+            Ok(solution) => pgrx::JsonB(solution),
+            Err(e) => pgrx::error!("{}", e),
+        }
+    } else {
+        // Large problem: use local search
+        let algo_name = worker::get_default_algorithm();
+        let algo = match metaheuristic::parse_algorithm(&algo_name) {
+            Ok(a) => a,
+            Err(e) => pgrx::error!("{}", e),
+        };
+        let time_limit = std::time::Duration::from_secs(time_limit_seconds.max(1) as u64);
+        match metaheuristic::solve_from_db(problem, &algo, time_limit) {
+            Ok(solution) => pgrx::JsonB(solution),
+            Err(e) => pgrx::error!("{}", e),
+        }
+    }
+}
+
+/// Add a typed constraint to a problem (for metaheuristic solving).
+/// constraint_type: capacity, group_balance, no_overlap, skill_match,
+///                  minimize_field, minimize_cost, pin_current
+/// config: JSONB with constraint parameters
+#[pg_extern]
+fn add_typed_constraint(problem: &str, constraint_type: &str, config: pgrx::JsonB) -> bool {
+    if !metaheuristic::is_valid_constraint_type(constraint_type) {
+        pgrx::error!(
+            "Invalid constraint type: '{}'. Valid types: capacity, group_balance, \
+             no_overlap, skill_match, minimize_field, minimize_cost, pin_current",
+            constraint_type
+        );
+    }
+
+    let config_str = config.0.to_string();
+
+    match Spi::run_with_args(
+        r#"
+        INSERT INTO pgortools.constraints (problem_id, constraint_type, constraint_config)
+        SELECT id, $2, $3::jsonb
+        FROM pgortools.problems WHERE name = $1
+        "#,
+        &[problem.into(), constraint_type.into(), config_str.into()],
+    ) {
+        Ok(_) => true,
+        Err(e) => pgrx::error!("Failed to add typed constraint: {}", e),
+    }
+}
+
+/// Pin a variable so the solver doesn't move it.
+#[pg_extern]
+fn pin_variable(problem: &str, var_name: &str) -> bool {
+    let updated = Spi::get_one_with_args::<i64>(
+        r#"
+        UPDATE pgortools.variables v
+        SET pinned = true
+        FROM pgortools.problems p
+        WHERE v.problem_id = p.id AND p.name = $1 AND v.name = $2
+        RETURNING v.id
+        "#,
+        &[problem.into(), var_name.into()],
+    );
+
+    match updated {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(pgrx::spi::SpiError::InvalidPosition) => {
+            pgrx::error!("Variable '{}' not found in problem '{}'", var_name, problem)
+        }
+        Err(e) => pgrx::error!("Failed to pin variable: {}", e),
+    }
+}
+
+/// Unpin a variable so the solver can move it.
+#[pg_extern]
+fn unpin_variable(problem: &str, var_name: &str) -> bool {
+    let updated = Spi::get_one_with_args::<i64>(
+        r#"
+        UPDATE pgortools.variables v
+        SET pinned = false
+        FROM pgortools.problems p
+        WHERE v.problem_id = p.id AND p.name = $1 AND v.name = $2
+        RETURNING v.id
+        "#,
+        &[problem.into(), var_name.into()],
+    );
+
+    match updated {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(pgrx::spi::SpiError::InvalidPosition) => {
+            pgrx::error!("Variable '{}' not found in problem '{}'", var_name, problem)
+        }
+        Err(e) => pgrx::error!("Failed to unpin variable: {}", e),
     }
 }
 
@@ -640,6 +798,248 @@ mod tests {
 
         // Cleanup
         Spi::run("SELECT pgortools.drop_problem('cancel_test')").ok();
+    }
+
+    // =========================================================================
+    // Phase 4: Metaheuristic SQL function tests
+    // =========================================================================
+
+    /// Helper: set up a 3x3 assignment problem with typed constraints
+    fn setup_local_problem(name: &str) {
+        Spi::run(&format!("SELECT pgortools.create_problem('{}')", name)).unwrap();
+        // 3 items × 3 slots = 9 boolean variables
+        for i in 0..3 {
+            for j in 0..3 {
+                Spi::run(&format!(
+                    "SELECT pgortools.add_bool_var('{}', 'x_{}_{}')",
+                    name, i, j
+                ))
+                .unwrap();
+            }
+        }
+    }
+
+    fn cleanup_problem(name: &str) {
+        Spi::run(&format!("SELECT pgortools.drop_problem('{}')", name)).ok();
+    }
+
+    #[pg_test]
+    fn test_add_typed_constraint() {
+        setup_local_problem("tc_test");
+        let result = Spi::get_one::<bool>(
+            "SELECT pgortools.add_typed_constraint('tc_test', 'capacity', '{\"limit\": 1}'::jsonb)",
+        );
+        assert_eq!(result.unwrap(), Some(true));
+
+        // Verify in DB
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*)::bigint FROM pgortools.constraints c \
+             JOIN pgortools.problems p ON c.problem_id = p.id \
+             WHERE p.name = 'tc_test' AND c.constraint_type = 'capacity'",
+        );
+        assert_eq!(count.unwrap(), Some(1));
+        cleanup_problem("tc_test");
+    }
+
+    #[pg_test]
+    fn test_add_typed_constraint_types() {
+        setup_local_problem("tc_types");
+        // Test each valid type
+        let types = vec![
+            ("capacity", r#"{"limit": 1}"#),
+            (
+                "group_balance",
+                r#"{"group_field": "role", "count_per_target": 1}"#,
+            ),
+            (
+                "skill_match",
+                r#"{"feasible": [[true, true, true], [true, true, true], [true, true, true]]}"#,
+            ),
+            (
+                "minimize_field",
+                r#"{"costs": [1.0, 2.0, 3.0], "weight": 1.0}"#,
+            ),
+            (
+                "minimize_cost",
+                r#"{"item_costs": [1.0, 2.0, 3.0], "slot_costs": [10.0, 20.0, 30.0], "weight": 1.0}"#,
+            ),
+            (
+                "pin_current",
+                r#"{"current": [null, null, null], "weight": 10.0}"#,
+            ),
+        ];
+        for (ctype, config) in types {
+            let sql = format!(
+                "SELECT pgortools.add_typed_constraint('tc_types', '{}', '{}'::jsonb)",
+                ctype, config
+            );
+            let result = Spi::get_one::<bool>(&sql);
+            assert_eq!(result.unwrap(), Some(true), "failed for type {}", ctype);
+        }
+        cleanup_problem("tc_types");
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "Invalid constraint type")]
+    fn test_add_typed_constraint_bad_type() {
+        setup_local_problem("tc_bad");
+        Spi::get_one::<bool>(
+            "SELECT pgortools.add_typed_constraint('tc_bad', 'bogus', '{}'::jsonb)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn test_pin_variable() {
+        setup_local_problem("pin_test");
+        let result = Spi::get_one::<bool>("SELECT pgortools.pin_variable('pin_test', 'x_0_0')");
+        assert_eq!(result.unwrap(), Some(true));
+
+        // Verify in DB
+        let pinned = Spi::get_one::<bool>(
+            "SELECT pinned FROM pgortools.variables v \
+             JOIN pgortools.problems p ON v.problem_id = p.id \
+             WHERE p.name = 'pin_test' AND v.name = 'x_0_0'",
+        );
+        assert_eq!(pinned.unwrap(), Some(true));
+        cleanup_problem("pin_test");
+    }
+
+    #[pg_test]
+    fn test_unpin_variable() {
+        setup_local_problem("unpin_test");
+        // Pin then unpin
+        Spi::run("SELECT pgortools.pin_variable('unpin_test', 'x_0_0')").unwrap();
+        let result = Spi::get_one::<bool>("SELECT pgortools.unpin_variable('unpin_test', 'x_0_0')");
+        assert_eq!(result.unwrap(), Some(true));
+
+        let pinned = Spi::get_one::<bool>(
+            "SELECT pinned FROM pgortools.variables v \
+             JOIN pgortools.problems p ON v.problem_id = p.id \
+             WHERE p.name = 'unpin_test' AND v.name = 'x_0_0'",
+        );
+        assert_eq!(pinned.unwrap(), Some(false));
+        cleanup_problem("unpin_test");
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "not found")]
+    fn test_pin_nonexistent_variable() {
+        setup_local_problem("pin_novar");
+        Spi::get_one::<bool>("SELECT pgortools.pin_variable('pin_novar', 'x_99_99')").unwrap();
+    }
+
+    #[pg_test]
+    fn test_solve_local_simple_assignment() {
+        setup_local_problem("sl_simple");
+        // Add capacity constraint
+        Spi::run(
+            "SELECT pgortools.add_typed_constraint('sl_simple', 'capacity', '{\"limit\": 1}'::jsonb)",
+        )
+        .unwrap();
+
+        let result = Spi::get_one::<pgrx::JsonB>(
+            "SELECT pgortools.solve_local('sl_simple', 'late_acceptance', 2)",
+        );
+        assert!(result.is_ok());
+        let solution = result.unwrap().unwrap();
+        assert_eq!(solution.0["status"], "FEASIBLE");
+        assert_eq!(solution.0["method"], "late_acceptance");
+        cleanup_problem("sl_simple");
+    }
+
+    #[pg_test]
+    fn test_solve_local_with_soft_constraints() {
+        setup_local_problem("sl_soft");
+        Spi::run(
+            "SELECT pgortools.add_typed_constraint('sl_soft', 'capacity', '{\"limit\": 1}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run(
+            "SELECT pgortools.add_typed_constraint('sl_soft', 'minimize_cost', \
+             '{\"item_costs\": [1.0, 2.0, 3.0], \"slot_costs\": [10.0, 20.0, 30.0], \"weight\": 1.0}'::jsonb)",
+        )
+        .unwrap();
+
+        let result = Spi::get_one::<pgrx::JsonB>(
+            "SELECT pgortools.solve_local('sl_soft', 'late_acceptance', 2)",
+        );
+        let solution = result.unwrap().unwrap();
+        assert_eq!(solution.0["status"], "FEASIBLE");
+        // Should have a non-zero objective
+        assert!(solution.0["soft_score"].as_i64().unwrap() < 0);
+        cleanup_problem("sl_soft");
+    }
+
+    #[pg_test]
+    fn test_solve_local_returns_values() {
+        setup_local_problem("sl_vals");
+        Spi::run(
+            "SELECT pgortools.add_typed_constraint('sl_vals', 'capacity', '{\"limit\": 1}'::jsonb)",
+        )
+        .unwrap();
+
+        let result = Spi::get_one::<pgrx::JsonB>(
+            "SELECT pgortools.solve_local('sl_vals', 'hill_climbing', 2)",
+        );
+        let solution = result.unwrap().unwrap();
+        let values = solution.0["values"].as_object().unwrap();
+        // Should have x_i_j format values
+        assert!(values.contains_key("x_0_0") || values.contains_key("x_0_1"));
+        // Each item should be assigned to exactly one slot (sum = 1)
+        for i in 0..3 {
+            let sum: i64 = (0..3)
+                .map(|j| {
+                    values
+                        .get(&format!("x_{}_{}", i, j))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                })
+                .sum();
+            assert_eq!(sum, 1, "item {} should be assigned to exactly one slot", i);
+        }
+        cleanup_problem("sl_vals");
+    }
+
+    #[pg_test]
+    fn test_solve_auto_small_uses_mip() {
+        // Create a small MIP problem (< auto_threshold)
+        Spi::run("SELECT pgortools.create_problem('auto_small')").unwrap();
+        Spi::run("SELECT pgortools.add_int_var('auto_small', 'x', 0, 10)").unwrap();
+        Spi::run("SELECT pgortools.add_int_var('auto_small', 'y', 0, 10)").unwrap();
+        Spi::run("SELECT pgortools.add_constraint('auto_small', 'x + y <= 15')").unwrap();
+        Spi::run("SELECT pgortools.maximize('auto_small', 'x + y')").unwrap();
+
+        let result = Spi::get_one::<pgrx::JsonB>("SELECT pgortools.solve_auto('auto_small', 10)");
+        let solution = result.unwrap().unwrap();
+        // Small problem → MIP → OPTIMAL
+        assert_eq!(solution.0["status"], "OPTIMAL");
+        cleanup_problem("auto_small");
+    }
+
+    #[pg_test]
+    fn test_schema_tables_have_new_columns() {
+        // Verify constraint_config column exists
+        let has_config = Spi::get_one::<bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema::text = 'pgortools'
+                  AND table_name::text = 'constraints'
+                  AND column_name::text = 'constraint_config'
+            )",
+        );
+        assert_eq!(has_config.unwrap(), Some(true));
+
+        // Verify pinned column exists
+        let has_pinned = Spi::get_one::<bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema::text = 'pgortools'
+                  AND table_name::text = 'variables'
+                  AND column_name::text = 'pinned'
+            )",
+        );
+        assert_eq!(has_pinned.unwrap(), Some(true));
     }
 }
 

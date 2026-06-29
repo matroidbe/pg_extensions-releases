@@ -791,6 +791,27 @@ pub fn predict(project_name: &str, features: Vec<f64>) -> String {
     }
 }
 
+/// Predict from a JSONB row (preserves categorical/string feature types)
+/// Usage: SELECT pgml.predict_row('my_project', '{"amount": 100, "channel": "web"}'::jsonb)
+#[pg_extern]
+pub fn predict_row(project_name: &str, row: pgrx::JsonB) -> String {
+    let deployed = match models::get_deployed_model(project_name) {
+        Ok(Some(m)) => m,
+        Ok(None) => pgrx::error!("No deployed model found for project '{}'", project_name),
+        Err(e) => pgrx::error!("Model not found: {}", e),
+    };
+
+    match pycaret::run_predict_row(
+        &deployed.model_bytes,
+        &row.0,
+        &deployed.feature_columns,
+        deployed.label_classes.as_deref(),
+    ) {
+        Ok(prediction) => prediction,
+        Err(e) => pgrx::error!("Prediction failed: {}", e),
+    }
+}
+
 /// Get class probabilities using deployed model
 #[pg_extern]
 pub fn predict_proba(project_name: &str, features: Vec<f64>) -> Vec<f64> {

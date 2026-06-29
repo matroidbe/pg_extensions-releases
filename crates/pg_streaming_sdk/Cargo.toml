@@ -1,0 +1,25 @@
+[package]
+name = "pg_streaming_sdk"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "SDK for writing custom pg_streaming connectors as separate pgrx extensions"
+
+[features]
+default = []
+# Feature flags for matching pg_streaming's pgrx version targets.
+pg14 = []
+pg15 = []
+pg16 = []
+pg17 = []
+pg18 = []
+
+[dependencies]
+async-trait = "0.1"
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

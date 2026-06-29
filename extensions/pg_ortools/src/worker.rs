@@ -27,6 +27,13 @@ static SOLVER_DATABASE: pgrx::GucSetting<Option<CString>> =
 /// Solver time limit in seconds
 static SOLVER_TIME_LIMIT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(300);
 
+/// Variable count threshold for auto strategy (MIP below, local search above)
+static AUTO_THRESHOLD: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(500);
+
+/// Default algorithm for local search
+static DEFAULT_ALGORITHM: pgrx::GucSetting<Option<CString>> =
+    pgrx::GucSetting::<Option<CString>>::new(None);
+
 const DEFAULT_DATABASE: &str = "postgres";
 
 /// Register solver worker GUC settings
@@ -74,6 +81,26 @@ pub fn register_gucs() {
             pgrx::GucFlags::default(),
         );
     }
+
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_ortools.auto_threshold",
+        c"Variable count threshold for auto strategy",
+        c"Problems with more variables than this use local search instead of MIP",
+        &AUTO_THRESHOLD,
+        1,
+        1000000,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        c"pg_ortools.default_algorithm",
+        c"Default algorithm for local search",
+        c"Algorithm used by solve_local when not specified (late_acceptance, tabu_search, simulated_annealing, hill_climbing)",
+        &DEFAULT_ALGORITHM,
+        pgrx::GucContext::Userset,
+        pgrx::GucFlags::default(),
+    );
 }
 
 /// Check if solver worker is enabled
@@ -98,6 +125,19 @@ pub fn get_database() -> String {
 #[allow(dead_code)]
 pub fn get_solver_time_limit() -> i32 {
     SOLVER_TIME_LIMIT.get()
+}
+
+/// Get auto threshold (variable count above which local search is used)
+pub fn get_auto_threshold() -> i32 {
+    AUTO_THRESHOLD.get()
+}
+
+/// Get default algorithm name
+pub fn get_default_algorithm() -> String {
+    DEFAULT_ALGORITHM
+        .get()
+        .and_then(|s| s.into_string().ok())
+        .unwrap_or_else(|| "late_acceptance".to_string())
 }
 
 // =============================================================================
@@ -135,10 +175,57 @@ fn process_solve_job(job: jobs::SolveJob) -> Result<(), PgOrtoolsError> {
         return Ok(());
     }
 
-    jobs::update_job_progress(job.id, "solving", 0.1, Some("Building model"))?;
+    let strategy = job.config.strategy.as_deref();
+    let time_limit_secs = job
+        .config
+        .time_limit_seconds
+        .unwrap_or(get_solver_time_limit());
+    let time_limit = Duration::from_secs(time_limit_secs.max(1) as u64);
 
-    // Run the solver
-    let result = crate::solver::solve_problem(&job.problem_name, false);
+    let step_msg = match strategy {
+        Some(s) => format!("Building model (strategy: {})", s),
+        None => "Building model (MIP)".to_string(),
+    };
+    jobs::update_job_progress(job.id, "solving", 0.1, Some(&step_msg))?;
+
+    // Dispatch based on strategy
+    let result = match strategy {
+        Some("hill_climbing")
+        | Some("tabu_search")
+        | Some("simulated_annealing")
+        | Some("late_acceptance") => {
+            let algorithm = crate::metaheuristic::parse_algorithm(strategy.unwrap())?;
+            crate::metaheuristic::solve_from_db(&job.problem_name, &algorithm, time_limit)
+        }
+        Some("auto") => {
+            // Count variables to decide
+            let var_count = Spi::get_one::<i64>(&format!(
+                "SELECT COUNT(*)::bigint FROM pgortools.variables v \
+                 JOIN pgortools.problems p ON v.problem_id = p.id \
+                 WHERE p.name = '{}'",
+                job.problem_name.replace('\'', "''")
+            ))
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
+
+            let threshold = get_auto_threshold() as i64;
+            if var_count < threshold {
+                crate::solver::solve_problem(&job.problem_name, false)
+            } else {
+                let algo_name = get_default_algorithm();
+                let algorithm = crate::metaheuristic::parse_algorithm(&algo_name)?;
+                crate::metaheuristic::solve_from_db(&job.problem_name, &algorithm, time_limit)
+            }
+        }
+        Some("mip") | None => crate::solver::solve_problem(&job.problem_name, false),
+        Some(unknown) => {
+            return Err(PgOrtoolsError::InvalidParameter(format!(
+                "Unknown strategy: '{}'. Valid: mip, hill_climbing, tabu_search, \
+                 simulated_annealing, late_acceptance, auto",
+                unknown
+            )));
+        }
+    };
 
     // Check cancellation before completing
     if jobs::is_job_cancelled(job.id)? {
@@ -147,8 +234,14 @@ fn process_solve_job(job: jobs::SolveJob) -> Result<(), PgOrtoolsError> {
     }
 
     match result {
-        Ok(_solution) => {
+        Ok(solution) => {
             jobs::update_job_progress(job.id, "solving", 0.9, Some("Storing solution"))?;
+
+            // Store solution if the solver didn't already (metaheuristic path)
+            if strategy.is_some() && !matches!(strategy, Some("mip")) {
+                crate::solver::store_solution(&job.problem_name, &solution)?;
+            }
+
             jobs::complete_job(job.id)?;
             jobs::notify_completion(job.id, "completed", &job.problem_name, None)?;
 

@@ -16,6 +16,10 @@ use pgrx::prelude::*;
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SolveJobConfig {
     pub time_limit_seconds: Option<i32>,
+    /// Strategy: "mip", "hill_climbing", "tabu_search", "simulated_annealing",
+    /// "late_acceptance", "auto". None defaults to MIP behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
 }
 
 /// A claimed solve job ready for processing
@@ -291,18 +295,21 @@ mod tests {
     fn test_solve_job_config_default() {
         let config = SolveJobConfig::default();
         assert!(config.time_limit_seconds.is_none());
+        assert!(config.strategy.is_none());
     }
 
     #[test]
     fn test_solve_job_config_serialization() {
         let config = SolveJobConfig {
             time_limit_seconds: Some(60),
+            strategy: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: SolveJobConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.time_limit_seconds, Some(60));
+        assert!(parsed.strategy.is_none());
     }
 
     #[test]
@@ -310,5 +317,49 @@ mod tests {
         assert_eq!(quote_literal("hello"), "'hello'");
         assert_eq!(quote_literal("it's"), "'it''s'");
         assert_eq!(quote_literal(""), "''");
+    }
+
+    #[test]
+    fn test_solve_job_config_with_strategy() {
+        let config = SolveJobConfig {
+            time_limit_seconds: Some(30),
+            strategy: Some("tabu_search".to_string()),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: SolveJobConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.time_limit_seconds, Some(30));
+        assert_eq!(parsed.strategy, Some("tabu_search".to_string()));
+    }
+
+    #[test]
+    fn test_solve_job_config_backward_compat() {
+        // Old JSON without strategy field should deserialize with strategy=None
+        let old_json = r#"{"time_limit_seconds":60}"#;
+        let config: SolveJobConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(config.time_limit_seconds, Some(60));
+        assert!(config.strategy.is_none());
+    }
+
+    #[test]
+    fn test_solve_job_config_all_strategies() {
+        let strategies = vec![
+            "mip",
+            "hill_climbing",
+            "tabu_search",
+            "simulated_annealing",
+            "late_acceptance",
+            "auto",
+        ];
+        for s in strategies {
+            let config = SolveJobConfig {
+                time_limit_seconds: Some(30),
+                strategy: Some(s.to_string()),
+            };
+            let json = serde_json::to_string(&config).unwrap();
+            let parsed: SolveJobConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.strategy.as_deref(), Some(s));
+        }
     }
 }

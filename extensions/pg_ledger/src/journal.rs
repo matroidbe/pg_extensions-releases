@@ -40,6 +40,10 @@ pub fn create_journal_line_internal(
         ],
     )
     .expect("failed to create journal entry");
+    // Accumulate in the per-(sub)xact balance tracker so PRE_COMMIT can
+    // validate without re-querying the table (which fails because the
+    // snapshot is gone by then). See balance.rs / matroidbe/pg_extensions#85.
+    crate::balance::record_entry(debit, credit);
 }
 
 /// Record a debit entry in the journal.
@@ -154,4 +158,34 @@ pub fn reverse(journal_id: i64, reason: default!(Option<&str>, "NULL")) -> i64 {
     });
 
     reversal_id
+}
+
+/// Post a balanced double-entry journal: one debit line and one credit line.
+///
+/// This is the primary API used by ERP modules (pg_sales, pg_purchase, etc.)
+/// to record accounting entries.
+#[pg_extern]
+pub fn post_journal(
+    description: &str,
+    debit_account: &str,
+    credit_account: &str,
+    amount: f64,
+    currency: default!(Option<&str>, "NULL"),
+    source_ref_type: default!(Option<&str>, "NULL"),
+    source_ref_id: default!(Option<i64>, "NULL"),
+) -> i64 {
+    if amount <= 0.0 {
+        pgrx::error!("post_journal amount must be positive, got {}", amount);
+    }
+
+    let currency = currency.unwrap_or("USD");
+    let journal_id = create_journal_header_internal(
+        source_ref_type,
+        source_ref_id.map(|id| id.to_string()).as_deref(),
+        Some(description),
+    );
+    create_journal_line_internal(journal_id, debit_account, amount, 0.0, currency);
+    create_journal_line_internal(journal_id, credit_account, 0.0, amount, currency);
+    crate::balance::mark_ledger_activity();
+    journal_id
 }

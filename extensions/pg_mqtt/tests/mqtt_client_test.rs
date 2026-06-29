@@ -24,7 +24,7 @@ use std::time::Duration;
 #[test]
 fn test_mqtt_connect_and_publish() {
     skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-1", "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new("test-client-1", common::MQTT_HOST, common::MQTT_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, mut connection) = Client::new(mqttoptions, 10);
@@ -91,7 +91,7 @@ fn test_mqtt_connect_and_publish() {
 #[test]
 fn test_mqtt_subscribe() {
     skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-2", "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new("test-client-2", common::MQTT_HOST, common::MQTT_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, mut connection) = Client::new(mqttoptions, 10);
@@ -148,7 +148,7 @@ fn test_mqtt_subscribe() {
 #[test]
 fn test_mqtt_ping() {
     skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-3", "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new("test-client-3", common::MQTT_HOST, common::MQTT_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5)); // rumqttc requires >= 5 secs
 
     let (_client, mut connection) = Client::new(mqttoptions, 10);
@@ -203,7 +203,7 @@ fn test_mqtt_ping() {
 #[test]
 fn test_mqtt_clean_session() {
     skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-4", "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new("test-client-4", common::MQTT_HOST, common::MQTT_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     mqttoptions.set_clean_start(true);
 
@@ -257,7 +257,7 @@ fn test_mqtt_clean_session() {
 
 /// Helper: publish a message via MQTT and wait for the outgoing publish confirmation
 fn mqtt_publish_and_wait(client_id: &str, topic: &str, payload: &[u8]) -> bool {
-    let mut mqttoptions = MqttOptions::new(client_id, "localhost", 1883);
+    let mut mqttoptions = MqttOptions::new(client_id, common::MQTT_HOST, common::MQTT_PORT);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     mqttoptions.set_clean_start(true);
 

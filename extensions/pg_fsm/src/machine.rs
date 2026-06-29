@@ -60,6 +60,7 @@ pub fn add_state(
 }
 
 /// Add a transition between two states in a machine.
+#[allow(clippy::too_many_arguments)]
 #[pg_extern]
 pub fn add_transition(
     machine_name: &str,
@@ -68,6 +69,10 @@ pub fn add_transition(
     event: &str,
     guard: default!(Option<&str>, "NULL"),
     description: default!(Option<&str>, "NULL"),
+    label: default!(Option<&str>, "NULL"),
+    variant: default!(Option<&str>, "NULL"),
+    sort_order: default!(Option<i32>, "0"),
+    confirm_required: default!(Option<bool>, "false"),
 ) -> i32 {
     let machine_id = get_machine_id(machine_name);
 
@@ -88,6 +93,17 @@ pub fn add_transition(
         pgrx::error!("cannot add transition from final state '{}'", from_state);
     }
 
+    // Validate variant if provided
+    if let Some(v) = variant {
+        match v {
+            "default" | "primary" | "danger" | "outline" => {}
+            _ => pgrx::error!(
+                "invalid variant '{}': must be 'default', 'primary', 'danger', or 'outline'",
+                v
+            ),
+        }
+    }
+
     // Auto-assign priority: next available for this (machine, from_state, event) group
     let next_priority = Spi::get_one_with_args::<i32>(
         r#"
@@ -100,10 +116,13 @@ pub fn add_transition(
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
+    let sort_order = sort_order.unwrap_or(0);
+    let confirm_required = confirm_required.unwrap_or(false);
+
     Spi::get_one_with_args::<i32>(
         r#"
-        INSERT INTO pgfsm.transition (machine_id, from_state, to_state, event, guard, priority, description)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO pgfsm.transition (machine_id, from_state, to_state, event, guard, priority, description, label, variant, sort_order, confirm_required)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id
         "#,
         &[
@@ -114,6 +133,10 @@ pub fn add_transition(
             guard.into(),
             next_priority.into(),
             description.into(),
+            label.into(),
+            variant.into(),
+            sort_order.into(),
+            confirm_required.into(),
         ],
     )
     .expect("failed to add transition")
@@ -127,6 +150,7 @@ pub fn add_action(
     action_type: &str,
     action_value: &str,
     run_order: default!(Option<i32>, "0"),
+    phase: default!(Option<&str>, "'after'"),
 ) {
     // Validate action_type
     match action_type {
@@ -135,6 +159,12 @@ pub fn add_action(
             "invalid action_type '{}': must be 'notify', 'sql', or 'function'",
             action_type
         ),
+    }
+
+    let phase = phase.unwrap_or("after");
+    match phase {
+        "before" | "after" => {}
+        _ => pgrx::error!("invalid phase '{}': must be 'before' or 'after'", phase),
     }
 
     // Validate transition exists
@@ -153,14 +183,15 @@ pub fn add_action(
 
     Spi::run_with_args(
         r#"
-        INSERT INTO pgfsm.action (transition_id, action_type, action_value, run_order)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO pgfsm.action (transition_id, action_type, action_value, run_order, phase)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
         &[
             transition_id.into(),
             action_type.into(),
             action_value.into(),
             run_order.into(),
+            phase.into(),
         ],
     )
     .expect("failed to add action");

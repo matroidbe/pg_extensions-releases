@@ -554,6 +554,10 @@ impl Processor for WindowProcessor {
     fn name(&self) -> &str {
         "window"
     }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
 }
 
 impl WindowProcessor {

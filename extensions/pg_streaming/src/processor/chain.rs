@@ -13,10 +13,11 @@ impl ProcessorChain {
     }
 
     /// Process a batch through all processors in sequence.
-    /// If any processor returns an empty batch, short-circuit.
+    /// If any processor returns an empty batch, short-circuit — unless
+    /// the next processor is stateful (e.g., window) and needs ticks.
     pub fn process(&self, mut batch: RecordBatch) -> Result<RecordBatch, String> {
         for proc in &self.processors {
-            if batch.is_empty() {
+            if batch.is_empty() && !proc.is_stateful() {
                 return Ok(batch);
             }
             batch = proc
@@ -24,6 +25,11 @@ impl ProcessorChain {
                 .map_err(|e| format!("{}: {}", proc.name(), e))?;
         }
         Ok(batch)
+    }
+
+    /// Returns true if any processor in the chain is stateful (needs empty-batch ticks).
+    pub fn has_stateful(&self) -> bool {
+        self.processors.iter().any(|p| p.is_stateful())
     }
 
     #[allow(dead_code)]

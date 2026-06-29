@@ -1,0 +1,7 @@
+comment = 'pg_augur: Pure-Rust ML for PostgreSQL (Augur-backed)'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_augur'
+schema = 'pgaugur'
+relocatable = false
+superuser = true
+trusted = false

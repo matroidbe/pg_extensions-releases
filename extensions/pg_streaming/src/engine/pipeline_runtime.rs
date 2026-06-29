@@ -1,12 +1,18 @@
 //! CompiledPipeline — a ready-to-run pipeline with concrete connectors and processors
 
+use crate::connector::bridge::{AsyncSinkBridge, AsyncSourceBridge};
 use crate::connector::input::cdc::CdcInput;
+use crate::connector::input::http_paginated::HttpPaginatedSource;
 use crate::connector::input::kafka::KafkaInput;
+use crate::connector::input::opendal_source::OpendalSource;
 use crate::connector::input::table::TableInput;
 use crate::connector::output::branch::{BranchOutput, Route};
 use crate::connector::output::kafka::{KafkaOutput, TypedTopicOutput};
+use crate::connector::output::opendal_sink::OpendalSink;
 use crate::connector::output::table::TableOutput;
-use crate::connector::{DropOutput, InputConnector, OutputConnector};
+use crate::connector::registry;
+use crate::connector::secrets;
+use crate::connector::{AsyncSink, AsyncSource, DropOutput, InputConnector, OutputConnector};
 use crate::dsl::types::*;
 use crate::processor::aggregate::AggregateProcessor;
 use crate::processor::cep::CepProcessor;
@@ -85,6 +91,41 @@ impl CompiledPipeline {
                     shape,
                 )
             }
+            InputConfig::Opendal(raw_cfg) => {
+                // Resolve secrets in the config before constructing the source.
+                let resolved = secrets::resolve(raw_cfg)
+                    .map_err(|e| format!("opendal input: secret resolution failed: {}", e))?;
+                let source = OpendalSource::from_config(&resolved)?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || Box::new(source));
+                let bridge = AsyncSourceBridge::new("input", factory);
+                // OpenDAL emits records pre-wrapped in the Messages shape so
+                // user SQL like `value_json->>'field'` works.
+                (Box::new(bridge), TopicShape::Messages)
+            }
+            InputConfig::HttpPaginated(raw_cfg) => {
+                let resolved = secrets::resolve(raw_cfg).map_err(|e| {
+                    format!("http_paginated input: secret resolution failed: {}", e)
+                })?;
+                let source = HttpPaginatedSource::from_config(&resolved)?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || Box::new(source));
+                let bridge = AsyncSourceBridge::new("input", factory);
+                (Box::new(bridge), TopicShape::Messages)
+            }
+            InputConfig::Custom(c) => {
+                let factory_fn = registry::lookup_source(&c.name).ok_or_else(|| {
+                    format!("custom input: no source registered with name '{}'", c.name)
+                })?;
+                let resolved = secrets::resolve(&c.config)
+                    .map_err(|e| format!("custom input: secret resolution failed: {}", e))?;
+                let source = factory_fn(&resolved)
+                    .map_err(|e| format!("custom input '{}': factory failed: {}", c.name, e))?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || source);
+                let bridge = AsyncSourceBridge::new("input", factory);
+                (Box::new(bridge), TopicShape::Messages)
+            }
         };
         let input_cte = input_shape.batch_cte();
 
@@ -156,6 +197,26 @@ impl CompiledPipeline {
                 ProcessorConfig::Unnest(config) => {
                     Box::new(UnnestProcessor::new(&config.array, &config.as_field, cte))
                 }
+                ProcessorConfig::Custom(c) => {
+                    let factory = registry::lookup_processor(&c.name).ok_or_else(|| {
+                        format!(
+                            "Processor[{}] custom: no processor registered with name '{}'",
+                            i, c.name
+                        )
+                    })?;
+                    let resolved = secrets::resolve(&c.config).map_err(|e| {
+                        format!(
+                            "Processor[{}] custom '{}': secret resolution failed: {}",
+                            i, c.name, e
+                        )
+                    })?;
+                    factory(&resolved).map_err(|e| {
+                        format!(
+                            "Processor[{}] custom '{}': factory failed: {}",
+                            i, c.name, e
+                        )
+                    })?
+                }
                 other => {
                     return Err(format!(
                         "Processor[{}] type {:?} not yet implemented",
@@ -198,7 +259,7 @@ impl CompiledPipeline {
         // Pull records from input (backpressure via batch_size)
         let (batch, max_offset) = self.input.poll(batch_size)?;
 
-        if batch.is_empty() {
+        if batch.is_empty() && !self.chain.has_stateful() {
             return Ok(ProcessResult {
                 records_in: 0,
                 records_out: 0,
@@ -344,6 +405,33 @@ fn compile_output(config: &OutputConfig) -> Result<Box<dyn OutputConnector>, Str
                 });
             }
             Ok(Box::new(BranchOutput::new(routes)))
+        }
+        OutputConfig::Opendal(raw_cfg) => {
+            let resolved = secrets::resolve(raw_cfg)
+                .map_err(|e| format!("opendal output: secret resolution failed: {}", e))?;
+            let sink = OpendalSink::from_config(&resolved)?;
+            let factory: Box<dyn FnOnce() -> Box<dyn AsyncSink> + Send> =
+                Box::new(move || Box::new(sink));
+            Ok(Box::new(AsyncSinkBridge::new(factory)))
+        }
+        OutputConfig::Custom(c) => {
+            let resolved = secrets::resolve(&c.config)
+                .map_err(|e| format!("custom output: secret resolution failed: {}", e))?;
+            // Prefer a sync sink (SPI-friendly) when registered; otherwise
+            // wrap an async sink via the bridge.
+            if let Some(factory_fn) = registry::lookup_sync_sink(&c.name) {
+                let sink = factory_fn(&resolved).map_err(|e| {
+                    format!("custom sync output '{}': factory failed: {}", c.name, e)
+                })?;
+                return Ok(sink);
+            }
+            let factory_fn = registry::lookup_sink(&c.name).ok_or_else(|| {
+                format!("custom output: no sink registered with name '{}'", c.name)
+            })?;
+            let sink = factory_fn(&resolved)
+                .map_err(|e| format!("custom output '{}': factory failed: {}", c.name, e))?;
+            let factory: Box<dyn FnOnce() -> Box<dyn AsyncSink> + Send> = Box::new(move || sink);
+            Ok(Box::new(AsyncSinkBridge::new(factory)))
         }
     }
 }

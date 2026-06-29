@@ -84,7 +84,7 @@ pub fn update_pipeline_impl(name: &str, definition: pgrx::JsonB) {
 
     let _ = Spi::run_with_args(
         "INSERT INTO pgstreams.pipeline_versions (pipeline_id, version, definition) \
-         SELECT $1, COALESCE(MAX(version), 0) + 1, definition \
+         SELECT $1, COALESCE(MAX(pv.version), 0) + 1, p.definition \
          FROM pgstreams.pipeline_versions pv \
          JOIN pgstreams.pipelines p ON p.id = $1 \
          WHERE pv.pipeline_id = $1 \

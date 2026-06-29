@@ -66,12 +66,12 @@ SELECT pgstreams.create_pipeline('high_value_orders', '{
   },
   "pipeline": {
     "processors": [
-      {"filter": "(value_json->>''amount'')::numeric > 500"},
+      {"filter": "amount > 500"},
       {"mapping": {
-        "order_id":    "value_json->>''order_id''",
-        "customer_id": "(value_json->>''customer_id'')::int",
-        "amount":      "(value_json->>''amount'')::numeric",
-        "currency":    "value_json->>''currency''",
+        "order_id":    "order_id",
+        "customer_id": "customer_id",
+        "amount":      "amount",
+        "currency":    "currency",
         "flagged_at":  "now()"
       }}
     ]

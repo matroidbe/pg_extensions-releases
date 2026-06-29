@@ -29,14 +29,18 @@ CREATE TABLE @extschema@.state (
 -- Transitions: (machine, from_state, event) -> to_state
 -- =============================================================================
 CREATE TABLE @extschema@.transition (
-    id          SERIAL PRIMARY KEY,
-    machine_id  INT NOT NULL REFERENCES @extschema@.machine(id) ON DELETE CASCADE,
-    from_state  TEXT NOT NULL,
-    to_state    TEXT NOT NULL,
-    event       TEXT NOT NULL,
-    guard       TEXT,
-    priority    INT NOT NULL DEFAULT 0,
-    description TEXT,
+    id                SERIAL PRIMARY KEY,
+    machine_id        INT NOT NULL REFERENCES @extschema@.machine(id) ON DELETE CASCADE,
+    from_state        TEXT NOT NULL,
+    to_state          TEXT NOT NULL,
+    event             TEXT NOT NULL,
+    guard             TEXT,
+    priority          INT NOT NULL DEFAULT 0,
+    description       TEXT,
+    label             TEXT,
+    variant           TEXT CHECK (variant IS NULL OR variant IN ('default', 'primary', 'danger', 'outline')),
+    sort_order        INT NOT NULL DEFAULT 0,
+    confirm_required  BOOLEAN NOT NULL DEFAULT false,
     UNIQUE(machine_id, from_state, event, priority)
 );
 
@@ -50,7 +54,8 @@ CREATE TABLE @extschema@.action (
     transition_id   INT NOT NULL REFERENCES @extschema@.transition(id) ON DELETE CASCADE,
     action_type     TEXT NOT NULL CHECK (action_type IN ('notify', 'sql', 'function')),
     action_value    TEXT NOT NULL,
-    run_order       INT NOT NULL DEFAULT 0
+    run_order       INT NOT NULL DEFAULT 0,
+    phase           TEXT NOT NULL DEFAULT 'after' CHECK (phase IN ('before', 'after'))
 );
 
 -- =============================================================================

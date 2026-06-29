@@ -1,0 +1,6 @@
+comment = 'Domain-aware spreadsheet overlays for PostgreSQL - formulas, snapshots, audit'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_sheet'
+relocatable = false
+superuser = false
+schema = pgsheet

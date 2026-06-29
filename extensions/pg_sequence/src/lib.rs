@@ -4,11 +4,13 @@ mod generate;
 mod queries;
 mod schema;
 mod seed;
+pub mod seq_id;
 
 pub use definition::*;
 pub use generate::*;
 pub use queries::*;
 pub use seed::*;
+pub use seq_id::*;
 
 use pgrx::prelude::*;
 
@@ -283,7 +285,7 @@ mod tests {
             "SELECT pgsequence.create_sequence('nf_test', 'INV-', '', '{prefix}{counter}', 5)",
         )
         .unwrap();
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('nf_test')")
+        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('nf_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(v1, "INV-00001");
@@ -294,7 +296,7 @@ mod tests {
         set_search_path();
         Spi::run("SELECT pgsequence.create_sequence('nf_year', 'INV-', '', '{prefix}{year}-{counter}', 5, 1, 1, 'yearly')")
             .unwrap();
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('nf_year')")
+        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('nf_year')::text")
             .unwrap()
             .unwrap();
         // Should match INV-YYYY-00001 pattern
@@ -340,23 +342,23 @@ mod tests {
         Spi::run("SELECT pgsequence.create_sequence('pv_test', 'X-', '', '{prefix}{counter}', 3)")
             .unwrap();
 
-        let p1 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')")
+        let p1 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(p1, "X-001"); // Preview shows what next would be (start_value=1)
 
-        let p2 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')")
+        let p2 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(p2, "X-001"); // Still the same — no increment
 
         // Now actually generate
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('pv_test')")
+        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('pv_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(v1, "X-001"); // First actual generation
 
-        let p3 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')")
+        let p3 = Spi::get_one::<String>("SELECT pgsequence.preview('pv_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(p3, "X-002"); // Preview now shows next
@@ -451,9 +453,10 @@ mod tests {
         )
         .unwrap();
 
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('scope_fmt', 'WH-A')")
-            .unwrap()
-            .unwrap();
+        let v1 =
+            Spi::get_one::<String>("SELECT pgsequence.next_formatted('scope_fmt', 'WH-A')::text")
+                .unwrap()
+                .unwrap();
         assert_eq!(v1, "WH-A/DO-0001");
     }
 
@@ -525,7 +528,7 @@ mod tests {
     fn test_seed_invoice_sequence() {
         set_search_path();
         Spi::run("SELECT pgsequence.seed_common()").unwrap();
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')")
+        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')::text")
             .unwrap()
             .unwrap();
         let year = Spi::get_one::<String>("SELECT to_char(now(), 'YYYY')")
@@ -591,30 +594,33 @@ mod tests {
             .unwrap();
 
         // Generate invoice numbers
-        let inv1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')")
+        let inv1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')::text")
             .unwrap()
             .unwrap();
-        let inv2 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')")
+        let inv2 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')::text")
             .unwrap()
             .unwrap();
         assert_eq!(inv1, format!("INV-{}-00001", year));
         assert_eq!(inv2, format!("INV-{}-00002", year));
 
         // Generate delivery orders (never reset, no year)
-        let do1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('delivery_order')")
-            .unwrap()
-            .unwrap();
+        let do1 =
+            Spi::get_one::<String>("SELECT pgsequence.next_formatted('delivery_order')::text")
+                .unwrap()
+                .unwrap();
         assert_eq!(do1, "DO-000001");
 
         // Generate PO for different scopes
-        let po1 =
-            Spi::get_one::<String>("SELECT pgsequence.next_formatted('purchase_order', 'DEPT-A')")
-                .unwrap()
-                .unwrap();
-        let po2 =
-            Spi::get_one::<String>("SELECT pgsequence.next_formatted('purchase_order', 'DEPT-B')")
-                .unwrap()
-                .unwrap();
+        let po1 = Spi::get_one::<String>(
+            "SELECT pgsequence.next_formatted('purchase_order', 'DEPT-A')::text",
+        )
+        .unwrap()
+        .unwrap();
+        let po2 = Spi::get_one::<String>(
+            "SELECT pgsequence.next_formatted('purchase_order', 'DEPT-B')::text",
+        )
+        .unwrap()
+        .unwrap();
         // Both should be 00001 for their scope
         assert!(po1.contains("00001"));
         assert!(po2.contains("00001"));
@@ -632,13 +638,13 @@ mod tests {
             .unwrap();
         assert_eq!(curr, 2);
 
-        let preview = Spi::get_one::<String>("SELECT pgsequence.preview('invoice')")
+        let preview = Spi::get_one::<String>("SELECT pgsequence.preview('invoice')::text")
             .unwrap()
             .unwrap();
         assert_eq!(preview, format!("INV-{}-00003", year));
 
         // Actual next should match preview
-        let inv3 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')")
+        let inv3 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('invoice')::text")
             .unwrap()
             .unwrap();
         assert_eq!(inv3, format!("INV-{}-00003", year));
@@ -651,18 +657,160 @@ mod tests {
             "SELECT pgsequence.create_sequence('atg_test', 'OLD-', '', '{prefix}{counter}', 3)",
         )
         .unwrap();
-        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('atg_test')")
+        let v1 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('atg_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(v1, "OLD-001");
 
         // Alter prefix
         Spi::run("SELECT pgsequence.alter_sequence('atg_test', 'NEW-')").unwrap();
-        let v2 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('atg_test')")
+        let v2 = Spi::get_one::<String>("SELECT pgsequence.next_formatted('atg_test')::text")
             .unwrap()
             .unwrap();
         assert_eq!(v2, "NEW-002"); // Counter continues, format changes
     }
+
+    // =========================================================================
+    // Phase 4: SeqId type
+    // =========================================================================
+
+    #[pg_test]
+    fn test_seq_id_type_exists() {
+        set_search_path();
+        let exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = 'seqid' AND typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pgsequence'))",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(exists);
+    }
+
+    #[pg_test]
+    fn test_seq_id_column_type() {
+        set_search_path();
+        // Create a table using seq_id as column type
+        Spi::run("CREATE TABLE test_typed_ids (id pgsequence.seqid NOT NULL, amount numeric)")
+            .unwrap();
+
+        // Create a sequence and insert using next_formatted (returns seq_id directly)
+        Spi::run(
+            "SELECT pgsequence.create_sequence('typed_test', 'TT-', '', '{prefix}{counter}', 4)",
+        )
+        .unwrap();
+        Spi::run("INSERT INTO test_typed_ids (id, amount) VALUES (pgsequence.next_formatted('typed_test'), 100.00)")
+            .unwrap();
+
+        // Verify the value via implicit cast to text
+        let val = Spi::get_one::<String>("SELECT id::text FROM test_typed_ids LIMIT 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(val, "TT-0001");
+    }
+
+    #[pg_test]
+    fn test_seq_id_explicit_cast_from_text() {
+        set_search_path();
+        Spi::run("CREATE TABLE test_cast_ids (id pgsequence.seqid NOT NULL)").unwrap();
+
+        // Explicit cast from text to seq_id works
+        Spi::run("INSERT INTO test_cast_ids (id) VALUES ('INV-2026-00050'::pgsequence.seqid)")
+            .unwrap();
+
+        let val = Spi::get_one::<String>("SELECT id::text FROM test_cast_ids LIMIT 1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(val, "INV-2026-00050");
+    }
+
+    #[pg_test]
+    fn test_seq_id_comparison_operators() {
+        set_search_path();
+        Spi::run("CREATE TABLE test_cmp_ids (id pgsequence.seqid NOT NULL)").unwrap();
+        Spi::run("INSERT INTO test_cmp_ids (id) VALUES ('DO-000001'::pgsequence.seqid), ('DO-000002'::pgsequence.seqid), ('DO-000003'::pgsequence.seqid)")
+            .unwrap();
+
+        // Equality
+        let eq_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_cmp_ids WHERE id = 'DO-000002'::pgsequence.seqid",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(eq_count, 1);
+
+        // Ordering
+        let first =
+            Spi::get_one::<String>("SELECT id::text FROM test_cmp_ids ORDER BY id ASC LIMIT 1")
+                .unwrap()
+                .unwrap();
+        assert_eq!(first, "DO-000001");
+
+        let last =
+            Spi::get_one::<String>("SELECT id::text FROM test_cmp_ids ORDER BY id DESC LIMIT 1")
+                .unwrap()
+                .unwrap();
+        assert_eq!(last, "DO-000003");
+
+        // Greater than
+        let gt_count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_cmp_ids WHERE id > 'DO-000001'::pgsequence.seqid",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gt_count, 2);
+    }
+
+    #[pg_test]
+    fn test_seq_id_btree_index() {
+        set_search_path();
+        Spi::run("CREATE TABLE test_idx_ids (id pgsequence.seqid PRIMARY KEY)").unwrap();
+        Spi::run("INSERT INTO test_idx_ids (id) VALUES ('A-001'::pgsequence.seqid), ('A-002'::pgsequence.seqid)")
+            .unwrap();
+
+        // B-tree index should work (PRIMARY KEY creates btree index)
+        let val = Spi::get_one::<String>(
+            "SELECT id::text FROM test_idx_ids WHERE id = 'A-001'::pgsequence.seqid",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(val, "A-001");
+    }
+
+    #[pg_test]
+    fn test_seq_id_implicit_cast_to_text() {
+        set_search_path();
+        // The implicit cast to text should allow using seq_id in text contexts
+        Spi::run(
+            "SELECT pgsequence.create_sequence('cast_test', 'CT-', '', '{prefix}{counter}', 3)",
+        )
+        .unwrap();
+
+        // concat() expects text — implicit cast should kick in
+        let val =
+            Spi::get_one::<String>("SELECT concat('ID: ', pgsequence.next_formatted('cast_test'))")
+                .unwrap()
+                .unwrap();
+        assert_eq!(val, "ID: CT-001");
+    }
+
+    #[pg_test]
+    fn test_seq_id_hash_index() {
+        set_search_path();
+        Spi::run("CREATE TABLE test_hash_ids (id pgsequence.seqid NOT NULL)").unwrap();
+        Spi::run("CREATE INDEX idx_hash ON test_hash_ids USING hash (id)").unwrap();
+        Spi::run("INSERT INTO test_hash_ids (id) VALUES ('H-001'::pgsequence.seqid), ('H-002'::pgsequence.seqid)")
+            .unwrap();
+
+        let count = Spi::get_one::<i64>(
+            "SELECT COUNT(*) FROM test_hash_ids WHERE id = 'H-001'::pgsequence.seqid",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    // =========================================================================
+    // Phase 3: Full workflow (continued)
+    // =========================================================================
 
     #[pg_test]
     fn test_drop_cascade_removes_counters() {

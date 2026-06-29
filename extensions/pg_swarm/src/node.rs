@@ -34,14 +34,20 @@ pub fn node_manager_main() {
     log!("pg_swarm node registered with id={}", node_id);
 
     loop {
+        let heartbeat_secs = GUC_HEARTBEAT_INTERVAL.get() as u64;
+        // wait_latch returns false when WL_POSTMASTER_DEATH fires — sticky once
+        // the postmaster is gone, so we must exit immediately or busy-loop forever.
+        // No deregister on postmaster death: SPI is unusable; peer nodes will
+        // reap this node via cleanup_dead_nodes once the heartbeat times out.
+        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(heartbeat_secs))) {
+            log!("pg_swarm node manager: postmaster died, exiting");
+            break;
+        }
         if BackgroundWorker::sigterm_received() {
             log!("pg_swarm node manager shutting down");
             BackgroundWorker::transaction(|| deregister_node(node_id));
             break;
         }
-
-        let heartbeat_secs = GUC_HEARTBEAT_INTERVAL.get() as u64;
-        BackgroundWorker::wait_latch(Some(Duration::from_secs(heartbeat_secs)));
 
         BackgroundWorker::transaction(|| {
             // Send heartbeat

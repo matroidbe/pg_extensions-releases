@@ -80,3 +80,8 @@ codegen-units = 1
 [patch."https://github.com/matroidbe/pg_extensions"]
 pg_spi = { path = "crates/pg_spi" }
 pg_observability = { path = "crates/pg_observability" }
+
+[patch."https://github.com/matroidbe/augur.git"]
+augur = { path = "../augur/crates/augur" }
+augur-core = { path = "../augur/crates/augur-core" }
+augur-preprocessing = { path = "../augur/crates/augur-preprocessing" }

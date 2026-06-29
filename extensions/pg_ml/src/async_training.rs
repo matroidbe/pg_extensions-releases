@@ -781,6 +781,18 @@ pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
 
     pgrx::log!("pg_ml_training: Python initialized successfully");
 
+    // Ensure pgml schema and tables exist before polling
+    let schema_result: Result<(), PgMlError> = BackgroundWorker::transaction(|| {
+        crate::models::ensure_schema()?;
+        Ok(())
+    });
+    if let Err(e) = schema_result {
+        pgrx::log!("pg_ml_training: failed to ensure schema: {}", e);
+        return;
+    }
+
+    pgrx::log!("pg_ml_training: schema ready");
+
     let poll_interval = get_poll_interval();
 
     // Main loop

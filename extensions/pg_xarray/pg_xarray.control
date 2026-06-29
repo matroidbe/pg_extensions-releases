@@ -1,0 +1,7 @@
+comment = 'Catalog and query layer for chunked scientific arrays (NetCDF, Zarr, HDF5, GRIB, COG, SELAFIN, MED, CGNS, FITS)'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_xarray'
+relocatable = false
+superuser = true
+schema = pgx
+requires = 'postgis'

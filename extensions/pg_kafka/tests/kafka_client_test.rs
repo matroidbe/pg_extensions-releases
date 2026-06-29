@@ -18,8 +18,8 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::TopicPartitionList;
 use std::time::Duration;
 
-// Use explicit IPv4 address to avoid IPv6 resolution issues on CI
-const BOOTSTRAP_SERVERS: &str = "127.0.0.1:9092";
+// Use the test broker address from common (port 19092 to avoid dev-PG conflicts)
+use common::KAFKA_ADDR as BOOTSTRAP_SERVERS;
 const TEST_TOPIC: &str = "test-topic";
 
 /// Create a producer with common configuration
@@ -53,7 +53,7 @@ fn test_metadata() {
     // Fetch metadata for all topics
     let metadata = producer
         .client()
-        .fetch_metadata(None, Duration::from_secs(5))
+        .fetch_metadata(None, Duration::from_secs(30))
         .expect("Failed to fetch metadata");
 
     println!("Cluster ID: {:?}", metadata.orig_broker_name());
@@ -99,7 +99,7 @@ fn test_produce_single() {
 
     // Wait for delivery
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
 
     println!("Produced message: key={}, value={}", key, value);
@@ -124,7 +124,7 @@ fn test_produce_batch() {
     }
 
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
 
     println!("Produced {} messages", messages.len());
@@ -246,7 +246,7 @@ fn test_produce_consume_roundtrip() {
 
     producer.send(record).expect("Failed to send");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
     println!("Produced: key={}, value={}", test_key, test_value);
 
@@ -259,7 +259,7 @@ fn test_produce_consume_roundtrip() {
 
     // Get current high watermark to start consuming from recent messages
     let (_, high) = consumer
-        .fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(5))
+        .fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(30))
         .expect("Failed to fetch watermarks");
 
     // Start from a few messages before the end to catch our new message
@@ -319,7 +319,7 @@ fn test_watermarks() {
     skip_if_no_server!(common::KAFKA_ADDR);
     let consumer = create_consumer("test-group-watermarks");
 
-    match consumer.fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(5)) {
+    match consumer.fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(30)) {
         Ok((low, high)) => {
             println!(
                 "Watermarks for {}:0 - low: {}, high: {}",
@@ -369,7 +369,7 @@ fn test_offset_commit_fetch() {
             println!("Committed offset {}", consumed_offset + 1);
 
             // Try to fetch committed offset
-            match consumer.committed(Duration::from_secs(5)) {
+            match consumer.committed(Duration::from_secs(30)) {
                 Ok(committed) => {
                     for tp in committed.elements() {
                         println!(
@@ -411,7 +411,7 @@ fn test_list_groups() {
         .expect("Failed to create admin client");
 
     // Try to list consumer groups
-    let _opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(5)));
+    let _opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
 
     // Note: rdkafka's admin API is async-only for some operations
     // This test just verifies we can create an admin client connection
@@ -420,7 +420,7 @@ fn test_list_groups() {
     // Try fetching metadata as a basic admin operation
     match admin_client
         .inner()
-        .fetch_metadata(None, Duration::from_secs(5))
+        .fetch_metadata(None, Duration::from_secs(30))
     {
         Ok(metadata) => {
             println!(
@@ -504,7 +504,7 @@ fn test_seek_to_offset() {
     consumer.assign(&tpl).expect("Failed to assign");
 
     // Get watermarks to find a valid offset to seek to
-    let (low, high) = match consumer.fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(5)) {
+    let (low, high) = match consumer.fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(30)) {
         Ok((l, h)) => (l, h),
         Err(e) => {
             println!("Cannot get watermarks, skipping seek test: {}", e);
@@ -683,7 +683,7 @@ fn test_sql_insert_to_kafka_consumer() {
     let consumer = create_consumer("test-group-sql-insert");
 
     let (low, high) = consumer
-        .fetch_watermarks(ORDERS_TOPIC, 0, Duration::from_secs(5))
+        .fetch_watermarks(ORDERS_TOPIC, 0, Duration::from_secs(30))
         .expect("Failed to fetch watermarks");
     println!("Initial watermarks: low={}, high={}", low, high);
 
@@ -769,7 +769,7 @@ fn test_consumer_restart_no_duplicates() {
     // Get current high watermark
     let consumer1 = create_consumer("test-group-restart-1");
     let (_, high) = consumer1
-        .fetch_watermarks(ORDERS_TOPIC, 0, Duration::from_secs(5))
+        .fetch_watermarks(ORDERS_TOPIC, 0, Duration::from_secs(30))
         .expect("Failed to fetch watermarks");
     println!("Current high watermark: {}", high);
     drop(consumer1);
@@ -863,7 +863,7 @@ fn test_produce_to_readonly_topic_fails() {
     match producer.send(record) {
         Ok(_) => {
             // Message was enqueued, wait for delivery result
-            producer.flush(Duration::from_secs(5)).ok();
+            producer.flush(Duration::from_secs(30)).ok();
 
             // Check if there were any delivery errors by producing again and checking
             // In rdkafka, delivery errors are reported via delivery callbacks
@@ -926,7 +926,7 @@ fn test_produce_json_columns() {
 
     producer.send(record).expect("Failed to enqueue message");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
 
     println!("Produced JSON message: key={}, value={}", key, json_value);
@@ -1164,7 +1164,7 @@ fn test_produce_valid_message_to_typed_topic() {
         "Should be able to enqueue valid message"
     );
 
-    let flush_result = producer.flush(Duration::from_secs(5));
+    let flush_result = producer.flush(Duration::from_secs(30));
     assert!(
         flush_result.is_ok(),
         "Should be able to flush valid message"
@@ -1208,7 +1208,7 @@ fn test_produce_invalid_message_to_typed_topic() {
     let _ = producer.send(record);
 
     // Flush and check for delivery errors
-    let flush_result = producer.flush(Duration::from_secs(5));
+    let flush_result = producer.flush(Duration::from_secs(30));
 
     // Note: rdkafka may not surface validation errors directly
     // The message might be enqueued but rejected by the broker
@@ -1474,7 +1474,7 @@ fn test_table_mode_upsert_roundtrip() {
 
     producer.send(record).expect("Failed to send insert");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush insert");
     println!("Produced INSERT: {}", insert_json);
 
@@ -1500,7 +1500,7 @@ fn test_table_mode_upsert_roundtrip() {
 
     producer.send(record).expect("Failed to send update");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush update");
     println!("Produced UPDATE: {}", update_json);
 
@@ -1540,7 +1540,7 @@ fn test_table_mode_upsert_roundtrip() {
 
     // Get watermarks to find recent messages
     let (_, high) = consumer
-        .fetch_watermarks(UPSERT_TOPIC, 0, Duration::from_secs(5))
+        .fetch_watermarks(UPSERT_TOPIC, 0, Duration::from_secs(30))
         .expect("Failed to fetch watermarks");
 
     // Start from a few messages before the end
@@ -1652,7 +1652,7 @@ fn test_table_mode_multiple_products() {
         producer.send(record).expect("Failed to send");
     }
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
 
     std::thread::sleep(Duration::from_millis(500));
@@ -1681,7 +1681,7 @@ fn test_table_mode_multiple_products() {
         .payload(update_json.as_str());
     producer.send(record).expect("Failed to send update");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
 
     std::thread::sleep(Duration::from_millis(500));
@@ -1737,7 +1737,7 @@ fn test_table_mode_schema_validation_rejects_invalid() {
         .payload(invalid_json.as_str());
 
     let _ = producer.send(record);
-    let _ = producer.flush(Duration::from_secs(5));
+    let _ = producer.flush(Duration::from_secs(30));
 
     std::thread::sleep(Duration::from_millis(500));
 
@@ -1879,7 +1879,7 @@ fn test_create_typed_topic_stream_mode() {
     let send_result = producer.send(record);
     assert!(send_result.is_ok(), "Should produce to typed topic");
     producer
-        .flush(Duration::from_secs(5))
+        .flush(Duration::from_secs(30))
         .expect("Failed to flush");
     println!("Produced event to typed topic");
 

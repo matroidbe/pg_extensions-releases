@@ -9,12 +9,21 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_postgres::NoTls;
 
-/// Default MQTT server address
-pub const MQTT_ADDR: &str = "127.0.0.1:1883";
+/// MQTT broker address — uses port 11883 to avoid conflicts with a dev PG
+/// running pg_mqtt on the default 1883. test.sh sets pg_mqtt.port = 11883
+/// in postgresql.conf to match.
+pub const MQTT_HOST: &str = "127.0.0.1";
+pub const MQTT_PORT: u16 = 11883;
+pub const MQTT_ADDR: &str = "127.0.0.1:11883";
 
 /// Default PostgreSQL connection parameters for pgrx-managed instance
 pub const PG_HOST: &str = "localhost";
-pub const PG_PORT: u16 = 28816;
+pub fn pg_port() -> u16 {
+    std::env::var("PG_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(28816)
+}
 pub const PG_DB: &str = "pg_mqtt";
 
 /// Check if server is currently accepting connections
@@ -97,7 +106,7 @@ fn runtime() -> Runtime {
 /// Execute SQL against the pgrx-managed PostgreSQL instance and return the first column of the first row
 pub fn run_sql(sql: &str) -> Result<String, String> {
     runtime().block_on(async {
-        let conn_str = format!("host={} port={} dbname={}", PG_HOST, PG_PORT, PG_DB);
+        let conn_str = format!("host={} port={} dbname={}", PG_HOST, pg_port(), PG_DB);
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .map_err(|e| format!("Failed to connect to PostgreSQL: {}", e))?;
@@ -138,7 +147,7 @@ pub fn run_sql(sql: &str) -> Result<String, String> {
 /// Execute SQL without returning results
 pub fn execute_sql(sql: &str) -> Result<(), String> {
     runtime().block_on(async {
-        let conn_str = format!("host={} port={} dbname={}", PG_HOST, PG_PORT, PG_DB);
+        let conn_str = format!("host={} port={} dbname={}", PG_HOST, pg_port(), PG_DB);
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .map_err(|e| format!("Failed to connect to PostgreSQL: {}", e))?;

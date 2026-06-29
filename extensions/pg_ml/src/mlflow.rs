@@ -242,8 +242,18 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
             }
         }
 
-        // Wait for latch with timeout (handles signals)
-        BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+        // Service ProcSignalBarrier (DROP DATABASE) — wait_latch never runs
+        // CHECK_FOR_INTERRUPTS, and this loop does no SPI that would.
+        pgrx::check_for_interrupts!();
+
+        // Wait for latch with timeout. The return value is false on SIGTERM
+        // or postmaster death — break so a dead postmaster can't leave this
+        // worker spinning on instantly-returning WaitLatch with an orphaned
+        // MLflow subprocess (the kill/wait cleanup below still runs).
+        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(1))) {
+            pgrx::log!("pg_ml_mlflow: latch wait interrupted, shutting down");
+            break;
+        }
 
         // Handle SIGHUP for config reload (currently no-op)
         if BackgroundWorker::sighup_received() {

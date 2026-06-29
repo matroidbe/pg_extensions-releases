@@ -309,8 +309,15 @@ def pycaret_compare_models(n_select=1, sort=None, include=None, exclude=None, bu
     best = compare_models(**kwargs)
     metrics = pull().iloc[0].to_dict()
 
+    # Finalize to get full sklearn Pipeline with preprocessing (handles categorical encoding)
+    if task == 'classification':
+        from pycaret.classification import finalize_model
+    else:
+        from pycaret.regression import finalize_model
+    pipeline = finalize_model(best)
+
     return {
-        'model': pickle.dumps(best),
+        'model': pickle.dumps(pipeline),
         'algorithm': type(best).__name__,
         'metrics': metrics,
         'task': task,
@@ -350,8 +357,15 @@ def pycaret_create_model(algorithm, hyperparams=None):
 
     metrics = pull().iloc[0].to_dict()
 
+    # Finalize to get full sklearn Pipeline with preprocessing (handles categorical encoding)
+    if task == 'classification':
+        from pycaret.classification import finalize_model
+    else:
+        from pycaret.regression import finalize_model
+    pipeline = finalize_model(model)
+
     return {
-        'model': pickle.dumps(model),
+        'model': pickle.dumps(pipeline),
         'algorithm': algorithm,
         'metrics': metrics,
         'task': task,
@@ -602,6 +616,10 @@ def pycaret_forecast(model_bytes, fh=None, return_pred_int=False, alpha=0.05):
 
 def predict(model_bytes, df, label_classes=None):
     """Predict using pickled model.
+
+    Models stored via finalize_model() are sklearn Pipelines that include
+    PyCaret's preprocessing (categorical encoding, etc.), so model.predict(df)
+    handles raw categorical features automatically.
 
     Args:
         model_bytes: Pickled model bytes
@@ -2521,6 +2539,85 @@ pub fn run_predict_single(
             Ok(strs) => strs,
             Err(_) => {
                 // Try extracting as floats and convert to strings
+                let float_preds: Vec<f64> = result.extract().map_err(|e| {
+                    PgMlError::PythonError(format!("Failed to extract predictions: {}", e))
+                })?;
+                float_preds.iter().map(|f| f.to_string()).collect()
+            }
+        };
+
+        predictions
+            .first()
+            .cloned()
+            .ok_or_else(|| PgMlError::PythonError("No predictions returned".to_string()))
+    })
+}
+
+/// Predict from a JSONB row (preserves categorical/string feature types)
+pub fn run_predict_row(
+    model_bytes: &[u8],
+    row: &serde_json::Value,
+    feature_columns: &[String],
+    label_classes: Option<&[String]>,
+) -> Result<String, PgMlError> {
+    crate::ensure_python()?;
+
+    Python::with_gil(|py| {
+        let module = get_pycaret_module(py)?;
+        let predict_fn = module.getattr("predict").map_err(PgMlError::from)?;
+
+        let pd = py.import("pandas").map_err(PgMlError::from)?;
+        let data = PyDict::new(py);
+        if let serde_json::Value::Object(map) = row {
+            for col in feature_columns {
+                if let Some(val) = map.get(col) {
+                    let py_val: Bound<'_, PyAny> = match val {
+                        serde_json::Value::Number(n) => {
+                            if let Some(f) = n.as_f64() {
+                                PyList::new(py, [f]).map_err(PgMlError::from)?.into_any()
+                            } else {
+                                PyList::new(py, [n.to_string()])
+                                    .map_err(PgMlError::from)?
+                                    .into_any()
+                            }
+                        }
+                        serde_json::Value::Bool(b) => {
+                            PyList::new(py, [*b]).map_err(PgMlError::from)?.into_any()
+                        }
+                        serde_json::Value::String(s) => PyList::new(py, [s.as_str()])
+                            .map_err(PgMlError::from)?
+                            .into_any(),
+                        _ => PyList::new(py, [val.to_string()])
+                            .map_err(PgMlError::from)?
+                            .into_any(),
+                    };
+                    data.set_item(col, py_val).map_err(PgMlError::from)?;
+                }
+            }
+        }
+
+        let df = pd
+            .call_method1("DataFrame", (data,))
+            .map_err(PgMlError::from)?;
+
+        let py_bytes = PyBytes::new(py, model_bytes);
+
+        let py_label_classes = match label_classes {
+            Some(classes) if !classes.is_empty() => {
+                PyList::new(py, classes.iter().map(|s| s.as_str()))
+                    .map_err(PgMlError::from)?
+                    .into_any()
+            }
+            _ => py.None().into_bound(py),
+        };
+
+        let result = predict_fn
+            .call1((py_bytes, df, py_label_classes))
+            .map_err(PgMlError::from)?;
+
+        let predictions: Vec<String> = match result.extract::<Vec<String>>() {
+            Ok(strs) => strs,
+            Err(_) => {
                 let float_preds: Vec<f64> = result.extract().map_err(|e| {
                     PgMlError::PythonError(format!("Failed to extract predictions: {}", e))
                 })?;

@@ -1510,6 +1510,391 @@ mod tests {
         .expect("NULL");
         assert!(has_props, "wall should have properties");
     }
+
+    // ===== Phase 8: Georeferencing =====
+
+    fn ifc_georef_file() -> String {
+        format!(
+            "{}/test_data/georef_building.ifc",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    #[pg_test]
+    fn test_ifc_site_location_returns_lat_lon() {
+        set_search_path();
+        let path = ifc_georef_file();
+        let row = Spi::get_three::<f64, f64, f64>(&format!(
+            "SELECT lat, lon, elevation FROM ifc_site_location('{path}')"
+        ))
+        .expect("SPI failed");
+        let lat = row.0.expect("NULL lat");
+        let lon = row.1.expect("NULL lon");
+        let elev = row.2.expect("NULL elev");
+        assert!((lat - 50.833_333_333).abs() < 1e-6, "lat = {lat}");
+        assert!((lon - 4.35).abs() < 1e-6, "lon = {lon}");
+        assert!((elev - 15.0).abs() < 1e-9, "elev = {elev}");
+    }
+
+    #[pg_test]
+    fn test_ifc_site_location_no_geo_returns_nulls() {
+        set_search_path();
+        let path = ifc_test_file(); // minimal_building has no geo fields
+        let lat = Spi::get_one::<f64>(&format!("SELECT lat FROM ifc_site_location('{path}')"))
+            .expect("SPI failed");
+        assert!(lat.is_none(), "expected NULL lat for non-georef fixture");
+    }
+
+    #[pg_test]
+    fn test_ifc_map_conversion_returns_crs() {
+        set_search_path();
+        let path = ifc_georef_file();
+        let target = Spi::get_one::<String>(&format!(
+            "SELECT target_crs FROM ifc_map_conversion('{path}')"
+        ))
+        .expect("SPI failed");
+        assert_eq!(target.as_deref(), Some("EPSG:32631"));
+    }
+
+    #[pg_test]
+    fn test_ifc_map_conversion_eastings_northings() {
+        set_search_path();
+        let path = ifc_georef_file();
+        let row = Spi::get_three::<f64, f64, f64>(&format!(
+            "SELECT eastings, northings, orthogonal_height FROM ifc_map_conversion('{path}')"
+        ))
+        .expect("SPI failed");
+        assert_eq!(row.0, Some(597_500.0));
+        assert_eq!(row.1, Some(5_630_500.0));
+        assert_eq!(row.2, Some(15.0));
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_default_4326_lands_near_site() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // Default target_srid = 4326 (geographic). Wall sits at IFC local
+        // x = 10; tangent-plane around (50.8333°, 4.35°) maps that to
+        // ~10/(111319 * cos(50.83°)) ≈ 1.42e-4° east of the site longitude.
+        let pt = Spi::get_one::<crate::Point3D>(&format!(
+            "SELECT solid_centroid(solid_georeference(solid, '{path}')) \
+             FROM ifc_elements('{path}') WHERE ifc_type = 'IfcWall' LIMIT 1"
+        ))
+        .expect("SPI failed")
+        .expect("NULL centroid");
+        // lon ≈ 4.35 + (10 / (111319 * cos(50.8333°))) ≈ 4.3501424
+        assert!(
+            (pt.x - 4.350_142).abs() < 1e-5,
+            "expected lon near 4.350142, got {}",
+            pt.x
+        );
+        // lat ≈ 50.8333 (wall has y ≈ 0 in IFC local)
+        assert!(
+            (pt.y - 50.833_333).abs() < 1e-5,
+            "expected lat near 50.8333, got {}",
+            pt.y
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_projected_srid_keeps_utm_metres() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // Asking for target_srid = 32631 honours the file's IfcMapConversion
+        // verbatim — output is UTM 31N metres. Wall centroid lands near
+        // (eastings + 10, northings, +height/2).
+        let pt = Spi::get_one::<crate::Point3D>(&format!(
+            "SELECT solid_centroid(solid_georeference(solid, '{path}', 32631)) \
+             FROM ifc_elements('{path}') WHERE ifc_type = 'IfcWall' LIMIT 1"
+        ))
+        .expect("SPI failed")
+        .expect("NULL centroid");
+        assert!(
+            (pt.x - 597_510.0).abs() < 1.0,
+            "expected UTM x near 597510, got {}",
+            pt.x
+        );
+        assert!(
+            (pt.y - 5_630_500.0).abs() < 1.0,
+            "expected UTM y near 5_630_500, got {}",
+            pt.y
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_srid_mismatch_errors() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // File is EPSG:32631 — asking for 32632 must error.
+        let result = std::panic::catch_unwind(|| {
+            Spi::get_one::<f64>(&format!(
+                "SELECT solid_volume(solid_georeference(solid, '{path}', 32632)) \
+                 FROM ifc_elements('{path}') WHERE ifc_type = 'IfcWall' LIMIT 1"
+            ))
+        });
+        assert!(
+            result.is_err(),
+            "solid_georeference must error when target_srid disagrees with IfcProjectedCRS"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_no_site_lat_lon_errors_at_4326() {
+        set_search_path();
+        let path = ifc_test_file(); // no IfcSite lat/lon
+                                    // Default target_srid = 4326 now requires IfcSite lat/lon.
+        let result = std::panic::catch_unwind(|| {
+            Spi::get_one::<f64>(&format!(
+                "SELECT solid_volume(solid_georeference(solid, '{path}')) \
+                 FROM ifc_elements('{path}') WHERE ifc_type = 'IfcWall' LIMIT 1"
+            ))
+        });
+        assert!(
+            result.is_err(),
+            "solid_georeference at target_srid=4326 must error without IfcSite lat/lon"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_lonlat_default_4326_is_tangent_plane() {
+        set_search_path();
+        // Default target_srid = 4326. Box at (lat=50.8333°, lon=4.35°)
+        // with local centre at (50, 50, 50):
+        //   lon ≈ 4.35 + 50/(111319 * cos(50.83°)) ≈ 4.350710
+        //   lat ≈ 50.8333 + 50/111319                ≈ 50.833783
+        //   elev = 0 + 50 = 50
+        let pt = Spi::get_one::<crate::Point3D>(
+            "SELECT solid_centroid(solid_georeference_lonlat(\
+                solid_box(100, 100, 100), 50.833333, 4.35, 0.0))",
+        )
+        .expect("SPI failed")
+        .expect("NULL centroid");
+        assert!(
+            (pt.x - 4.350_710).abs() < 1e-5,
+            "lon expected ~4.350710, got {}",
+            pt.x
+        );
+        assert!(
+            (pt.y - 50.833_783).abs() < 1e-5,
+            "lat expected ~50.833783, got {}",
+            pt.y
+        );
+        assert!((pt.z - 50.0).abs() < 1.0, "elev expected ~50, got {}", pt.z);
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_lonlat_4978_is_ecef() {
+        set_search_path();
+        // target_srid = 4978: same anchor (lat=0, lon=0, elev=0) lands at
+        // ECEF (6378137, 0, 0); box centre maps to (origin_x + 50, 50, 50).
+        let pt = Spi::get_one::<crate::Point3D>(
+            "SELECT solid_centroid(solid_georeference_lonlat(\
+                solid_box(100, 100, 100), 0.0, 0.0, 0.0, 0.0, 1.0, 4978))",
+        )
+        .expect("SPI failed")
+        .expect("NULL centroid");
+        assert!(
+            (pt.x - (6_378_137.0 + 50.0)).abs() < 1.0,
+            "ECEF x expected ~6378187, got {}",
+            pt.x
+        );
+        assert!(
+            (pt.y - 50.0).abs() < 1.0,
+            "ECEF y expected ~50, got {}",
+            pt.y
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_georeference_lonlat_invalid_srid_errors() {
+        set_search_path();
+        let result = std::panic::catch_unwind(|| {
+            Spi::get_one::<f64>(
+                "SELECT solid_volume(solid_georeference_lonlat(\
+                  solid_box(100, 100, 100), 0.0, 0.0, 0.0, 0.0, 1.0, 12345))",
+            )
+        });
+        assert!(
+            result.is_err(),
+            "solid_georeference_lonlat must error on unsupported target_srid"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_to_glb_embeds_srid_metadata() {
+        set_search_path();
+        // Default target_srid = 4326. JSON chunk of the GLB should embed
+        // "srid":4326 and "axis_order":"longitude_deg...".
+        let glb = Spi::get_one::<Vec<u8>>("SELECT solid_to_glb(solid_box(10, 10, 10))")
+            .expect("SPI failed")
+            .expect("NULL glb");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        assert!(
+            json.contains("\"srid\":4326"),
+            "GLB asset.extras missing srid=4326: {json}"
+        );
+        assert!(
+            json.contains("longitude_deg"),
+            "GLB asset.extras missing axis_order hint: {json}"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_to_glb_explicit_srid_passes_through() {
+        set_search_path();
+        let glb =
+            Spi::get_one::<Vec<u8>>("SELECT solid_to_glb(solid_box(10, 10, 10), 0.1, 0.5, 32631)")
+                .expect("SPI failed")
+                .expect("NULL glb");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        assert!(
+            json.contains("\"srid\":32631"),
+            "GLB asset.extras missing srid=32631: {json}"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_to_glb_georef_path_transforms_vertices() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // Default target_srid=4326 + georef_path → tessellate the
+        // FIRST IFC wall in local metres, then transform the vertex
+        // buffer to (lon°, lat°, m). Parse the GLB and assert the
+        // POSITION bbox lies near (4.35°, 50.83°).
+        let glb = Spi::get_one::<Vec<u8>>(&format!(
+            "SELECT solid_to_glb(solid, 0.1, 0.5, 4326, '{path}') \
+             FROM ifc_elements('{path}') WHERE ifc_type = 'IfcWall' LIMIT 1"
+        ))
+        .expect("SPI failed")
+        .expect("NULL glb");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        assert!(json.contains("\"srid\":4326"), "expected srid 4326: {json}");
+        // glTF POSITION accessor includes a "min" array; pull the first
+        // number out and verify it sits near 4.35° (lon) instead of
+        // near 0 (the IFC-local x).
+        let needle = "\"min\":[";
+        let i = json
+            .find(needle)
+            .expect("no POSITION min array in glTF JSON");
+        let after = &json[i + needle.len()..];
+        let comma = after.find(',').unwrap();
+        let lon_min: f64 = after[..comma].parse().expect("lon_min not f64");
+        assert!(
+            (4.30..4.40).contains(&lon_min),
+            "expected POSITION min[0] near 4.35° (lon), got {lon_min} — \
+             render-time georef did not run"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_to_glb_no_georef_path_stays_local() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // No georef_path → vertices stay in IFC local metres (~x=10).
+        let glb = Spi::get_one::<Vec<u8>>(&format!(
+            "SELECT solid_to_glb(solid) \
+             FROM ifc_elements('{path}') \
+             WHERE ifc_type = 'IfcWall' AND solid IS NOT NULL LIMIT 1"
+        ))
+        .expect("SPI failed")
+        .expect("NULL glb");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        let i = json.find("\"min\":[").unwrap();
+        let after = &json[i + "\"min\":[".len()..];
+        let comma = after.find(',').unwrap();
+        let lon_min: f64 = after[..comma].parse().unwrap();
+        assert!(
+            lon_min < 50.0,
+            "expected local-metre coords (~7m), got {lon_min}"
+        );
+    }
+
+    #[pg_test]
+    fn test_solids_to_multi_glb_one_mesh_per_input() {
+        set_search_path();
+        let path = ifc_georef_file();
+        let glb = Spi::get_one::<Vec<u8>>(&format!(
+            "SELECT solids_to_multi_glb(\
+                 array_agg(solid), \
+                 array_agg(global_id), \
+                 0.1, 0.5, 4326, '{path}'\
+             ) FROM ifc_elements('{path}') WHERE solid IS NOT NULL"
+        ))
+        .expect("SPI failed")
+        .expect("NULL glb");
+        assert_eq!(&glb[0..4], b"glTF", "missing GLB magic");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        // The fixture has 1 wall — multi_glb should still emit a valid
+        // GLB with mesh_count = 1 and one named node.
+        assert!(
+            json.contains("\"mesh_count\":1"),
+            "mesh_count missing or != 1: {json}"
+        );
+        assert!(
+            json.contains("\"name\":\"0005_WALL_____GUID\""),
+            "expected wall name in nodes[0].name: {json}"
+        );
+        assert!(json.contains("\"srid\":4326"), "expected srid 4326: {json}");
+    }
+
+    #[pg_test]
+    fn test_solids_to_multi_glb_local_when_no_georef() {
+        set_search_path();
+        let path = ifc_georef_file();
+        // Without georef_path, vertices stay in local metres.
+        let glb = Spi::get_one::<Vec<u8>>(&format!(
+            "SELECT solids_to_multi_glb(array_agg(solid), array_agg(global_id)) \
+             FROM ifc_elements('{path}') WHERE solid IS NOT NULL"
+        ))
+        .expect("SPI failed")
+        .expect("NULL glb");
+        let json_start = 20;
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let json = std::str::from_utf8(&glb[json_start..json_start + json_len])
+            .expect("non-utf8 JSON chunk");
+        let i = json.find("\"min\":[").unwrap();
+        let after = &json[i + "\"min\":[".len()..];
+        let comma = after.find(',').unwrap();
+        let lon_min: f64 = after[..comma].parse().unwrap();
+        assert!(
+            lon_min < 50.0,
+            "expected local-metre POSITION min, got {lon_min}"
+        );
+    }
+
+    #[pg_test]
+    fn test_solid_footprint_wkt_parses() {
+        set_search_path();
+        let wkt = Spi::get_one::<String>("SELECT solid_footprint_wkt(solid_box(100, 200, 300))")
+            .expect("SPI failed")
+            .expect("NULL");
+        assert!(wkt.starts_with("POLYGON Z (("), "wkt = {wkt}");
+        assert!(wkt.matches(',').count() == 4, "5-vertex closed ring");
+    }
+
+    #[pg_test]
+    fn test_solid_bbox_wkt_parses() {
+        set_search_path();
+        let wkt = Spi::get_one::<String>("SELECT solid_bbox_wkt(solid_box(100, 200, 300))")
+            .expect("SPI failed")
+            .expect("NULL");
+        assert!(wkt.starts_with("POLYGON Z (("), "wkt = {wkt}");
+    }
 }
 
 #[cfg(test)]

@@ -132,7 +132,7 @@ pub extern "C-unwind" fn _PG_init() {
         &PG_S3_WORKER_COUNT,
         1,
         16,
-        pgrx::GucContext::Postmaster,
+        pgrx::GucContext::Sighup,
         pgrx::GucFlags::default(),
     );
 

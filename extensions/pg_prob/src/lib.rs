@@ -14,12 +14,14 @@ mod distribution;
 mod fitting;
 mod operators;
 mod sampling;
+mod simulate;
 
 pub use correlation::*;
 pub use distribution::*;
 pub use fitting::*;
 pub use operators::*;
 pub use sampling::*;
+pub use simulate::*;
 
 use pgrx::prelude::*;
 

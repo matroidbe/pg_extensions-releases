@@ -1,0 +1,30 @@
+[package]
+name = "pgx_zarr_walker"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Self-contained Zarr v3 header walker — opens a store, reads zarr.json, returns per-chunk records with chunk_key + bbox. No pgrx, no cdylib; shared by pg_xarray and pg_streaming."
+
+[lib]
+# Plain rlib so both pg_xarray.so and pg_streaming.so can statically link
+# this without any pgrx-symbol collisions.
+crate-type = ["lib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+opendal = { version = "0.50", features = ["services-fs", "services-http"] }
+# NOTE: do not set `default-features = false` on opendal — its default
+# pulls in `reqwest/rustls-tls`, without which the HTTP backend has no
+# TLS support and `https://` URLs fail with "invalid URL, scheme is not
+# http" from hyper.
+# Decoders for Zarr v3's most common compression codecs. Sharding is
+# deferred — that's a separate codec category with its own state.
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }

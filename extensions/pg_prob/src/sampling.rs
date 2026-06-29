@@ -491,7 +491,12 @@ pub fn stddev(dist: Dist, n: default!(i32, 10000), seed: default!(Option<i64>, "
     var.sqrt()
 }
 
-/// Compute the covariance between two distributions via paired Monte Carlo sampling
+/// Compute the covariance between two distributions via paired Monte Carlo sampling.
+///
+/// DEPRECATED: This function samples each distribution independently, so it always
+/// returns near-zero for any pair of distributions. Use `fit_correlation(x, y)` on
+/// table data to discover real correlations, or use `correlated_pair()` /
+/// `correlated_sample()` for correlated sampling.
 #[pg_extern(immutable, parallel_safe)]
 pub fn covariance(
     dist1: Dist,
@@ -502,6 +507,11 @@ pub fn covariance(
     if n <= 0 {
         pgrx::error!("n must be positive");
     }
+
+    pgrx::warning!(
+        "covariance(dist, dist) samples independently and always returns near-zero. \
+         Use fit_correlation(x, y) on table data instead."
+    );
 
     let mut rng = make_rng(seed);
     let mut sum1 = 0.0_f64;
@@ -520,7 +530,12 @@ pub fn covariance(
     sum12 / n_f - (sum1 / n_f) * (sum2 / n_f)
 }
 
-/// Compute the Pearson correlation between two distributions via paired Monte Carlo sampling
+/// Compute the Pearson correlation between two distributions via paired Monte Carlo sampling.
+///
+/// DEPRECATED: This function samples each distribution independently, so it always
+/// returns near-zero for any pair of distributions. Use `fit_correlation(x, y)` on
+/// table data to discover real correlations, or use `correlated_pair()` /
+/// `correlated_sample()` for correlated sampling.
 #[pg_extern(immutable, parallel_safe)]
 pub fn correlation(
     dist1: Dist,
@@ -531,6 +546,11 @@ pub fn correlation(
     if n <= 0 {
         pgrx::error!("n must be positive");
     }
+
+    pgrx::warning!(
+        "correlation(dist, dist) samples independently and always returns near-zero. \
+         Use fit_correlation(x, y) on table data instead."
+    );
 
     let mut rng = make_rng(seed);
     let mut sum1 = 0.0_f64;

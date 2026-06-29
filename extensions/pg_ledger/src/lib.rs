@@ -53,9 +53,13 @@ pub extern "C-unwind" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Register permanent transaction callback
+    // Register permanent transaction callbacks. The sub-xact callback is
+    // what lets SAVEPOINT rollbacks correctly discard journal entries
+    // recorded inside the savepoint — without it, the balance check sees
+    // entries that aren't actually in the database.
     unsafe {
         pg_sys::RegisterXactCallback(Some(ledger_xact_callback), std::ptr::null_mut());
+        pg_sys::RegisterSubXactCallback(Some(ledger_subxact_callback), std::ptr::null_mut());
     }
 
     pgrx::log!("pg_ledger: initialized");
@@ -68,6 +72,11 @@ unsafe extern "C-unwind" fn ledger_xact_callback(
 ) {
     match event {
         pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT => {
+            // Balance is validated from in-memory accumulators populated
+            // by `record_entry` — no SPI, so no snapshot needed. This
+            // fixes the long-standing bug where the old SPI-based check
+            // failed with "cannot execute SQL without an outer snapshot
+            // or portal" because PRE_COMMIT runs after snapshot teardown.
             if PG_LEDGER_ENABLED.get() && balance::has_ledger_activity() {
                 balance::validate_transaction_balance();
             }
@@ -76,6 +85,21 @@ unsafe extern "C-unwind" fn ledger_xact_callback(
         pg_sys::XactEvent::XACT_EVENT_ABORT => {
             balance::clear_ledger_activity();
         }
+        _ => {}
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn ledger_subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut std::os::raw::c_void,
+) {
+    match event {
+        pg_sys::SubXactEvent::SUBXACT_EVENT_START_SUB => balance::push_subxact(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_COMMIT_SUB => balance::pop_subxact_commit(),
+        pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB => balance::pop_subxact_abort(),
         _ => {}
     }
 }

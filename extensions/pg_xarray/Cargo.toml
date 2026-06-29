@@ -1,0 +1,79 @@
+[package]
+name = "pg_xarray"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Postgres-hosted catalog and query layer for chunked scientific arrays"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_xarray"
+path = "src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg16"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+# Format-reader Cargo features — opt-in to keep base build small.
+# `memory` (always on), `zarr` (in-tree minimal — always on, no extra dep),
+# `grib` (gated by reader-grib for the gribberish dep),
+# `netcdf` (gated by reader-netcdf for the netcdf crate — needs
+# libnetcdf-dev + libhdf5-dev installed on the build host).
+reader-grib = ["dep:gribberish"]
+reader-netcdf = ["dep:netcdf"]
+reader-all = ["reader-grib", "reader-netcdf"]
+
+[dependencies]
+pgrx.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
+thiserror.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+bytes.workspace = true
+futures.workspace = true
+chrono.workspace = true
+async-trait = "0.1"
+url = { workspace = true }
+opendal = { version = "0.50", features = [
+    "services-fs",
+    "services-http",
+    # Public + private object stores. Enabled by default so
+    # `pgx.register_file(..., 's3://bucket/key.grib2', 'grib2')` works
+    # out of the box against AWS / GCS / Azure Blob — the catalog
+    # stays local while the bytes live in the cloud bucket.
+    "services-s3",
+    "services-gcs",
+    "services-azblob",
+] }
+# NOTE: do not set `default-features = false` on opendal — its default
+# pulls in `reqwest/rustls-tls`, without which the HTTP backend has no
+# TLS support and `https://` URLs fail with "invalid URL, scheme is not
+# http" from hyper. The other defaults (services-memory, executors-tokio)
+# are already what we need.
+
+# Shared Zarr v3 header walker — used by `pgx.register_file` so the same
+# per-chunk bbox logic is exercised by both the pipeline path and the
+# direct (no-pipeline) catalog path.
+pgx_zarr_walker = { path = "../../crates/pgx_zarr_walker" }
+
+# Optional format readers (gated by Cargo features above)
+gribberish = { version = "0.21", optional = true, default-features = false }
+netcdf = { version = "0.10", optional = true }
+
+# Image encoding for the 2D raster path (xarray_to_png + WMS GetMap).
+# Pin matches pg_image/Cargo.toml. Default-features off + only PNG to
+# keep the binary tight — WMS only emits image/png for v1.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+pgrx-tests = "0.16"
+tokio = { workspace = true, features = ["rt", "macros"] }

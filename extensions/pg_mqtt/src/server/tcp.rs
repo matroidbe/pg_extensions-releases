@@ -111,6 +111,14 @@ pub fn run_server(
     pgrx::log!("pg_mqtt worker {}: starting SPI polling loop", worker_id);
 
     loop {
+        // Service pending interrupts — in particular ProcSignalBarrier, which
+        // is how DROP DATABASE (FORCE) asks every backend to release the
+        // database. wait_latch alone is NOT enough: pgrx's wait_latch only
+        // calls WaitLatch and checks the SIGTERM/postmaster-death flags, it
+        // never runs CHECK_FOR_INTERRUPTS, so ProcSignalBarrierPending stays
+        // set and DROP DATABASE hangs forever on WaitForProcSignalBarrier.
+        pgrx::check_for_interrupts!();
+
         // Check for shutdown signal from PostgreSQL
         if BackgroundWorker::sigterm_received() {
             pgrx::log!(
@@ -132,10 +140,14 @@ pub fn run_server(
             }
         }
 
-        // Small sleep to avoid busy-waiting when there are no requests
-        // This also allows checking for shutdown signals
-        if processed == 0 {
-            std::thread::sleep(Duration::from_micros(100));
+        // Idle wait. wait_latch (not thread::sleep) so the latch wakes us
+        // promptly when a procsignal (e.g. a barrier) arrives — the actual
+        // interrupt processing happens via check_for_interrupts!() at the top
+        // of the loop. wait_latch also gives this backend a real wait_event
+        // in pg_stat_activity (PG_WAIT_EXTENSION). Returns false on SIGTERM
+        // or postmaster death — break in either case.
+        if processed == 0 && !BackgroundWorker::wait_latch(Some(Duration::from_millis(1))) {
+            break;
         }
     }
 

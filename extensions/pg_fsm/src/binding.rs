@@ -173,6 +173,11 @@ pub fn validate_insert(table_name: &str, status_column: &str, row: pgrx::JsonB) 
         Some(ref s) if s == &initial_state => {
             // Valid: inserting with initial state, log it
             log_history(machine_id, table_name, &row.0, "", &initial_state, None);
+
+            // Default NOTIFY for INSERTs too (empty old_state, no event)
+            if !crate::PG_FSM_DISABLE_DEFAULT_NOTIFY.get() {
+                emit_default_notify(table_name, &row.0, machine_id, "", &initial_state, "");
+            }
         }
         Some(ref s) => {
             pgrx::error!(
@@ -211,6 +216,9 @@ pub fn validate_transition(
 
     match transition {
         Some((transition_id, event)) => {
+            // BEFORE-phase actions — may raise to abort the transition
+            execute_actions(transition_id, &row.0, "before");
+
             // Log history
             log_history(
                 machine_id,
@@ -221,8 +229,13 @@ pub fn validate_transition(
                 Some(&event),
             );
 
-            // Execute actions
-            execute_actions(transition_id, &row.0);
+            // Default NOTIFY pgfsm (unless disabled by GUC)
+            if !crate::PG_FSM_DISABLE_DEFAULT_NOTIFY.get() {
+                emit_default_notify(table_name, &row.0, machine_id, old_state, new_state, &event);
+            }
+
+            // AFTER-phase actions
+            execute_actions(transition_id, &row.0, "after");
         }
         None => {
             pgrx::error!(
@@ -235,9 +248,60 @@ pub fn validate_transition(
     }
 }
 
+/// Fire `NOTIFY pgfsm, '<json>'` summarising a transition.
+fn emit_default_notify(
+    table_name: &str,
+    row: &serde_json::Value,
+    machine_id: i32,
+    old_state: &str,
+    new_state: &str,
+    event: &str,
+) {
+    let row_id = row
+        .get("id")
+        .map(|v| v.to_string().trim_matches('"').to_string());
+
+    // Look up machine name once.
+    let machine_name = Spi::get_one_with_args::<String>(
+        "SELECT name FROM pgfsm.machine WHERE id = $1",
+        &[machine_id.into()],
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+
+    Spi::run_with_args(
+        r#"
+        SELECT pg_notify('pgfsm', json_build_object(
+            'table',           $1,
+            'row_id',          $2,
+            'machine',         $3,
+            'old_state',       $4,
+            'new_state',       $5,
+            'event',           $6,
+            'transitioned_at', clock_timestamp(),
+            'transitioned_by', current_user
+        )::text)
+        "#,
+        &[
+            table_name.into(),
+            row_id.into(),
+            machine_name.into(),
+            old_state.into(),
+            new_state.into(),
+            event.into(),
+        ],
+    )
+    .ok();
+}
+
 /// Load binding for a table+column. Returns (machine_id, initial_state).
+///
+/// Exact text match first; if that misses, try regclass canonicalisation so callers
+/// using `'orders'` and `'public.orders'` resolve to the same binding.
 fn load_binding(table_name: &str, status_column: &str) -> Option<(i32, String)> {
     Spi::connect(|client| {
+        // Exact match — fast path.
         let mut result = client
             .select(
                 r#"
@@ -250,7 +314,32 @@ fn load_binding(table_name: &str, status_column: &str) -> Option<(i32, String)> 
                 &[table_name.into(), status_column.into()],
             )
             .unwrap();
+        if let Some(row) = result.next() {
+            let machine_id: i32 = row.get_by_name("machine_id").unwrap().unwrap();
+            let initial: String = row.get_by_name("initial").unwrap().unwrap();
+            return Some((machine_id, initial));
+        }
 
+        // Regclass fallback — compares canonical OIDs. Wrapped in a sub-SELECT that
+        // ignores cast errors on stored bindings whose tables have since been dropped.
+        let mut result = client
+            .select(
+                r#"
+                SELECT b.machine_id, m.initial
+                FROM pgfsm.binding b
+                JOIN pgfsm.machine m ON b.machine_id = m.id
+                WHERE b.status_column = $2 AND b.active = true
+                  AND (
+                    SELECT to_regclass(b.table_name)
+                  ) = (
+                    SELECT to_regclass($1)
+                  )
+                  AND to_regclass($1) IS NOT NULL
+                "#,
+                None,
+                &[table_name.into(), status_column.into()],
+            )
+            .unwrap();
         if let Some(row) = result.next() {
             let machine_id: i32 = row.get_by_name("machine_id").unwrap().unwrap();
             let initial: String = row.get_by_name("initial").unwrap().unwrap();
@@ -330,19 +419,19 @@ fn log_history(
     .expect("failed to log transition history");
 }
 
-/// Execute actions associated with a transition.
-fn execute_actions(transition_id: i32, row: &serde_json::Value) {
+/// Execute actions associated with a transition, filtered by phase.
+fn execute_actions(transition_id: i32, row: &serde_json::Value, phase: &str) {
     Spi::connect(|client| {
         let result = client
             .select(
                 r#"
                 SELECT action_type, action_value
                 FROM pgfsm.action
-                WHERE transition_id = $1
+                WHERE transition_id = $1 AND phase = $2
                 ORDER BY run_order
                 "#,
                 None,
-                &[transition_id.into()],
+                &[transition_id.into(), phase.into()],
             )
             .unwrap();
 

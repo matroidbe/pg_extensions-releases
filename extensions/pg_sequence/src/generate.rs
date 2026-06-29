@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 
 use crate::definition::get_sequence_id;
 use crate::format::{format_template, FormatContext};
+use crate::seq_id::SeqId;
 
 /// Sequence definition fields needed for generation.
 struct SeqDef {
@@ -107,8 +108,9 @@ pub fn next_val(name: &str, scope_key: default!(Option<&str>, "''")) -> i64 {
 }
 
 /// Get the next formatted document number. Atomically increments the counter.
+/// Returns a `SeqId` type for column type safety.
 #[pg_extern]
-pub fn next_formatted(name: &str, scope_key: default!(Option<&str>, "''")) -> String {
+pub fn next_formatted(name: &str, scope_key: default!(Option<&str>, "''")) -> SeqId {
     let scope = scope_key.unwrap_or("");
     let def = load_seq_def(name);
     let period_key = compute_period_key(&def.reset_policy);
@@ -144,8 +146,9 @@ pub fn next_formatted(name: &str, scope_key: default!(Option<&str>, "''")) -> St
         scope: scope.to_string(),
     };
 
-    format_template(&def.format, &ctx)
-        .unwrap_or_else(|e| pgrx::error!("pg_sequence: format error: {}", e))
+    let formatted = format_template(&def.format, &ctx)
+        .unwrap_or_else(|e| pgrx::error!("pg_sequence: format error: {}", e));
+    SeqId::new(formatted)
 }
 
 /// Read the current counter value without incrementing.
@@ -167,8 +170,9 @@ pub fn current_val(name: &str, scope_key: default!(Option<&str>, "''")) -> i64 {
 }
 
 /// Preview the next formatted number without incrementing.
+/// Returns a `SeqId` type for column type safety.
 #[pg_extern]
-pub fn preview(name: &str, scope_key: default!(Option<&str>, "''")) -> String {
+pub fn preview(name: &str, scope_key: default!(Option<&str>, "''")) -> SeqId {
     let scope = scope_key.unwrap_or("");
     let def = load_seq_def(name);
     let period_key = compute_period_key(&def.reset_policy);
@@ -202,8 +206,9 @@ pub fn preview(name: &str, scope_key: default!(Option<&str>, "''")) -> String {
         scope: scope.to_string(),
     };
 
-    format_template(&def.format, &ctx)
-        .unwrap_or_else(|e| pgrx::error!("pg_sequence: format error: {}", e))
+    let formatted = format_template(&def.format, &ctx)
+        .unwrap_or_else(|e| pgrx::error!("pg_sequence: format error: {}", e));
+    SeqId::new(formatted)
 }
 
 /// Manually reset a counter to a specific value (or to start_value - increment if none given).

@@ -4,6 +4,11 @@
 //! - Coordinator (1): manages pipeline lifecycle and executor assignments
 //! - Executor (N): processes assigned pipelines in a poll-process-commit loop
 //! - Timer (1): fires window close events, TTL cleanup, state expiry
+//!
+//! IMPORTANT: All SPI calls in background workers MUST be wrapped in
+//! `BackgroundWorker::transaction()` to properly set up the transaction context
+//! (StartTransactionCommand, PushActiveSnapshot, CommitTransactionCommand).
+//! Calling Spi::get_one() etc. without this wrapper causes a segfault.
 
 use pgrx::bgworkers::*;
 use pgrx::prelude::*;
@@ -45,7 +50,9 @@ pub extern "C-unwind" fn pg_streaming_coordinator_main(_arg: pg_sys::Datum) {
             break;
         }
 
-        run_coordinator_tick();
+        BackgroundWorker::transaction(|| {
+            run_coordinator_tick();
+        });
     }
 
     log!("pg_streaming coordinator: shutting down");
@@ -91,7 +98,9 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
             break;
         }
 
-        run_executor_tick(worker_id, &mut compiled);
+        BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
+            run_executor_tick(worker_id, &mut compiled);
+        }));
     }
 
     log!("pg_streaming executor {}: shutting down", worker_id);

@@ -35,14 +35,16 @@ pub fn scheduler_main() {
     log!("pg_swarm scheduler started for node_id={}", node_id);
 
     loop {
+        let poll_secs = GUC_POLL_INTERVAL.get() as u64;
+        // wait_latch returns false when WL_POSTMASTER_DEATH fires — sticky once
+        // the postmaster is gone, so we must exit immediately or busy-loop forever.
+        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(poll_secs))) {
+            log!("pg_swarm scheduler: postmaster died, exiting");
+            break;
+        }
         if BackgroundWorker::sigterm_received() {
             log!("pg_swarm scheduler shutting down");
             break;
-        }
-
-        let poll_secs = GUC_POLL_INTERVAL.get() as u64;
-        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(poll_secs))) {
-            continue;
         }
 
         BackgroundWorker::transaction(|| {
@@ -69,7 +71,9 @@ fn wait_for_node_id() -> i64 {
             pgrx::error!("pg_swarm scheduler: shutting down before node registered");
         }
 
-        BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(1))) {
+            pgrx::error!("pg_swarm scheduler: postmaster died waiting for node registration");
+        }
     }
 
     pgrx::error!("pg_swarm scheduler: timed out waiting for node registration");
@@ -314,6 +318,10 @@ fn claim_and_execute_task(node_id: i64) {
 ///
 /// The executor function must accept (task_id BIGINT, payload JSONB, chunk_index INT, chunk_count INT)
 /// and return JSONB.
+///
+/// Uses a subtransaction to isolate executor errors. If the executor function
+/// raises an EXCEPTION, the subtransaction is rolled back but the parent
+/// transaction (and the scheduler worker) survives.
 fn execute_task(
     task_id: i64,
     function_name: &str,
@@ -330,20 +338,84 @@ fn execute_task(
     // We use a parameterized approach for values, but function name must be an identifier
     let query = format!("SELECT {}($1, $2::jsonb, $3, $4)::text", function_name);
 
-    let result = Spi::get_one_with_args::<String>(
-        &query,
-        &[
-            task_id.into(),
-            payload_str.to_string().into(),
-            chunk_index.into(),
-            chunk_count.into(),
-        ],
-    );
+    // Save memory context before subtransaction — must be restored after
+    let saved_ctx = unsafe { pg_sys::CurrentMemoryContext };
+    let saved_owner = unsafe { pg_sys::CurrentResourceOwner };
 
-    match result {
-        Ok(Some(json_str)) => Ok(json_str),
-        Ok(None) => Ok("null".to_string()),
-        Err(e) => Err(format!("{}", e)),
+    // Begin subtransaction so executor errors don't abort the parent transaction
+    unsafe {
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+    }
+
+    // Run the executor inside catch_unwind so PostgreSQL ERRORs (from RAISE EXCEPTION
+    // etc.) are caught as Rust panics instead of crashing the worker process
+    let spi_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Spi::get_one_with_args::<String>(
+            &query,
+            &[
+                task_id.into(),
+                payload_str.to_string().into(),
+                chunk_index.into(),
+                chunk_count.into(),
+            ],
+        )
+    }));
+
+    match spi_result {
+        Ok(Ok(Some(json_str))) => {
+            // Success — release subtransaction
+            unsafe {
+                pg_sys::ReleaseCurrentSubTransaction();
+                pg_sys::CurrentMemoryContext = saved_ctx;
+                pg_sys::CurrentResourceOwner = saved_owner;
+            }
+            Ok(json_str)
+        }
+        Ok(Ok(None)) => {
+            unsafe {
+                pg_sys::ReleaseCurrentSubTransaction();
+                pg_sys::CurrentMemoryContext = saved_ctx;
+                pg_sys::CurrentResourceOwner = saved_owner;
+            }
+            Ok("null".to_string())
+        }
+        Ok(Err(spi_err)) => {
+            // SPI returned an error — rollback subtransaction
+            unsafe {
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pg_sys::CurrentMemoryContext = saved_ctx;
+                pg_sys::CurrentResourceOwner = saved_owner;
+            }
+            Err(format!("{}", spi_err))
+        }
+        Err(panic_payload) => {
+            // PostgreSQL ERROR caught as panic — rollback subtransaction
+            unsafe {
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pg_sys::CurrentMemoryContext = saved_ctx;
+                pg_sys::CurrentResourceOwner = saved_owner;
+            }
+            // Extract the error message from the panic payload
+            use pgrx::pg_sys::panic::CaughtError;
+            let msg = if let Some(caught) = panic_payload.downcast_ref::<CaughtError>() {
+                match caught {
+                    CaughtError::PostgresError(er)
+                    | CaughtError::ErrorReport(er)
+                    | CaughtError::RustPanic { ereport: er, .. } => er.message().to_string(),
+                }
+            } else if let Some(er) =
+                panic_payload.downcast_ref::<pgrx::pg_sys::panic::ErrorReportWithLevel>()
+            {
+                er.message().to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                format!("Executor function '{}' failed", function_name)
+            };
+            Err(msg)
+        }
     }
 }
 

@@ -61,7 +61,7 @@ fn send_request(stream: &mut TcpStream, request: &[u8]) -> Vec<u8> {
 #[test]
 fn test_api_versions() {
     skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect("127.0.0.1:9092").expect("Failed to connect");
+    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -90,7 +90,7 @@ fn test_api_versions() {
 #[test]
 fn test_metadata() {
     skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect("127.0.0.1:9092").expect("Failed to connect");
+    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -120,7 +120,7 @@ fn test_metadata() {
 #[test]
 fn test_metadata_unknown_topic() {
     skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect("127.0.0.1:9092").expect("Failed to connect");
+    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -250,7 +250,7 @@ fn put_varint(buf: &mut BytesMut, value: i32) {
 #[test]
 fn test_produce() {
     skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect("127.0.0.1:9092").expect("Failed to connect");
+    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -306,7 +306,7 @@ fn build_fetch_request(topic: &str, offset: i64, max_bytes: i32) -> BytesMut {
 #[test]
 fn test_fetch() {
     skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect("127.0.0.1:9092").expect("Failed to connect");
+    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();

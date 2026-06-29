@@ -284,9 +284,12 @@ pub fn run_stream_manager() -> Result<(), Box<dyn std::error::Error + Send + Syn
         manager.streams.len()
     );
 
-    // Main loop - keep it simple and responsive to shutdown
-    // Use std::thread::sleep instead of BackgroundWorker::wait_latch
-    // because wait_latch may not return immediately on SIGTERM
+    // Main loop. wait_latch (not thread::sleep) so the bgworker processes
+    // Postgres interrupts — in particular ProcSignalBarrier (SIGUSR1), which
+    // is how DROP DATABASE asks every backend to release its connection.
+    // thread::sleep stays inside libc and never runs the CFI that handles the
+    // barrier, so DROP DATABASE hangs indefinitely. wait_latch also gives the
+    // backend a real wait_event in pg_stat_activity (PG_WAIT_EXTENSION).
     loop {
         // Check for shutdown FIRST before doing any work
         if BackgroundWorker::sigterm_received() {
@@ -314,9 +317,11 @@ pub fn run_stream_manager() -> Result<(), Box<dyn std::error::Error + Send + Syn
             manager.tick();
         }
 
-        // Small sleep to avoid busy-waiting
-        // This also allows checking for shutdown signals frequently
-        std::thread::sleep(Duration::from_millis(100));
+        // Idle wait — see comment at top of loop. Returns false on SIGTERM
+        // or postmaster death; in either case break out.
+        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(100))) {
+            break;
+        }
     }
 
     log!("pg_delta: main loop exited, cleaning up");

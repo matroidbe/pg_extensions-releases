@@ -45,7 +45,9 @@ pub fn pg_type_needs_cast(pg_type: &str) -> Option<&'static str> {
         | "TIME WITH TIME ZONE"
         | "TIME"
         | "TIMETZ"
-        | "INTERVAL" => Some("TEXT"),
+        | "INTERVAL"
+        | "UUID"
+        | "USER-DEFINED" => Some("TEXT"),
         _ => None,
     }
 }

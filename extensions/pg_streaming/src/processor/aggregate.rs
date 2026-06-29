@@ -302,7 +302,10 @@ fn build_upsert_sql(
             .chain(columns.iter().map(|c| format!("'{}', {}", c.name, c.name)))
             .chain(std::iter::once("'updated_at', updated_at".to_string()))
             .collect();
-        format!(" RETURNING jsonb_build_object({})", return_cols.join(", "))
+        format!(
+            " RETURNING jsonb_build_object({}) AS _row",
+            return_cols.join(", ")
+        )
     } else {
         String::new()
     };
@@ -316,7 +319,7 @@ fn build_upsert_sql(
                SELECT {vals} FROM _agg \
                ON CONFLICT (group_key) DO UPDATE SET {sets}{returning}\
              ) \
-             SELECT COALESCE(jsonb_agg(_upsert), '[]'::jsonb) FROM _upsert",
+             SELECT COALESCE(jsonb_agg(_upsert._row), '[]'::jsonb) FROM _upsert",
             cte = cte.trim(),
             agg_cte = agg_cte,
             table = state_table,

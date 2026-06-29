@@ -1,0 +1,48 @@
+[package]
+name = "pg_streaming_xarray_tests"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "End-to-end integration tests for pg_streaming (--features xarray) + pg_xarray"
+
+# Tests-only crate. No cdylib. No pgrx_embed. The xarray connectors
+# (xarray_index sink, xarray_header processor) live inside pg_streaming
+# behind the `xarray` Cargo feature — folding them in avoids the two-
+# pgrx-cdylibs duplicate-symbol problem (Pg_magic_func / _PG_init).
+#
+# This crate exists to host:
+#   * test.sh    — orchestrator that installs pg_streaming --features xarray
+#                  + pg_xarray, brings up Postgres, runs the tests, cleans up
+#   * tests/     — Rust integration tests connecting via tokio-postgres
+#                  (autocommit) so background workers can observe state
+
+[lib]
+# Use a dummy lib for the `tests/common/mod.rs` to be reachable from
+# every integration test target.
+path = "tests/common/lib_stub.rs"
+
+[features]
+default = []
+# Enabled by `test.sh` when RUN_GRIB_E2E=1 — the test code itself is
+# pure Rust and only changes its env-var gate; the feature is here so
+# downstream tooling can detect the extended config.
+grib-e2e = []
+
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+# Used by the test fixture to build gzip- and zstd-compressed Zarr
+# chunks. Matches the codec stack pgx_zarr_walker decodes.
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }
+
+[[test]]
+name = "end_to_end_zarr"
+path = "tests/end_to_end_zarr.rs"
+
+[[test]]
+name = "end_to_end_grib"
+path = "tests/end_to_end_grib.rs"

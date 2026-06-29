@@ -131,7 +131,7 @@ SELECT pgstreams.create_pipeline('enrich_orders', $$
       {
         "sql": {
           "query": "SELECT name, tier, region FROM customers WHERE customer_id = $1",
-          "args": ["(value_json->>'customer_id')::int"],
+          "args": ["_batch.customer_id"],
           "result_map": {
             "customer_name": "name",
             "customer_tier": "tier",
@@ -141,13 +141,13 @@ SELECT pgstreams.create_pipeline('enrich_orders', $$
         }
       },
       {"mapping": {
-        "order_id":        "value_json->>'order_id'",
-        "customer_id":     "(value_json->>'customer_id')::int",
-        "customer_name":   "customer_name",
-        "customer_tier":   "customer_tier",
-        "customer_region": "customer_region",
-        "amount":          "(value_json->>'amount')::numeric",
-        "ordered_at":      "value_json->>'created_at'"
+        "order_id":        "order_id",
+        "customer_id":     "customer_id",
+        "customer_name":   "_original->>'customer_name'",
+        "customer_tier":   "_original->>'customer_tier'",
+        "customer_region": "_original->>'customer_region'",
+        "amount":          "amount",
+        "ordered_at":      "created_at"
       }}
     ]
   },
@@ -177,8 +177,8 @@ SELECT pgstreams.create_pipeline('enrich_line_items', $$
     "processors": [
       {
         "sql": {
-          "query": "SELECT product_id, name, category, unit_price FROM products WHERE product_id = $1",
-          "args": ["value_json->>'product_id'"],
+          "query": "SELECT name, category, unit_price FROM products WHERE product_id = $1",
+          "args": ["_batch.product_id"],
           "result_map": {
             "product_name":     "name",
             "product_category": "category",
@@ -188,13 +188,13 @@ SELECT pgstreams.create_pipeline('enrich_line_items', $$
         }
       },
       {"mapping": {
-        "order_id":          "value_json->>'order_id'",
-        "product_id":        "value_json->>'product_id'",
-        "product_name":      "product_name",
-        "product_category":  "product_category",
-        "quantity":          "(value_json->>'quantity')::int",
-        "unit_price":        "unit_price::numeric",
-        "line_total":        "(value_json->>'quantity')::int * unit_price::numeric"
+        "order_id":          "order_id",
+        "product_id":        "product_id",
+        "product_name":      "_original->>'product_name'",
+        "product_category":  "_original->>'product_category'",
+        "quantity":          "quantity",
+        "unit_price":        "(_original->>'unit_price')::numeric",
+        "line_total":        "quantity * (_original->>'unit_price')::numeric"
       }}
     ]
   },

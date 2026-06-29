@@ -1,0 +1,39 @@
+[package]
+name = "pg_augur"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pg_augur"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+default = ["pg16"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+augur_plots = ["augur/plots"]
+
+[dependencies]
+pgrx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+augur = { git = "https://github.com/matroidbe/augur.git", features = ["timeseries"] }
+augur-core = { git = "https://github.com/matroidbe/augur.git" }
+augur-preprocessing = { git = "https://github.com/matroidbe/augur.git" }
+polars = { version = "0.46", features = ["lazy", "ndarray"] }
+once_cell = "1"
+
+[dev-dependencies]
+pgrx-tests = "0.16"
