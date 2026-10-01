@@ -5,9 +5,11 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#include <Standard_Version.hxx>
 
 // OCCT headers
 #include <BRep_Builder.hxx>
@@ -790,6 +792,57 @@ int occt_step_read(const uint8_t* data, size_t len, void** shape_out) {
     }
 }
 
+// Serialize a prepared STEPControl_Writer into a string.
+//
+// OCCT >= 7.8 can write straight to a std::ostream. Older releases (7.6 on
+// Ubuntu 24.04 / Debian 12) only expose Write(filename), so round-trip through
+// a temp file — the same workaround occt_iges_read uses for its missing
+// ReadStream. Returns false and fills `err` on failure.
+static bool step_writer_to_string(STEPControl_Writer& writer, std::string& out, std::string& err) {
+#if OCC_VERSION_HEX >= 0x070800
+    std::ostringstream oss;
+    IFSelect_ReturnStatus status = writer.WriteStream(oss);
+    if (status != IFSelect_RetDone) {
+        err = "STEPControl_Writer::WriteStream failed (status " +
+              std::to_string(static_cast<int>(status)) + ")";
+        return false;
+    }
+    out = oss.str();
+    return true;
+#else
+    char tmpname[] = "/tmp/pg_solid_step_XXXXXX";
+    int fd = mkstemp(tmpname);
+    if (fd < 0) {
+        err = "mkstemp failed in occt_step_write";
+        return false;
+    }
+    // OCCT opens the path itself, so hand over the file we just created.
+    close(fd);
+
+    IFSelect_ReturnStatus status = writer.Write(tmpname);
+    if (status != IFSelect_RetDone) {
+        unlink(tmpname);
+        err = "STEPControl_Writer::Write failed (status " +
+              std::to_string(static_cast<int>(status)) + ")";
+        return false;
+    }
+
+    std::ifstream ifs(tmpname, std::ios::binary);
+    if (!ifs) {
+        unlink(tmpname);
+        err = "could not reopen temp STEP file in occt_step_write";
+        return false;
+    }
+    std::ostringstream buf;
+    buf << ifs.rdbuf();
+    ifs.close();
+    unlink(tmpname);
+
+    out = buf.str();
+    return true;
+#endif
+}
+
 int occt_step_write(void* shape, uint8_t** data_out, size_t* len_out) {
     try {
         STEPControl_Writer writer;
@@ -799,14 +852,12 @@ int occt_step_write(void* shape, uint8_t** data_out, size_t* len_out) {
                       std::to_string(static_cast<int>(status)) + ")");
             return 1;
         }
-        std::ostringstream oss;
-        status = writer.WriteStream(oss);
-        if (status != IFSelect_RetDone) {
-            set_error("STEPControl_Writer::WriteStream failed (status " +
-                      std::to_string(static_cast<int>(status)) + ")");
+        std::string step_str;
+        std::string write_err;
+        if (!step_writer_to_string(writer, step_str, write_err)) {
+            set_error(write_err);
             return 1;
         }
-        std::string step_str = oss.str();
         *len_out = step_str.size();
         *data_out = static_cast<uint8_t*>(malloc(step_str.size()));
         if (!*data_out) {

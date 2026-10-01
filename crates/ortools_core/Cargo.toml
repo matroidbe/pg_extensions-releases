@@ -1,6 +1,6 @@
 [package]
 name = "ortools_core"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,6 +14,10 @@ pg15 = []
 pg16 = []
 pg17 = []
 pg18 = []
+# CP-SAT scheduling engine (opt-in). Off by default so the pg_ortools extension
+# and existing MIP/metaheuristic builds do NOT pull Pumpkin's dependency tree.
+# Enable with `--features cpsat`. See design/pg_ortools/cpsat-engine.md.
+cpsat = ["dep:pumpkin-core", "dep:pumpkin-constraints", "dep:pumpkin-conflict-resolvers"]
 
 [dependencies]
 thiserror.workspace = true
@@ -21,3 +25,10 @@ serde.workspace = true
 serde_json.workspace = true
 good_lp = { version = "1.14", default-features = false, features = ["highs"] }
 rand = "0.8"
+# CP-SAT-class scheduling engine (lazy clause generation). Optional: only compiled
+# under the `cpsat` feature. Depend on the lean companion crates directly, not the
+# `pumpkin-solver` umbrella, to avoid its CLI / flatzinc / signal-hook / cc-checker
+# build baggage. See design/pg_ortools/cpsat-engine.md.
+pumpkin-core = { version = "0.4", optional = true }
+pumpkin-constraints = { version = "0.4", optional = true }
+pumpkin-conflict-resolvers = { version = "0.4", optional = true }

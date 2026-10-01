@@ -6,6 +6,9 @@
 
 use pgrx::prelude::*;
 
+#[cfg(feature = "cpsat")]
+mod cpsat;
+mod eidos_catalog;
 pub mod error;
 mod jobs;
 pub mod metaheuristic;
@@ -776,8 +779,8 @@ mod tests {
         // Greedy returns a feasible solution (not necessarily optimal)
         let x = solution.0["values"]["x"].as_i64().unwrap();
         let y = solution.0["values"]["y"].as_i64().unwrap();
-        assert!(x >= 0 && x <= 100);
-        assert!(y >= 0 && y <= 100);
+        assert!((0..=100).contains(&x));
+        assert!((0..=100).contains(&y));
         assert!(x + y <= 150);
 
         // Cleanup

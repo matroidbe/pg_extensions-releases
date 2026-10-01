@@ -5,8 +5,11 @@
 //! - fit_uniform(float8) → dist
 //! - fit_lognormal(float8) → dist
 //! - fit_correlation(float8, float8) → float8
+//!
+//! The state machines live in `prob_core::fit`; this module carries the
+//! pgrx state-type wrappers and the SQL aggregate DDL.
 
-use crate::distribution::{lognormal, normal, uniform, Dist};
+use crate::distribution::Dist;
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,18 +17,12 @@ use serde::{Deserialize, Serialize};
 // FitState — shared aggregate state for all fitters
 // =============================================================================
 
-/// Aggregate state tracking running statistics for distribution fitting
+/// Aggregate state tracking running statistics for distribution fitting.
+/// Transparent wrapper over `prob_core::fit::FitState` (same JSON shape).
 #[derive(Debug, Clone, Serialize, Deserialize, PostgresType)]
 #[inoutfuncs]
-pub struct FitState {
-    pub count: i64,
-    pub sum: f64,
-    pub sum_sq: f64,
-    pub sum_ln: f64,
-    pub sum_ln_sq: f64,
-    pub min: f64,
-    pub max: f64,
-}
+#[serde(transparent)]
+pub struct FitState(pub prob_core::fit::FitState);
 
 impl InOutFuncs for FitState {
     fn input(input: &core::ffi::CStr) -> Self
@@ -49,38 +46,7 @@ impl InOutFuncs for FitState {
 /// State function shared by all fitting aggregates
 #[pg_extern(immutable, parallel_safe)]
 fn fit_state(state: Option<FitState>, value: Option<f64>) -> Option<FitState> {
-    let value = match value {
-        Some(v) if v.is_finite() => v,
-        _ => return state, // skip NULL and non-finite
-    };
-
-    match state {
-        None => {
-            let ln_v = if value > 0.0 { value.ln() } else { 0.0 };
-            Some(FitState {
-                count: 1,
-                sum: value,
-                sum_sq: value * value,
-                sum_ln: ln_v,
-                sum_ln_sq: ln_v * ln_v,
-                min: value,
-                max: value,
-            })
-        }
-        Some(mut s) => {
-            s.count += 1;
-            s.sum += value;
-            s.sum_sq += value * value;
-            if value > 0.0 {
-                let ln_v = value.ln();
-                s.sum_ln += ln_v;
-                s.sum_ln_sq += ln_v * ln_v;
-            }
-            s.min = s.min.min(value);
-            s.max = s.max.max(value);
-            Some(s)
-        }
-    }
+    prob_core::fit::fit_state(state.map(|s| s.0), value).map(FitState)
 }
 
 // =============================================================================
@@ -90,16 +56,7 @@ fn fit_state(state: Option<FitState>, value: Option<f64>) -> Option<FitState> {
 /// Final function for fit_normal: compute normal(mean, std) from running stats
 #[pg_extern(immutable, parallel_safe)]
 fn fit_normal_final(state: Option<FitState>) -> Option<Dist> {
-    state.map(|s| {
-        if s.count == 0 {
-            return normal(0.0, 1.0);
-        }
-        let n = s.count as f64;
-        let mu = s.sum / n;
-        let variance = (s.sum_sq / n - mu * mu).max(0.0);
-        let sigma = variance.sqrt().max(0.0001); // guard against zero
-        normal(mu, sigma)
-    })
+    prob_core::fit::fit_normal_final(state.map(|s| s.0)).map(Dist)
 }
 
 /// Final function for fit_uniform: compute uniform(min, max) from running stats.
@@ -107,32 +64,13 @@ fn fit_normal_final(state: Option<FitState>) -> Option<Dist> {
 /// to better estimate the true uniform bounds from a finite sample.
 #[pg_extern(immutable, parallel_safe)]
 fn fit_uniform_final(state: Option<FitState>) -> Option<Dist> {
-    state.map(|s| {
-        if s.min == s.max {
-            uniform(s.min, s.max + 0.0001)
-        } else if s.count <= 2 {
-            uniform(s.min, s.max)
-        } else {
-            let range = s.max - s.min;
-            let padding = range / (s.count as f64 + 1.0);
-            uniform(s.min - padding, s.max + padding)
-        }
-    })
+    prob_core::fit::fit_uniform_final(state.map(|s| s.0)).map(Dist)
 }
 
 /// Final function for fit_lognormal: compute lognormal(mu, sigma) from log-space running stats
 #[pg_extern(immutable, parallel_safe)]
 fn fit_lognormal_final(state: Option<FitState>) -> Option<Dist> {
-    state.map(|s| {
-        if s.count == 0 {
-            return lognormal(0.0, 1.0);
-        }
-        let n = s.count as f64;
-        let mu_ln = s.sum_ln / n;
-        let variance_ln = (s.sum_ln_sq / n - mu_ln * mu_ln).max(0.0);
-        let sigma_ln = variance_ln.sqrt().max(0.0001); // guard against zero
-        lognormal(mu_ln, sigma_ln)
-    })
+    prob_core::fit::fit_lognormal_final(state.map(|s| s.0)).map(Dist)
 }
 
 // =============================================================================
@@ -173,18 +111,11 @@ CREATE AGGREGATE @extschema@.fit_lognormal(float8) (
 // =============================================================================
 
 /// Aggregate state for computing Pearson correlation between two columns.
-/// Uses the formula: r = (n*sum_xy - sum_x*sum_y) /
-///   sqrt((n*sum_x2 - sum_x^2) * (n*sum_y2 - sum_y^2))
+/// Transparent wrapper over `prob_core::fit::FitCorrState` (same JSON shape).
 #[derive(Debug, Clone, Serialize, Deserialize, PostgresType)]
 #[inoutfuncs]
-pub struct FitCorrState {
-    pub count: i64,
-    pub sum_x: f64,
-    pub sum_y: f64,
-    pub sum_x2: f64,
-    pub sum_y2: f64,
-    pub sum_xy: f64,
-}
+#[serde(transparent)]
+pub struct FitCorrState(pub prob_core::fit::FitCorrState);
 
 impl InOutFuncs for FitCorrState {
     fn input(input: &core::ffi::CStr) -> Self
@@ -208,50 +139,13 @@ fn fit_corr_state(
     x: Option<f64>,
     y: Option<f64>,
 ) -> Option<FitCorrState> {
-    let (x, y) = match (x, y) {
-        (Some(xv), Some(yv)) if xv.is_finite() && yv.is_finite() => (xv, yv),
-        _ => return state,
-    };
-
-    match state {
-        None => Some(FitCorrState {
-            count: 1,
-            sum_x: x,
-            sum_y: y,
-            sum_x2: x * x,
-            sum_y2: y * y,
-            sum_xy: x * y,
-        }),
-        Some(mut s) => {
-            s.count += 1;
-            s.sum_x += x;
-            s.sum_y += y;
-            s.sum_x2 += x * x;
-            s.sum_y2 += y * y;
-            s.sum_xy += x * y;
-            Some(s)
-        }
-    }
+    prob_core::fit::fit_corr_state(state.map(|s| s.0), x, y).map(FitCorrState)
 }
 
 /// Final function for fit_correlation: compute Pearson r from running stats
 #[pg_extern(immutable, parallel_safe)]
 fn fit_corr_final(state: Option<FitCorrState>) -> Option<f64> {
-    state.map(|s| {
-        if s.count < 2 {
-            return 0.0;
-        }
-        let n = s.count as f64;
-        let numerator = n * s.sum_xy - s.sum_x * s.sum_y;
-        let denom_x = n * s.sum_x2 - s.sum_x * s.sum_x;
-        let denom_y = n * s.sum_y2 - s.sum_y * s.sum_y;
-
-        if denom_x <= 0.0 || denom_y <= 0.0 {
-            return 0.0;
-        }
-
-        (numerator / (denom_x * denom_y).sqrt()).clamp(-1.0, 1.0)
-    })
+    prob_core::fit::fit_corr_final(state.map(|s| s.0))
 }
 
 pgrx::extension_sql!(

@@ -219,11 +219,53 @@ Status values:
 - `Infeasible` - No solution exists
 - `Unbounded` - The problem is unbounded
 
+## Scheduling (CP-SAT)
+
+Beyond linear MIP, pg_ortools has a constraint-programming engine for **scheduling**:
+interval variables on shared resources with no-overlap / capacity, precedence, and a
+wait-minimisation objective. It uses lazy clause generation (the pure-Rust
+[Pumpkin](https://github.com/ConSol-Lab/Pumpkin) solver), so it scales on scheduling where a
+time-indexed MIP would not. It is part of the default build (the `cpsat` cargo feature, on by
+default); a build with `--no-default-features` must add it back, e.g.
+`--no-default-features --features pg17,cpsat`.
+
+| Function | Description |
+|----------|-------------|
+| `add_interval_var(problem, name, duration, earliest_start, latest_end)` | An operation occupying `[start, start+duration)`. |
+| `add_resource(problem, name, capacity)` | A station; `capacity = 1` ⇒ no overlap. |
+| `add_demand(problem, resource, interval, demand=1)` | Put an interval on a resource. |
+| `add_precedence(problem, before, after, gap=0)` | `end[before] + gap ≤ start[after]` (FIFO, grill→plate). |
+| `minimize_wait(problem, after, before, weight=1)` | Minimise `weight · (start[after] − end[before])`. |
+| `solve_cp_sync(problem)` | Solve inline; returns `{status, objective, intervals:{name:{start,end}}}`. Bounded by `solver_time_limit` and responds to `statement_timeout` / cancel. |
+| `solve_cp(problem, time_limit_seconds=NULL)` | Solve asynchronously via the background worker; returns a job_id (poll `solve_status`, read `get_solution`). `NULL` uses `solver_time_limit`. `cancel_solve(job_id)` stops it mid-search. |
+
+CP scheduling proves optimality by search, which on a hard instance can run
+effectively forever. Both entry points are therefore **time-bounded** — they
+return the best schedule found so far (`status = FEASIBLE`) when the budget is
+hit — and **cancellable**: `statement_timeout` / query-cancel stop a
+`solve_cp_sync`, and `cancel_solve(job_id)` stops a running `solve_cp` within a
+fraction of a second.
+
+```sql
+-- Kitchen: two tickets, one grill + one pass, grill→plate, don't let the plate sit
+SELECT pgortools.create_problem('dinner_rush');
+SELECT pgortools.add_interval_var('dinner_rush', 't1_grill', 8, 0, 60);
+SELECT pgortools.add_interval_var('dinner_rush', 't1_plate', 2, 0, 60);
+SELECT pgortools.add_resource('dinner_rush', 'grill', 1);
+SELECT pgortools.add_demand('dinner_rush', 'grill', 't1_grill', 1);
+SELECT pgortools.add_precedence('dinner_rush', 't1_grill', 't1_plate', 0);
+SELECT pgortools.minimize_wait('dinner_rush', 't1_plate', 't1_grill', 1);
+SELECT pgortools.solve_cp_sync('dinner_rush');
+```
+
+See [design/pg_ortools/cpsat-engine.md](../../design/pg_ortools/cpsat-engine.md) for the full design.
+
 ## Dependencies
 
 - PostgreSQL 14, 15, 16, or 17
 - Rust (build time only)
 - No Python, no external runtime dependencies
+- CP-SAT scheduling (`cpsat` feature, on by default): pure-Rust Pumpkin solver — still no external runtime
 
 ## License
 

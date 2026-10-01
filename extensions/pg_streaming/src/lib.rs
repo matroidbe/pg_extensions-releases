@@ -375,6 +375,46 @@ CREATE TABLE pgstreams.ldes_seen_members (
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (stream_url, member_iri)
 );
+
+-- Per-record isolation for the `call` output connector.
+--
+-- Runs one record's function call inside a subtransaction: the PL/pgSQL
+-- EXCEPTION block is exactly BeginInternalSubTransaction /
+-- RollbackAndReleaseCurrentSubTransaction. Returns NULL on success, or the
+-- SQLSTATE and message on a raise, so the caller can route that one record to
+-- the dead-letter output and keep going with the rest of the batch.
+--
+-- Caveat: non-transactional side effects inside the called function (dblink,
+-- the http extension, NOTIFY — anything reaching outside the database) are NOT
+-- rolled back by the subtransaction.
+-- `assume_role` is applied HERE rather than around the call site, so it wraps
+-- only the user function. Setting it outside would leave the connector calling
+-- this very function as the application role, which has no rights on the
+-- pgstreams schema — the pipeline then fails with `permission denied for schema
+-- pgstreams` before the user function is ever reached.
+--
+-- On error the subtransaction rollback restores the role for free; on success
+-- it is reset explicitly.
+CREATE FUNCTION pgstreams.call_guarded(query TEXT, payload JSONB, assume_role TEXT DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $call_guarded$
+BEGIN
+    IF assume_role IS NOT NULL THEN
+        EXECUTE format('SET LOCAL ROLE %I', assume_role);
+    END IF;
+    EXECUTE query USING payload;
+    IF assume_role IS NOT NULL THEN
+        RESET ROLE;
+    END IF;
+    RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+    RETURN jsonb_build_object('sqlstate', SQLSTATE, 'message', SQLERRM);
+END;
+$call_guarded$;
+
+COMMENT ON FUNCTION pgstreams.call_guarded(TEXT, JSONB, TEXT) IS
+    'Runs one `call` output-connector invocation inside a subtransaction, optionally as `assume_role`; returns NULL on success or {sqlstate, message} on error.';
 "#,
     name = "bootstrap_tables",
     bootstrap
@@ -951,6 +991,286 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cursor.unwrap().0, serde_json::json!(100));
+    }
+
+    // =========================================================================
+    // call output connector — pgstreams.call_guarded (per-record isolation)
+    // =========================================================================
+
+    /// Create a function that raises on every third record, plus the sink
+    /// table it writes to. Mirrors the design doc's first test case.
+    fn setup_call_target() {
+        Spi::run(
+            r#"
+            CREATE TABLE landed (payload jsonb);
+            CREATE FUNCTION ingest(rec jsonb) RETURNS void LANGUAGE plpgsql AS $fn$
+            BEGIN
+                IF (rec->>'n')::int % 3 = 0 THEN
+                    RAISE EXCEPTION 'poison record %', rec->>'n' USING ERRCODE = '22000';
+                END IF;
+                INSERT INTO landed VALUES (rec);
+            END;
+            $fn$;
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// The SQL the call connector builds for `args: ["record"]`.
+    const CALL_SQL: &str = "SELECT ingest(r) FROM jsonb_array_elements($1) AS r";
+
+    #[pg_test]
+    fn test_call_guarded_returns_null_on_success() {
+        setup_call_target();
+
+        let err = Spi::get_one_with_args::<pgrx::JsonB>(
+            "SELECT pgstreams.call_guarded($1, $2)",
+            &[
+                CALL_SQL.into(),
+                pgrx::JsonB(serde_json::json!([{"n": 1}])).into(),
+            ],
+        )
+        .unwrap();
+        assert!(err.is_none(), "successful call should return NULL");
+
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM landed").unwrap();
+        assert_eq!(count, Some(1));
+    }
+
+    #[pg_test]
+    fn test_call_guarded_returns_sqlstate_and_message_on_raise() {
+        setup_call_target();
+
+        let err = Spi::get_one_with_args::<pgrx::JsonB>(
+            "SELECT pgstreams.call_guarded($1, $2)",
+            &[
+                CALL_SQL.into(),
+                pgrx::JsonB(serde_json::json!([{"n": 3}])).into(),
+            ],
+        )
+        .unwrap()
+        .expect("failed call should return an error object");
+
+        assert_eq!(err.0["sqlstate"], "22000");
+        assert!(err.0["message"]
+            .as_str()
+            .unwrap()
+            .contains("poison record 3"));
+    }
+
+    /// The whole point of the subtransaction: one poison record must not take
+    /// the good records with it, and the caller can keep going afterwards.
+    #[pg_test]
+    fn test_call_guarded_isolates_failures_per_record() {
+        setup_call_target();
+
+        let mut failed = 0;
+        for n in 1..=9 {
+            let err = Spi::get_one_with_args::<pgrx::JsonB>(
+                "SELECT pgstreams.call_guarded($1, $2)",
+                &[
+                    CALL_SQL.into(),
+                    pgrx::JsonB(serde_json::json!([{"n": n}])).into(),
+                ],
+            )
+            .unwrap();
+            if err.is_some() {
+                failed += 1;
+            }
+        }
+
+        // 3, 6, 9 raise; 1, 2, 4, 5, 7, 8 land. 2/3 through, 1/3 rejected.
+        assert_eq!(failed, 3);
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM landed").unwrap();
+        assert_eq!(count, Some(6), "good records must survive the poison ones");
+    }
+
+    /// A rolled-back record must not leave partial writes behind.
+    #[pg_test]
+    fn test_call_guarded_rolls_back_partial_writes() {
+        Spi::run(
+            r#"
+            CREATE TABLE landed (payload jsonb);
+            CREATE FUNCTION ingest(rec jsonb) RETURNS void LANGUAGE plpgsql AS $fn$
+            BEGIN
+                INSERT INTO landed VALUES (rec);
+                RAISE EXCEPTION 'after the insert';
+            END;
+            $fn$;
+            "#,
+        )
+        .unwrap();
+
+        let err = Spi::get_one_with_args::<pgrx::JsonB>(
+            "SELECT pgstreams.call_guarded($1, $2)",
+            &[
+                CALL_SQL.into(),
+                pgrx::JsonB(serde_json::json!([{"n": 1}])).into(),
+            ],
+        )
+        .unwrap();
+        assert!(err.is_some());
+
+        let count = Spi::get_one::<i64>("SELECT count(*)::bigint FROM landed").unwrap();
+        assert_eq!(count, Some(0), "the insert must roll back with the record");
+    }
+
+    /// set_config is applied outside the subtransaction, so a rolled-back
+    /// record must not strip the setting from the record that follows.
+    #[pg_test]
+    fn test_set_config_survives_a_rolled_back_record() {
+        Spi::run(
+            r#"
+            CREATE TABLE landed (role text);
+            CREATE FUNCTION ingest(rec jsonb) RETURNS void LANGUAGE plpgsql AS $fn$
+            BEGIN
+                IF (rec->>'n')::int = 1 THEN RAISE EXCEPTION 'boom'; END IF;
+                INSERT INTO landed VALUES (current_setting('app.user_role'));
+            END;
+            $fn$;
+            "#,
+        )
+        .unwrap();
+
+        Spi::run("SELECT set_config('app.user_role', 'ingest_service', true)").unwrap();
+
+        // Record 1 raises and rolls back.
+        let err = Spi::get_one_with_args::<pgrx::JsonB>(
+            "SELECT pgstreams.call_guarded($1, $2)",
+            &[
+                CALL_SQL.into(),
+                pgrx::JsonB(serde_json::json!([{"n": 1}])).into(),
+            ],
+        )
+        .unwrap();
+        assert!(err.is_some());
+
+        // Record 2 must still see the setting.
+        let err = Spi::get_one_with_args::<pgrx::JsonB>(
+            "SELECT pgstreams.call_guarded($1, $2)",
+            &[
+                CALL_SQL.into(),
+                pgrx::JsonB(serde_json::json!([{"n": 2}])).into(),
+            ],
+        )
+        .unwrap();
+        assert!(err.is_none(), "unexpected error: {:?}", err.map(|e| e.0));
+
+        let role = Spi::get_one::<String>("SELECT role FROM landed").unwrap();
+        assert_eq!(role.as_deref(), Some("ingest_service"));
+    }
+
+    // =========================================================================
+    // call output connector — compile-time function resolution
+    // =========================================================================
+
+    fn call_output(function: &str, args: &[&str]) -> crate::dsl::types::CallOutputConfig {
+        crate::dsl::types::CallOutputConfig {
+            function: function.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            set_config: Default::default(),
+            set_role: None,
+            on_record_error: crate::dsl::types::OnRecordError::DeadLetter,
+            batch: false,
+        }
+    }
+
+    fn verify(function: &str, args: &[&str]) -> Result<(), String> {
+        crate::connector::output::call::CallOutput::new(
+            &call_output(function, args),
+            crate::record::TopicShape::Messages.batch_cte().as_str(),
+            "test_pipeline",
+            None,
+        )
+        .verify_function_exists()
+    }
+
+    #[pg_test]
+    fn test_verify_function_exists_qualified() {
+        Spi::run(
+            "CREATE SCHEMA app; \
+             CREATE FUNCTION app.ingest(rec jsonb) RETURNS void LANGUAGE sql AS $fn$ SELECT $fn$;",
+        )
+        .unwrap();
+        assert!(verify("app.ingest", &["record"]).is_ok());
+    }
+
+    #[pg_test]
+    fn test_verify_function_missing_is_rejected() {
+        let err = verify("app.no_such_function", &["record"]).unwrap_err();
+        assert!(err.contains("does not exist"), "got: {}", err);
+    }
+
+    #[pg_test]
+    fn test_verify_function_arity_mismatch_is_rejected() {
+        Spi::run(
+            "CREATE FUNCTION ingest(rec jsonb) RETURNS void LANGUAGE sql AS $fn$ SELECT $fn$;",
+        )
+        .unwrap();
+        let err = verify("ingest", &["record", "record"]).unwrap_err();
+        assert!(err.contains("2 argument(s)"), "got: {}", err);
+    }
+
+    #[pg_test]
+    fn test_verify_function_unqualified_uses_search_path() {
+        Spi::run(
+            "CREATE FUNCTION ingest(rec jsonb) RETURNS void LANGUAGE sql AS $fn$ SELECT $fn$;",
+        )
+        .unwrap();
+        assert!(verify("ingest", &["record"]).is_ok());
+    }
+
+    // =========================================================================
+    // "not found" lookups must say so
+    //
+    // `Spi::get_one` on a query returning ZERO rows fails with
+    // "SpiTupleTable positioned before the start" rather than yielding
+    // Ok(None). Any lookup written as `SELECT col FROM t WHERE ...` therefore
+    // reports a plain miss as an internal SPI error, and whatever nice message
+    // the Ok(None) arm carried is dead code. Both call sites below now use a
+    // scalar subquery so a miss is one row of NULL.
+    // =========================================================================
+
+    #[pg_test]
+    fn test_missing_secret_reports_unknown_secret() {
+        let err = crate::connector::secrets::resolve(&serde_json::json!({
+            "token": "${secret:no_such_secret}"
+        }))
+        .expect_err("an undefined secret must not resolve");
+
+        assert!(
+            err.contains("Unknown secret"),
+            "expected 'Unknown secret', got: {}",
+            err
+        );
+        assert!(
+            !err.contains("positioned before the start"),
+            "SPI internals leaked into the message: {}",
+            err
+        );
+    }
+
+    #[pg_test]
+    fn test_existing_secret_still_resolves() {
+        Spi::run("SELECT pgstreams.set_secret('sx_token', 'sekrit')").unwrap();
+        let resolved = crate::connector::secrets::resolve(&serde_json::json!({
+            "token": "${secret:sx_token}"
+        }))
+        .unwrap();
+        assert_eq!(resolved["token"], "sekrit");
+    }
+
+    /// Defaulted parameters may absorb the arity difference.
+    #[pg_test]
+    fn test_verify_function_accepts_defaulted_args() {
+        Spi::run(
+            "CREATE FUNCTION ingest(rec jsonb, src text DEFAULT 'stream') \
+             RETURNS void LANGUAGE sql AS $fn$ SELECT $fn$;",
+        )
+        .unwrap();
+        assert!(verify("ingest", &["record"]).is_ok());
+        assert!(verify("ingest", &["record", "'kafka'"]).is_ok());
+        assert!(verify("ingest", &["record", "'a'", "'b'"]).is_err());
     }
 }
 

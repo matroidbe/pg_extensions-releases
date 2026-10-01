@@ -701,7 +701,7 @@ fn test_mqtt_typed_topic_full_roundtrip() {
 
     // Step 2: Publish multiple valid messages via MQTT
     println!("\n=== Step 2: Publish metrics via MQTT ===");
-    let messages = vec![
+    let messages = [
         r#"{"device_id": "server-001", "cpu": 45.2, "memory": 67.8, "status": "healthy"}"#,
         r#"{"device_id": "server-002", "cpu": 89.1, "memory": 92.3, "status": "warning"}"#,
         r#"{"device_id": "server-003", "cpu": 12.0, "memory": 34.5}"#, // no status (optional)
@@ -945,4 +945,40 @@ fn test_mqtt_create_typed_topic_from_table() {
         }
         Err(e) => println!("Could not verify sensor: {}", e),
     }
+}
+
+/// Regression (#123 / #120): a topic or client id containing `$N` placeholder
+/// tokens and quotes is stored verbatim — never re-substituted into the SQL.
+#[test]
+fn test_mqtt_dollar_placeholder_topic_stored_literally() {
+    skip_if_no_server!(common::MQTT_ADDR);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let topic = format!("inj/$1/'||version()||'/{:x}", nanos);
+    let client_id = format!("$2-client-{:x}", nanos);
+
+    assert!(
+        mqtt_publish_and_wait(&client_id, &topic, b"$3 payload"),
+        "publish should succeed"
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let stored = common::run_sql(&format!(
+        "SELECT topic FROM pgmqtt.messages WHERE topic = '{}' ORDER BY message_id DESC LIMIT 1;",
+        topic.replace('\'', "''")
+    ))
+    .expect("SQL failed");
+    assert_eq!(stored, topic, "topic must round-trip as a literal");
+
+    let sessions = common::run_sql(&format!(
+        "SELECT COUNT(*)::bigint FROM pgmqtt.sessions WHERE client_id = '{}';",
+        client_id
+    ))
+    .expect("SQL failed");
+    assert!(
+        sessions.trim() == "1" || sessions.trim() == "0",
+        "session row query must not error"
+    );
 }

@@ -2,15 +2,37 @@
 //!
 //! Provides server readiness detection, graceful skipping, and SQL/HTTP execution helpers.
 
+// Compiled separately into every test binary, so a helper used by only one of
+// them reads as dead code while building the others.
+#![allow(dead_code)]
+
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_postgres::NoTls;
 
-/// S3 HTTP server address — uses port 19100 to avoid conflicts with a dev PG
-/// running pg_s3 on the default 9100. test.sh sets pg_s3.port = 19100
-/// in postgresql.conf to match.
-pub const S3_ADDR: &str = "127.0.0.1:19100";
+pub const S3_HOST: &str = "127.0.0.1";
+
+/// The S3 server port, from `PG_S3_PORT` — the same variable `test.sh`
+/// exports after choosing it and writing it into `postgresql.conf`.
+///
+/// Resolved at RUNTIME rather than fixed at 19100 because the port is global
+/// to the machine: a test that dials a port another process owns does not
+/// fail to connect, it connects to the WRONG SERVER and reports nonsense.
+///
+/// The default keeps a bare `cargo test` working against a hand-started PG.
+pub fn s3_port() -> u16 {
+    std::env::var("PG_S3_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(19100)
+}
+
+/// `host:port` for the server, resolved once per test binary.
+pub fn s3_addr() -> &'static str {
+    static ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ADDR.get_or_init(|| format!("{}:{}", S3_HOST, s3_port()))
+}
 
 /// Default PostgreSQL connection parameters for pgrx-managed instance
 pub const PG_HOST: &str = "localhost";
@@ -103,7 +125,7 @@ pub fn execute_sql(sql: &str) -> Result<(), String> {
 
 /// Base URL for the S3 HTTP server
 pub fn s3_base_url() -> String {
-    format!("http://{}", S3_ADDR)
+    format!("http://{}", s3_addr())
 }
 
 /// Macro to skip test if server is not running

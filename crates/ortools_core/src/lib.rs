@@ -7,6 +7,8 @@
 //! This crate has zero database dependencies. Consumers load data into the
 //! provided data structures and call solver functions directly.
 
+#[cfg(feature = "cpsat")]
+pub mod cpsat;
 pub mod error;
 pub mod metaheuristic;
 pub mod mip;

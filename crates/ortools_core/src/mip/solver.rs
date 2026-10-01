@@ -113,8 +113,14 @@ pub fn solve_mip(
 
 #[cfg(test)]
 mod tests {
+    // These benchmarks build LP/MIP models by hand, where i/j/r/c ARE the
+    // worker, task, row and column indices of the formulation and index
+    // several arrays at once (variables, cost matrix, constraint sums).
+    // Iterator rewrites obscure the standard textbook form for no gain.
+    #![allow(clippy::needless_range_loop)]
+
     use super::*;
-    use crate::mip::parser::{parse_constraint, parse_expression, parse_term};
+    use crate::mip::parser::{parse_constraint, parse_expression};
     use good_lp::{variable, Expression, ProblemVariables, Solution, SolverModel};
 
     fn make_vars() -> (ProblemVariables, HashMap<String, good_lp::Variable>) {

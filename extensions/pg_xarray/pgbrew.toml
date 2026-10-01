@@ -1,0 +1,28 @@
+# PostgreSQL configuration pg_xarray needs, read by pgbrew.
+#
+# `pgx install` reports this; `pgx install --configure` writes it to a
+# conf.d drop-in. It also travels inside a bottle, so a prebuilt install
+# configures the server too.
+
+[postgresql]
+# pg_xarray registers a background worker in _PG_init (the WMS tile server),
+# so its library must be loaded at server start. Without this the extension
+# installs and loads, but the worker never runs and it silently does nothing.
+#
+# This requirement is version-independent: a statically registered worker
+# needs preloading on every PostgreSQL version.
+shared_preload_libraries = true
+
+# No [postgresql.settings] block on purpose. Every GUC below already has a
+# working default, and writing defaults into postgresql.conf only creates
+# drift when the extension later changes one. Add a settings block here for
+# values that genuinely must differ for a deployment.
+#
+# NOTE: pg_xarray.wms_enabled defaults to OFF. The WMS server only starts
+#       once it is set, since it binds a TCP port (default 7800).
+# Available settings:
+#   pg_xarray.wms_enabled
+#   pg_xarray.database
+#   pg_xarray.wms_bind_host
+#   pg_xarray.wms_port
+#   pg_xarray.wms_cache_seconds

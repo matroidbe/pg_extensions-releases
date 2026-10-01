@@ -4,16 +4,22 @@ use crate::connector::bridge::{AsyncSinkBridge, AsyncSourceBridge};
 use crate::connector::input::cdc::CdcInput;
 use crate::connector::input::http_paginated::HttpPaginatedSource;
 use crate::connector::input::kafka::KafkaInput;
+use crate::connector::input::modbus::ModbusSource;
 use crate::connector::input::opendal_source::OpendalSource;
+use crate::connector::input::s7::S7Source;
 use crate::connector::input::table::TableInput;
 use crate::connector::output::branch::{BranchOutput, Route};
+use crate::connector::output::call::CallOutput;
 use crate::connector::output::kafka::{KafkaOutput, TypedTopicOutput};
+use crate::connector::output::modbus::ModbusSink;
 use crate::connector::output::opendal_sink::OpendalSink;
+use crate::connector::output::s7::S7Sink;
 use crate::connector::output::table::TableOutput;
 use crate::connector::registry;
 use crate::connector::secrets;
 use crate::connector::{AsyncSink, AsyncSource, DropOutput, InputConnector, OutputConnector};
 use crate::dsl::types::*;
+use crate::engine::subxact;
 use crate::processor::aggregate::AggregateProcessor;
 use crate::processor::cep::CepProcessor;
 use crate::processor::chain::ProcessorChain;
@@ -108,6 +114,25 @@ impl CompiledPipeline {
                     format!("http_paginated input: secret resolution failed: {}", e)
                 })?;
                 let source = HttpPaginatedSource::from_config(&resolved)?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || Box::new(source));
+                let bridge = AsyncSourceBridge::new("input", factory);
+                (Box::new(bridge), TopicShape::Messages)
+            }
+            InputConfig::Modbus(raw_cfg) => {
+                let resolved = secrets::resolve(raw_cfg)
+                    .map_err(|e| format!("modbus input: secret resolution failed: {}", e))?;
+                let source = ModbusSource::from_config(&resolved)?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || Box::new(source));
+                let bridge = AsyncSourceBridge::new("input", factory);
+                // Snapshots are pre-wrapped in the Messages shape.
+                (Box::new(bridge), TopicShape::Messages)
+            }
+            InputConfig::S7(raw_cfg) => {
+                let resolved = secrets::resolve(raw_cfg)
+                    .map_err(|e| format!("s7 input: secret resolution failed: {}", e))?;
+                let source = S7Source::from_config(&resolved)?;
                 let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
                     Box::new(move || Box::new(source));
                 let bridge = AsyncSourceBridge::new("input", factory);
@@ -229,11 +254,25 @@ impl CompiledPipeline {
         }
 
         // Build output connector — detect writable source-backed topics
-        let output: Box<dyn OutputConnector> = compile_output(&def.output)?;
+        let output: Box<dyn OutputConnector> = compile_output(
+            &def.output,
+            &OutputCtx {
+                cte: &input_cte,
+                pipeline: name,
+                dead_letter: def.pipeline.dead_letter.as_ref(),
+            },
+        )?;
 
         // Build dead letter output if configured
         let dead_letter_output: Option<Box<dyn OutputConnector>> = match &def.pipeline.dead_letter {
-            Some(out_config) => Some(compile_output(out_config)?),
+            Some(out_config) => Some(compile_output(
+                out_config,
+                &OutputCtx {
+                    cte: &input_cte,
+                    pipeline: name,
+                    dead_letter: None,
+                },
+            )?),
             None => None,
         };
 
@@ -255,9 +294,18 @@ impl CompiledPipeline {
     }
 
     /// Process one batch: poll → filter/map → write → commit
+    ///
+    /// Every connector call here runs in a subtransaction. Connectors reach
+    /// PostgreSQL through SPI, where a failure raises rather than returning
+    /// `Err` — a CHECK constraint the records violate, a source table someone
+    /// dropped. Left to escape, that error kills the executor's tick and the
+    /// worker restarts straight back into the same batch, retrying every few
+    /// seconds forever while the pipeline still reports `running` and records
+    /// no error. Wrapped, it comes back as an `Err` this function already knows
+    /// how to handle, and the operator sees `state = 'failed'` with the reason.
     pub fn process_batch(&mut self, batch_size: i32) -> Result<ProcessResult, String> {
         // Pull records from input (backpressure via batch_size)
-        let (batch, max_offset) = self.input.poll(batch_size)?;
+        let (batch, max_offset) = subxact::in_subtransaction_flat(|| self.input.poll(batch_size))?;
 
         if batch.is_empty() && !self.chain.has_stateful() {
             return Ok(ProcessResult {
@@ -292,7 +340,9 @@ impl CompiledPipeline {
                         }
                         // Commit offset to skip past bad records
                         if let Some(offset) = max_offset {
-                            self.input.commit(&self.name, offset)?;
+                            subxact::in_subtransaction_flat(|| {
+                                self.input.commit(&self.name, offset)
+                            })?;
                         }
                         Ok(ProcessResult {
                             records_in,
@@ -308,11 +358,17 @@ impl CompiledPipeline {
                         );
                         if let Some(ref orig) = original_batch {
                             Self::log_error_batch(&self.name, &e, orig);
-                            // Write failed batch to dead letter output
+                            // Write failed batch to dead letter output.
+                            // Guarded: a dead-letter sink that cannot accept
+                            // the batch raises a PostgreSQL error rather than
+                            // returning Err, and letting it escape here would
+                            // restart the executor into the same batch forever.
                             if let Some(ref mut dl) = self.dead_letter_output {
-                                if let Err(dl_err) = dl.write(orig) {
+                                let written = subxact::in_subtransaction_flat(|| dl.write(orig));
+                                if let Err(dl_err) = written {
                                     pgrx::warning!(
-                                        "pg_streaming pipeline '{}': dead letter write failed: {}",
+                                        "pg_streaming pipeline '{}': dead letter write failed \
+                                         (batch kept in pgstreams.error_log): {}",
                                         self.name,
                                         dl_err
                                     );
@@ -320,7 +376,9 @@ impl CompiledPipeline {
                             }
                         }
                         if let Some(offset) = max_offset {
-                            self.input.commit(&self.name, offset)?;
+                            subxact::in_subtransaction_flat(|| {
+                                self.input.commit(&self.name, offset)
+                            })?;
                         }
                         Ok(ProcessResult {
                             records_in,
@@ -335,12 +393,12 @@ impl CompiledPipeline {
 
         // Write to output
         if !processed.is_empty() {
-            self.output.write(&processed)?;
+            subxact::in_subtransaction_flat(|| self.output.write(&processed))?;
         }
 
         // Commit offset after successful write
         if let Some(offset) = max_offset {
-            self.input.commit(&self.name, offset)?;
+            subxact::in_subtransaction_flat(|| self.input.commit(&self.name, offset))?;
         }
 
         Ok(ProcessResult {
@@ -350,16 +408,21 @@ impl CompiledPipeline {
     }
 
     /// Log a batch of failed records to pgstreams.error_log (best-effort).
+    /// Guarded for the same reason as the dead-letter write: this runs on the
+    /// error path, and a raise here must not take the pipeline down.
     fn log_error_batch(pipeline: &str, error: &str, batch: &RecordBatch) {
         let batch_json = serde_json::Value::Array(batch.clone());
-        let result = Spi::run_with_args(
-            "INSERT INTO pgstreams.error_log (pipeline, error, record) VALUES ($1, $2, $3)",
-            &[
-                pipeline.into(),
-                error.into(),
-                pgrx::JsonB(batch_json).into(),
-            ],
-        );
+        let result = subxact::in_subtransaction_flat(|| {
+            Spi::run_with_args(
+                "INSERT INTO pgstreams.error_log (pipeline, error, record) VALUES ($1, $2, $3)",
+                &[
+                    pipeline.into(),
+                    error.into(),
+                    pgrx::JsonB(batch_json).into(),
+                ],
+            )
+            .map_err(|e| e.to_string())
+        });
         if let Err(e) = result {
             pgrx::warning!(
                 "pg_streaming pipeline '{}': failed to log error: {}",
@@ -381,8 +444,23 @@ pub struct ProcessResult {
 // Output compilation — converts OutputConfig / RouteOutput into connectors
 // =============================================================================
 
+/// Everything an output connector may need beyond its own config: the input
+/// batch CTE (for connectors that evaluate per-record SQL expressions), the
+/// pipeline name, and the pipeline's dead-letter config.
+struct OutputCtx<'a> {
+    /// Batch CTE preamble — same one the processor chain uses
+    cte: &'a str,
+    pipeline: &'a str,
+    /// `None` when compiling a dead-letter output itself, which stops a
+    /// `call` sink nested under `dead_letter` from recursing.
+    dead_letter: Option<&'a OutputConfig>,
+}
+
 /// Compile an OutputConfig into a concrete OutputConnector.
-fn compile_output(config: &OutputConfig) -> Result<Box<dyn OutputConnector>, String> {
+fn compile_output(
+    config: &OutputConfig,
+    ctx: &OutputCtx,
+) -> Result<Box<dyn OutputConnector>, String> {
     match config {
         OutputConfig::Kafka(k) => match resolve_output_topic_info(&k.topic)? {
             Some(typed_info) => Ok(Box::new(typed_info)),
@@ -413,6 +491,41 @@ fn compile_output(config: &OutputConfig) -> Result<Box<dyn OutputConnector>, Str
             let factory: Box<dyn FnOnce() -> Box<dyn AsyncSink> + Send> =
                 Box::new(move || Box::new(sink));
             Ok(Box::new(AsyncSinkBridge::new(factory)))
+        }
+        OutputConfig::Modbus(raw_cfg) => {
+            let resolved = secrets::resolve(raw_cfg)
+                .map_err(|e| format!("modbus output: secret resolution failed: {}", e))?;
+            let sink = ModbusSink::from_config(&resolved)?;
+            let factory: Box<dyn FnOnce() -> Box<dyn AsyncSink> + Send> =
+                Box::new(move || Box::new(sink));
+            Ok(Box::new(AsyncSinkBridge::new(factory)))
+        }
+        OutputConfig::S7(raw_cfg) => {
+            let resolved = secrets::resolve(raw_cfg)
+                .map_err(|e| format!("s7 output: secret resolution failed: {}", e))?;
+            let sink = S7Sink::from_config(&resolved)?;
+            let factory: Box<dyn FnOnce() -> Box<dyn AsyncSink> + Send> =
+                Box::new(move || Box::new(sink));
+            Ok(Box::new(AsyncSinkBridge::new(factory)))
+        }
+        OutputConfig::Call(c) => {
+            // The call sink does its own per-record dead-lettering, so it needs
+            // its own handle to the dead-letter sink. Compiled with
+            // `dead_letter: None` so a `call` under `dead_letter` can't recurse.
+            let dead_letter = match ctx.dead_letter {
+                Some(dl_config) => Some(compile_output(
+                    dl_config,
+                    &OutputCtx {
+                        cte: ctx.cte,
+                        pipeline: ctx.pipeline,
+                        dead_letter: None,
+                    },
+                )?),
+                None => None,
+            };
+            let output = CallOutput::new(c, ctx.cte, ctx.pipeline, dead_letter);
+            output.verify_function_exists()?;
+            Ok(Box::new(output))
         }
         OutputConfig::Custom(c) => {
             let resolved = secrets::resolve(&c.config)

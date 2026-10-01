@@ -1,6 +1,6 @@
 [package]
 name = "pg_ortools"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,13 +14,20 @@ name = "pgrx_embed_pg_ortools"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg16"]
+default = ["pg16", "cpsat"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "ortools_core/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "ortools_core/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "ortools_core/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "ortools_core/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "ortools_core/pg18"]
 pg_test = []
+# CP-SAT scheduling engine (pure-Rust Pumpkin). On by default: it adds SQL
+# objects, and an extension's SQL surface must not depend on how it was built,
+# or the same version means different catalogs (design/extension-versioning).
+# A build with --no-default-features (e.g. for another PG major) must list it:
+# `--no-default-features --features pg17,cpsat`.
+# See design/pg_ortools/cpsat-engine.md.
+cpsat = ["ortools_core/cpsat"]
 
 [dependencies]
 pgrx.workspace = true

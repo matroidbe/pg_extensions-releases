@@ -1,11 +1,12 @@
 //! Arithmetic operators for distributions
 //!
 //! These operators build lazy expression trees that are evaluated
-//! during sampling. This allows efficient Monte Carlo simulation
-//! by sampling once and propagating through the expression tree.
+//! during sampling. All math delegates to `prob_core::ops`; this module
+//! only carries the pgrx wrappers and the SQL operator/aggregate DDL.
 
-use crate::distribution::{Dist, DistAvgState, DistParams, DistType};
+use crate::distribution::{ok_or_pg, Dist, DistAvgState};
 use pgrx::prelude::*;
+use prob_core::ops;
 
 // =============================================================================
 // Distribution + Distribution
@@ -14,81 +15,25 @@ use pgrx::prelude::*;
 /// Add two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_add(left: Dist, right: Dist) -> Dist {
-    // Optimization: if both are literals, compute directly
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l + r },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Add,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ops::dist_add(left.0, right.0))
 }
 
 /// Subtract two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_sub(left: Dist, right: Dist) -> Dist {
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l - r },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Sub,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ops::dist_sub(left.0, right.0))
 }
 
 /// Multiply two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_mul(left: Dist, right: Dist) -> Dist {
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l * r },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Mul,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ops::dist_mul(left.0, right.0))
 }
 
 /// Divide two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_div(left: Dist, right: Dist) -> Dist {
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        if r == 0.0 {
-            pgrx::error!("division by zero");
-        }
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l / r },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Div,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ok_or_pg(ops::dist_div(left.0, right.0)))
 }
 
 // =============================================================================
@@ -98,20 +43,7 @@ pub fn dist_div(left: Dist, right: Dist) -> Dist {
 /// Multiply distribution by scalar
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_mul_scalar(dist: Dist, scalar: f64) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v * scalar },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Mul,
-        params: DistParams::ScalarOp {
-            dist: Box::new(dist),
-            scalar,
-        },
-    }
+    Dist(ops::dist_mul_scalar(dist.0, scalar))
 }
 
 /// Multiply scalar by distribution
@@ -123,70 +55,19 @@ pub fn scalar_mul_dist(scalar: f64, dist: Dist) -> Dist {
 /// Divide distribution by scalar
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_div_scalar(dist: Dist, scalar: f64) -> Dist {
-    if scalar == 0.0 {
-        pgrx::error!("division by zero");
-    }
-
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v / scalar },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Div,
-        params: DistParams::ScalarOp {
-            dist: Box::new(dist),
-            scalar,
-        },
-    }
+    Dist(ok_or_pg(ops::dist_div_scalar(dist.0, scalar)))
 }
 
 /// Divide scalar by distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn scalar_div_dist(scalar: f64, dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        if v == 0.0 {
-            pgrx::error!("division by zero");
-        }
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: scalar / v },
-        };
-    }
-
-    // scalar / dist = scalar * (1/dist) - but we need to represent this
-    // We'll use a binary op with literal on the left
-    Dist {
-        dist_type: DistType::Div,
-        params: DistParams::BinaryOp {
-            left: Box::new(Dist {
-                dist_type: DistType::Literal,
-                params: DistParams::Literal { value: scalar },
-            }),
-            right: Box::new(dist),
-        },
-    }
+    Dist(ok_or_pg(ops::scalar_div_dist(scalar, dist.0)))
 }
 
 /// Add scalar to distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_add_scalar(dist: Dist, scalar: f64) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v + scalar },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Add,
-        params: DistParams::ScalarOp {
-            dist: Box::new(dist),
-            scalar,
-        },
-    }
+    Dist(ops::dist_add_scalar(dist.0, scalar))
 }
 
 /// Add distribution to scalar
@@ -198,42 +79,13 @@ pub fn scalar_add_dist(scalar: f64, dist: Dist) -> Dist {
 /// Subtract scalar from distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_sub_scalar(dist: Dist, scalar: f64) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v - scalar },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Sub,
-        params: DistParams::ScalarOp {
-            dist: Box::new(dist),
-            scalar,
-        },
-    }
+    Dist(ops::dist_sub_scalar(dist.0, scalar))
 }
 
 /// Subtract distribution from scalar
 #[pg_extern(immutable, parallel_safe)]
 pub fn scalar_sub_dist(scalar: f64, dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: scalar - v },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Sub,
-        params: DistParams::BinaryOp {
-            left: Box::new(Dist {
-                dist_type: DistType::Literal,
-                params: DistParams::Literal { value: scalar },
-            }),
-            right: Box::new(dist),
-        },
-    }
+    Dist(ops::scalar_sub_dist(scalar, dist.0))
 }
 
 // =============================================================================
@@ -243,97 +95,31 @@ pub fn scalar_sub_dist(scalar: f64, dist: Dist) -> Dist {
 /// Negate a distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_neg(dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: -v },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Neg,
-        params: DistParams::UnaryOp {
-            operand: Box::new(dist),
-        },
-    }
+    Dist(ops::dist_neg(dist.0))
 }
 
 /// Absolute value of a distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_abs(dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v.abs() },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Abs,
-        params: DistParams::UnaryOp {
-            operand: Box::new(dist),
-        },
-    }
+    Dist(ops::dist_abs(dist.0))
 }
 
 /// Square root of a distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_sqrt(dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        if v < 0.0 {
-            pgrx::error!("cannot take square root of negative number");
-        }
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v.sqrt() },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Sqrt,
-        params: DistParams::UnaryOp {
-            operand: Box::new(dist),
-        },
-    }
+    Dist(ok_or_pg(ops::dist_sqrt(dist.0)))
 }
 
 /// Exponential of a distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_exp(dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v.exp() },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Exp,
-        params: DistParams::UnaryOp {
-            operand: Box::new(dist),
-        },
-    }
+    Dist(ops::dist_exp(dist.0))
 }
 
 /// Natural log of a distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn dist_ln(dist: Dist) -> Dist {
-    if let Some(v) = dist.as_literal() {
-        if v <= 0.0 {
-            pgrx::error!("cannot take log of non-positive number");
-        }
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: v.ln() },
-        };
-    }
-
-    Dist {
-        dist_type: DistType::Ln,
-        params: DistParams::UnaryOp {
-            operand: Box::new(dist),
-        },
-    }
+    Dist(ok_or_pg(ops::dist_ln(dist.0)))
 }
 
 // =============================================================================
@@ -491,12 +277,7 @@ fn nvl(dist: Option<Dist>, default: Dist) -> Dist {
 /// State function for SUM(dist) - uses dist as the state type
 #[pg_extern(immutable, parallel_safe)]
 fn dist_sum_state(state: Option<Dist>, value: Option<Dist>) -> Option<Dist> {
-    match (state, value) {
-        (None, None) => None,
-        (Some(s), None) => Some(s),
-        (None, Some(v)) => Some(v),
-        (Some(s), Some(v)) => Some(dist_add(s, v)),
-    }
+    ops::sum_state(state.map(|d| d.0), value.map(|d| d.0)).map(Dist)
 }
 
 pgrx::extension_sql!(
@@ -517,30 +298,13 @@ CREATE AGGREGATE @extschema@.sum(@extschema@.dist) (
 /// Binary min operation on two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 fn dist_min_op(left: Dist, right: Dist) -> Dist {
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l.min(r) },
-        };
-    }
-    Dist {
-        dist_type: DistType::Min,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ops::dist_min_op(left.0, right.0))
 }
 
 /// State function for MIN(dist)
 #[pg_extern(immutable, parallel_safe)]
 fn dist_min_state(state: Option<Dist>, value: Option<Dist>) -> Option<Dist> {
-    match (state, value) {
-        (None, None) => None,
-        (Some(s), None) => Some(s),
-        (None, Some(v)) => Some(v),
-        (Some(s), Some(v)) => Some(dist_min_op(s, v)),
-    }
+    ops::min_state(state.map(|d| d.0), value.map(|d| d.0)).map(Dist)
 }
 
 pgrx::extension_sql!(
@@ -561,30 +325,13 @@ CREATE AGGREGATE @extschema@.min(@extschema@.dist) (
 /// Binary max operation on two distributions (lazy)
 #[pg_extern(immutable, parallel_safe)]
 fn dist_max_op(left: Dist, right: Dist) -> Dist {
-    if let (Some(l), Some(r)) = (left.as_literal(), right.as_literal()) {
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: l.max(r) },
-        };
-    }
-    Dist {
-        dist_type: DistType::Max,
-        params: DistParams::BinaryOp {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    Dist(ops::dist_max_op(left.0, right.0))
 }
 
 /// State function for MAX(dist)
 #[pg_extern(immutable, parallel_safe)]
 fn dist_max_state(state: Option<Dist>, value: Option<Dist>) -> Option<Dist> {
-    match (state, value) {
-        (None, None) => None,
-        (Some(s), None) => Some(s),
-        (None, Some(v)) => Some(v),
-        (Some(s), Some(v)) => Some(dist_max_op(s, v)),
-    }
+    ops::max_state(state.map(|d| d.0), value.map(|d| d.0)).map(Dist)
 }
 
 pgrx::extension_sql!(
@@ -605,27 +352,13 @@ CREATE AGGREGATE @extschema@.max(@extschema@.dist) (
 /// State function for AVG(dist) - tracks sum and count
 #[pg_extern(immutable, parallel_safe)]
 fn dist_avg_state(state: Option<DistAvgState>, value: Option<Dist>) -> Option<DistAvgState> {
-    match (state, value) {
-        (None, None) => None,
-        (Some(s), None) => Some(s),
-        (None, Some(v)) => Some(DistAvgState { sum: v, count: 1 }),
-        (Some(s), Some(v)) => Some(DistAvgState {
-            sum: dist_add(s.sum, v),
-            count: s.count + 1,
-        }),
-    }
+    ops::avg_state(state.map(|s| s.0), value.map(|d| d.0)).map(DistAvgState)
 }
 
 /// Final function for AVG(dist) - divides sum by count
 #[pg_extern(immutable, parallel_safe)]
 fn dist_avg_final(state: Option<DistAvgState>) -> Option<Dist> {
-    state.map(|s| {
-        if s.count <= 1 {
-            s.sum
-        } else {
-            dist_div_scalar(s.sum, s.count as f64)
-        }
-    })
+    ops::avg_final(state.map(|s| s.0)).map(Dist)
 }
 
 pgrx::extension_sql!(
@@ -648,7 +381,7 @@ CREATE AGGREGATE @extschema@.avg(@extschema@.dist) (
 #[pgrx::pg_schema]
 mod tests {
     use super::*;
-    use crate::distribution::{literal_f64 as literal, normal};
+    use crate::distribution::{literal_f64 as literal, normal, DistType};
 
     #[pg_test]
     fn test_add_literals() {
@@ -661,7 +394,7 @@ mod tests {
     fn test_add_distributions_creates_add_type() {
         let result = dist_add(normal(100.0, 10.0), normal(50.0, 5.0));
         assert!(!result.is_literal());
-        assert_eq!(result.dist_type, DistType::Add);
+        assert_eq!(result.0.dist_type, DistType::Add);
     }
 
     #[pg_test]
@@ -698,7 +431,7 @@ mod tests {
         let result = Spi::get_one::<bool>(
             "SELECT pgprob.coalesce(NULL::pgprob.dist, NULL::pgprob.dist) IS NULL",
         );
-        assert_eq!(result.unwrap().unwrap(), true);
+        assert!(result.unwrap().unwrap());
     }
 
     #[pg_test]

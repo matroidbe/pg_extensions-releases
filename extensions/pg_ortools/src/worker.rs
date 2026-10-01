@@ -122,9 +122,15 @@ pub fn get_database() -> String {
 }
 
 /// Get solver time limit in seconds
-#[allow(dead_code)]
 pub fn get_solver_time_limit() -> i32 {
     SOLVER_TIME_LIMIT.get()
+}
+
+/// CP-SAT solve budget from `pg_ortools.solver_time_limit`, used to bound the
+/// synchronous `solve_cp_sync` so it can never run indefinitely proving optimality.
+#[cfg(feature = "cpsat")]
+pub fn cp_solve_limits() -> ortools_core::cpsat::SolveLimits {
+    ortools_core::cpsat::SolveLimits::from_secs(get_solver_time_limit() as i64)
 }
 
 /// Get auto threshold (variable count above which local search is used)
@@ -160,99 +166,192 @@ pub fn register_background_worker() {
 // Job Processing
 // =============================================================================
 
-/// Process a single solve job
-fn process_solve_job(job: jobs::SolveJob) -> Result<(), PgOrtoolsError> {
+/// How often a running CP solve actually hits the database to check whether its
+/// job was cancelled. The engine polls its termination hook far more often than
+/// this; between checks the cached answer is returned, so the DB cost of
+/// cancellation polling stays negligible.
+#[cfg(feature = "cpsat")]
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Run a claimed job to completion, managing its own short transactions.
+///
+/// The job was already claimed (state `solving`, committed) in a *separate*
+/// transaction, so no row lock on `solve_jobs` is held here — a concurrent
+/// `cancel_solve` can commit `state = 'cancelled'` and be observed. Each SPI step
+/// (load model, solve, store, complete) is its own `BackgroundWorker::transaction`,
+/// and the CPU-bound solve itself runs with **no transaction open**. This is what
+/// fixes both "status stuck at queued" (each state change commits immediately) and
+/// "cancel blocks on the claim row lock" (the lock is long gone).
+fn run_job(job: jobs::SolveJob) -> Result<(), PgOrtoolsError> {
+    let job_id = job.id;
+    let problem = job.problem_name.clone();
+    let strategy = job.config.strategy.clone();
+
     pgrx::log!(
         "pg_ortools_solver: processing job {} for problem '{}'",
-        job.id,
-        job.problem_name
+        job_id,
+        problem
     );
 
-    jobs::update_job_progress(job.id, "solving", 0.0, Some("Loading problem"))?;
-
-    if jobs::is_job_cancelled(job.id)? {
-        pgrx::log!("pg_ortools_solver: job {} cancelled during setup", job.id);
+    // The job may have been cancelled while it sat queued.
+    if BackgroundWorker::transaction(|| jobs::is_job_cancelled(job_id))? {
+        pgrx::log!("pg_ortools_solver: job {} cancelled before solving", job_id);
         return Ok(());
     }
 
-    let strategy = job.config.strategy.as_deref();
+    let step = match strategy.as_deref() {
+        Some(s) => format!("Solving (strategy: {})", s),
+        None => "Solving (MIP)".to_string(),
+    };
+    let _ = BackgroundWorker::transaction(|| {
+        jobs::update_job_progress(job_id, "solving", 0.1, Some(&step))
+    });
+
+    // Time budget: the job's own limit wins; otherwise the GUC default.
     let time_limit_secs = job
         .config
         .time_limit_seconds
-        .unwrap_or(get_solver_time_limit());
+        .unwrap_or_else(get_solver_time_limit);
     let time_limit = Duration::from_secs(time_limit_secs.max(1) as u64);
 
-    let step_msg = match strategy {
-        Some(s) => format!("Building model (strategy: {})", s),
-        None => "Building model (MIP)".to_string(),
-    };
-    jobs::update_job_progress(job.id, "solving", 0.1, Some(&step_msg))?;
-
-    // Dispatch based on strategy
-    let result = match strategy {
+    match strategy.as_deref() {
+        Some("cpsat") => {
+            #[cfg(feature = "cpsat")]
+            {
+                run_cpsat_job(job_id, &problem, time_limit_secs)?;
+            }
+            #[cfg(not(feature = "cpsat"))]
+            {
+                return Err(PgOrtoolsError::InvalidParameter(
+                    "strategy 'cpsat' requires building pg_ortools with --features cpsat"
+                        .to_string(),
+                ));
+            }
+        }
         Some("hill_climbing")
         | Some("tabu_search")
         | Some("simulated_annealing")
         | Some("late_acceptance") => {
-            let algorithm = crate::metaheuristic::parse_algorithm(strategy.unwrap())?;
-            crate::metaheuristic::solve_from_db(&job.problem_name, &algorithm, time_limit)
+            let algorithm = crate::metaheuristic::parse_algorithm(strategy.as_deref().unwrap())?;
+            let solution = BackgroundWorker::transaction(|| {
+                crate::metaheuristic::solve_from_db(&problem, &algorithm, time_limit)
+            })?;
+            finalize_job(job_id, &problem, || {
+                crate::solver::store_solution(&problem, &solution)
+            })?;
         }
         Some("auto") => {
-            // Count variables to decide
-            let var_count = Spi::get_one::<i64>(&format!(
-                "SELECT COUNT(*)::bigint FROM pgortools.variables v \
-                 JOIN pgortools.problems p ON v.problem_id = p.id \
-                 WHERE p.name = '{}'",
-                job.problem_name.replace('\'', "''")
-            ))
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-
-            let threshold = get_auto_threshold() as i64;
-            if var_count < threshold {
-                crate::solver::solve_problem(&job.problem_name, false)
+            let var_count = BackgroundWorker::transaction(|| count_variables(&problem));
+            if var_count < get_auto_threshold() as i64 {
+                // solve_problem stores its own solution.
+                BackgroundWorker::transaction(|| crate::solver::solve_problem(&problem, false))?;
+                finalize_job(job_id, &problem, || Ok(()))?;
             } else {
-                let algo_name = get_default_algorithm();
-                let algorithm = crate::metaheuristic::parse_algorithm(&algo_name)?;
-                crate::metaheuristic::solve_from_db(&job.problem_name, &algorithm, time_limit)
+                let algo = crate::metaheuristic::parse_algorithm(&get_default_algorithm())?;
+                let solution = BackgroundWorker::transaction(|| {
+                    crate::metaheuristic::solve_from_db(&problem, &algo, time_limit)
+                })?;
+                finalize_job(job_id, &problem, || {
+                    crate::solver::store_solution(&problem, &solution)
+                })?;
             }
         }
-        Some("mip") | None => crate::solver::solve_problem(&job.problem_name, false),
+        Some("mip") | None => {
+            // solve_problem stores its own solution.
+            BackgroundWorker::transaction(|| crate::solver::solve_problem(&problem, false))?;
+            finalize_job(job_id, &problem, || Ok(()))?;
+        }
         Some(unknown) => {
             return Err(PgOrtoolsError::InvalidParameter(format!(
-                "Unknown strategy: '{}'. Valid: mip, hill_climbing, tabu_search, \
+                "Unknown strategy: '{}'. Valid: mip, cpsat, hill_climbing, tabu_search, \
                  simulated_annealing, late_acceptance, auto",
                 unknown
             )));
         }
-    };
-
-    // Check cancellation before completing
-    if jobs::is_job_cancelled(job.id)? {
-        pgrx::log!("pg_ortools_solver: job {} cancelled after solving", job.id);
-        return Ok(());
-    }
-
-    match result {
-        Ok(solution) => {
-            jobs::update_job_progress(job.id, "solving", 0.9, Some("Storing solution"))?;
-
-            // Store solution if the solver didn't already (metaheuristic path)
-            if strategy.is_some() && !matches!(strategy, Some("mip")) {
-                crate::solver::store_solution(&job.problem_name, &solution)?;
-            }
-
-            jobs::complete_job(job.id)?;
-            jobs::notify_completion(job.id, "completed", &job.problem_name, None)?;
-
-            pgrx::log!("pg_ortools_solver: job {} completed", job.id);
-        }
-        Err(e) => {
-            return Err(e);
-        }
     }
 
     Ok(())
+}
+
+/// Count a problem's variables (for the `auto` strategy). Must run in a transaction.
+fn count_variables(problem: &str) -> i64 {
+    Spi::get_one_with_args::<i64>(
+        "SELECT COUNT(*)::bigint FROM pgortools.variables v \
+         JOIN pgortools.problems p ON v.problem_id = p.id WHERE p.name = $1",
+        &[problem.into()],
+    )
+    .unwrap_or(Some(0))
+    .unwrap_or(0)
+}
+
+/// Finalise a solved job in one short transaction: if it was cancelled mid-solve,
+/// leave it `cancelled` and run no side effects; otherwise persist the solution
+/// (`store`), mark it `completed`, and notify. Checking cancellation and
+/// completing in the same transaction keeps the two consistent.
+fn finalize_job(
+    job_id: i64,
+    problem: &str,
+    store: impl FnOnce() -> Result<(), PgOrtoolsError>
+        + std::panic::UnwindSafe
+        + std::panic::RefUnwindSafe,
+) -> Result<(), PgOrtoolsError> {
+    BackgroundWorker::transaction(|| {
+        if jobs::is_job_cancelled(job_id)? {
+            pgrx::log!(
+                "pg_ortools_solver: job {} cancelled during solve; leaving state=cancelled",
+                job_id
+            );
+            return Ok(());
+        }
+        store()?;
+        jobs::complete_job(job_id)?;
+        jobs::notify_completion(job_id, "completed", problem, None)?;
+        pgrx::log!("pg_ortools_solver: job {} completed", job_id);
+        Ok(())
+    })
+}
+
+/// Load → solve → store a CP-SAT job. The solve is bounded by `time_limit_secs`
+/// and cancellable: a throttled poll of the job's `cancelled` state feeds the
+/// engine's cooperative termination hook, so `cancel_solve` stops it mid-search
+/// instead of waiting for the whole (possibly unbounded) proof to finish.
+#[cfg(feature = "cpsat")]
+fn run_cpsat_job(job_id: i64, problem: &str, time_limit_secs: i32) -> Result<(), PgOrtoolsError> {
+    use ortools_core::cpsat::SolveLimits;
+    use std::time::Instant;
+
+    // Load inside a transaction; the owned model outlives it, so the solve below
+    // holds no transaction (and thus no locks) and the cancel poll can open its own.
+    let (model, names) = BackgroundWorker::transaction(|| crate::cpsat::load_cp_model(problem))?;
+
+    let mut last_poll = Instant::now();
+    let mut cancelled = || {
+        if last_poll.elapsed() < CANCEL_POLL_INTERVAL {
+            return false;
+        }
+        last_poll = Instant::now();
+        match BackgroundWorker::transaction(|| jobs::is_job_cancelled(job_id)) {
+            Ok(c) => c,
+            // A transient read failure must not abort a long solve — the time
+            // budget still bounds it. Keep going and retry on the next poll.
+            Err(e) => {
+                pgrx::log!(
+                    "pg_ortools_solver: cancel poll failed for job {}: {}",
+                    job_id,
+                    e
+                );
+                false
+            }
+        }
+    };
+
+    let limits = SolveLimits::from_secs(time_limit_secs as i64);
+    let outcome = model.solve_with(&limits, &mut cancelled);
+    let result = crate::cpsat::outcome_to_json(&outcome, &model, &names);
+
+    finalize_job(job_id, problem, || {
+        crate::cpsat::store_cp_solution(problem, &result)
+    })
 }
 
 // =============================================================================
@@ -291,48 +390,32 @@ pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
             pgrx::log!("pg_ortools_solver: received SIGHUP");
         }
 
-        let result: Result<(), PgOrtoolsError> = BackgroundWorker::transaction(|| {
-            match jobs::claim_next_job() {
-                Ok(Some(job)) => {
-                    let job_id = job.id;
-                    let problem = job.problem_name.clone();
+        // Claim in its own committed transaction. This makes state='solving'
+        // visible at once and releases the claim's row lock, so the long solve
+        // that follows holds nothing a concurrent cancel_solve could block on.
+        let claimed = BackgroundWorker::transaction(jobs::claim_next_job);
 
-                    if let Err(e) = process_solve_job(job) {
-                        pgrx::log!("pg_ortools_solver: job {} failed: {}", job_id, e);
+        match claimed {
+            Ok(Some(job)) => {
+                let job_id = job.id;
+                let problem = job.problem_name.clone();
 
-                        if let Err(fail_err) = jobs::fail_job(job_id, &e.to_string()) {
-                            pgrx::log!(
-                                "pg_ortools_solver: failed to mark job {} as failed: {}",
-                                job_id,
-                                fail_err
-                            );
-                        }
-
-                        if let Err(notify_err) = jobs::notify_completion(
-                            job_id,
-                            "failed",
-                            &problem,
-                            Some(&e.to_string()),
-                        ) {
-                            pgrx::log!(
-                                "pg_ortools_solver: failed to send failure notification: {}",
-                                notify_err
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No jobs to process
-                }
-                Err(e) => {
-                    pgrx::log!("pg_ortools_solver: error claiming job: {}", e);
+                // Solve OUTSIDE the claim transaction; run_job manages its own.
+                if let Err(e) = run_job(job) {
+                    let msg = e.to_string();
+                    pgrx::log!("pg_ortools_solver: job {} failed: {}", job_id, msg);
+                    let _ = BackgroundWorker::transaction(|| jobs::fail_job(job_id, &msg));
+                    let _ = BackgroundWorker::transaction(|| {
+                        jobs::notify_completion(job_id, "failed", &problem, Some(&msg))
+                    });
                 }
             }
-            Ok(())
-        });
-
-        if let Err(e) = result {
-            pgrx::log!("pg_ortools_solver: transaction error: {}", e);
+            Ok(None) => {
+                // No jobs to process
+            }
+            Err(e) => {
+                pgrx::log!("pg_ortools_solver: error claiming job: {}", e);
+            }
         }
     }
 

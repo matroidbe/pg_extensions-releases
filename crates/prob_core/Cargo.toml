@@ -1,0 +1,23 @@
+[package]
+name = "prob_core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure Rust probabilistic distribution core: lazy expression trees + Monte Carlo sampling"
+
+[features]
+# Empty features for workspace compatibility with pgrx extensions
+pg14 = []
+pg15 = []
+pg16 = []
+pg17 = []
+pg18 = []
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand = "0.8"
+rand_distr = "0.4"

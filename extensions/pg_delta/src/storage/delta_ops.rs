@@ -445,7 +445,7 @@ pub fn test_storage_connectivity(uri: &str) -> pgrx::JsonB {
 // =============================================================================
 
 /// Register storage handlers based on URI scheme.
-fn register_storage_handlers(uri: &str) {
+pub fn register_storage_handlers(uri: &str) {
     let uri_lower = uri.to_lowercase();
 
     if uri_lower.starts_with("s3://") {

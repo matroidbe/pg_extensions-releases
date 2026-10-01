@@ -6,6 +6,9 @@
 //! state written by the test (and vice versa).
 
 #![allow(dead_code)]
+// Fixture builders mirror the many-columned SQL rows they insert; bundling the
+// parameters into structs would just move the same fields one level down.
+#![allow(clippy::too_many_arguments)]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

@@ -47,7 +47,7 @@ impl MqttStorageClient {
                     SpiParam::Text(Some(topic.to_string())),
                     SpiParam::Bytea(payload.map(|p| p.to_vec())),
                     SpiParam::Int4(Some(qos as i32)),
-                    SpiParam::Text(Some(retain.to_string())),
+                    SpiParam::Bool(Some(retain)),
                 ],
             )
             .await

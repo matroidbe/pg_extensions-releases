@@ -16,8 +16,9 @@ use pgrx::prelude::*;
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SolveJobConfig {
     pub time_limit_seconds: Option<i32>,
-    /// Strategy: "mip", "hill_climbing", "tabu_search", "simulated_annealing",
-    /// "late_acceptance", "auto". None defaults to MIP behavior.
+    /// Strategy: "mip", "cpsat", "hill_climbing", "tabu_search",
+    /// "simulated_annealing", "late_acceptance", "auto". None defaults to MIP
+    /// behavior. "cpsat" (scheduling) requires the `cpsat` build feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
 }
@@ -189,7 +190,16 @@ pub fn fail_job(job_id: i64, error: &str) -> Result<(), PgOrtoolsError> {
         .map_err(|e| PgOrtoolsError::SpiError(format!("Failed to mark job failed: {}", e)))
 }
 
-/// Cancel a job
+/// Cancel a job. Returns `true` if a queued/solving job was moved to
+/// `cancelled`, `false` if there was nothing to cancel (already completed,
+/// failed, already cancelled, or no such job).
+///
+/// The `WHERE … RETURNING id` matches zero rows whenever the job is not
+/// cancellable, and pgrx's `Spi::get_one` reports an empty result set as
+/// `Err(InvalidPosition)` ("SpiTupleTable positioned before the start or after
+/// the end") rather than `Ok(None)`. Treat that empty result as "nothing
+/// cancelled" — surfacing it as an error is the bug that made `cancel_solve`
+/// throw on any already-finished job.
 pub fn cancel_job(job_id: i64) -> Result<bool, PgOrtoolsError> {
     let sql = format!(
         "UPDATE pgortools.solve_jobs
@@ -199,10 +209,14 @@ pub fn cancel_job(job_id: i64) -> Result<bool, PgOrtoolsError> {
         job_id
     );
 
-    let cancelled: Option<i64> = Spi::get_one(&sql)
-        .map_err(|e| PgOrtoolsError::SpiError(format!("Failed to cancel job: {}", e)))?;
-
-    Ok(cancelled.is_some())
+    match Spi::get_one::<i64>(&sql) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) | Err(pgrx::spi::SpiError::InvalidPosition) => Ok(false),
+        Err(e) => Err(PgOrtoolsError::SpiError(format!(
+            "Failed to cancel job: {}",
+            e
+        ))),
+    }
 }
 
 /// Check if a job was cancelled

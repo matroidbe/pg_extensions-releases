@@ -142,6 +142,26 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_create_machine_if_not_exists_returns_existing() {
+        set_search_path();
+        let first = Spi::get_one::<i32>("SELECT pgfsm.create_machine('seed_m', 'init')")
+            .unwrap()
+            .unwrap();
+        // Re-seeding with if_not_exists returns the existing id instead of raising.
+        let again = Spi::get_one::<i32>(
+            "SELECT pgfsm.create_machine('seed_m', 'init', if_not_exists => true)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first, again);
+
+        let count = Spi::get_one::<i64>("SELECT count(*) FROM pgfsm.machine WHERE name = 'seed_m'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[pg_test]
     fn test_add_state() {
         set_search_path();
         Spi::run("SELECT pgfsm.create_machine('sm', 'draft')").unwrap();
@@ -171,6 +191,22 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_add_state_if_not_exists_skips_duplicate() {
+        set_search_path();
+        Spi::run("SELECT pgfsm.create_machine('seed_s', 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.add_state('seed_s', 'active')").unwrap();
+        // Re-adding the same state with if_not_exists is a no-op, not a duplicate-key error.
+        Spi::run("SELECT pgfsm.add_state('seed_s', 'active', if_not_exists => true)").unwrap();
+
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.state s JOIN pgfsm.machine m ON s.machine_id = m.id WHERE m.name = 'seed_s' AND s.name = 'active'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[pg_test]
     fn test_add_state_final() {
         set_search_path();
         Spi::run("SELECT pgfsm.create_machine('sm3', 'open')").unwrap();
@@ -195,6 +231,32 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(tid > 0);
+    }
+
+    #[pg_test]
+    fn test_add_transition_if_not_exists_returns_existing() {
+        set_search_path();
+        Spi::run("SELECT pgfsm.create_machine('seed_t', 'draft')").unwrap();
+        Spi::run("SELECT pgfsm.add_state('seed_t', 'active')").unwrap();
+        let first =
+            Spi::get_one::<i32>("SELECT pgfsm.add_transition('seed_t', 'draft', 'active', 'go')")
+                .unwrap()
+                .unwrap();
+        // Re-seeding the same logical transition returns the existing id, not a second row —
+        // the unique key includes the auto-assigned priority, so ON CONFLICT can't catch it.
+        let again = Spi::get_one::<i32>(
+            "SELECT pgfsm.add_transition('seed_t', 'draft', 'active', 'go', if_not_exists => true)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first, again);
+
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgfsm.transition t JOIN pgfsm.machine m ON t.machine_id = m.id WHERE m.name = 'seed_t' AND t.event = 'go'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[pg_test]

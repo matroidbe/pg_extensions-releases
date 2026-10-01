@@ -111,14 +111,18 @@ CREATE TABLE pgkafka.messages (
 
 CREATE INDEX idx_messages_topic_offset ON pgkafka.messages (topic_id, offset_id);
 
--- Consumer groups
+-- Consumer groups (coordinator state; see storage/groups.rs)
+-- state: Empty | PreparingRebalance | CompletingRebalance | Stable
 CREATE TABLE pgkafka.consumer_groups (
     id SERIAL PRIMARY KEY,
     group_id TEXT NOT NULL UNIQUE,
-    state TEXT NOT NULL DEFAULT 'Empty',
+    state TEXT NOT NULL DEFAULT 'Empty'
+        CHECK (state IN ('Empty', 'PreparingRebalance', 'CompletingRebalance', 'Stable')),
     generation_id INT NOT NULL DEFAULT 0,
-    protocol TEXT,
+    protocol_type TEXT,               -- e.g. 'consumer'
+    protocol TEXT,                    -- selected assignor, e.g. 'range'
     leader_id TEXT,
+    rebalance_started_at TIMESTAMPTZ, -- when the current PreparingRebalance began
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -132,7 +136,12 @@ CREATE TABLE pgkafka.consumer_group_members (
     client_host TEXT,
     session_timeout_ms INT NOT NULL DEFAULT 30000,
     rebalance_timeout_ms INT NOT NULL DEFAULT 60000,
+    protocol_type TEXT,
+    protocols JSONB NOT NULL DEFAULT '[]', -- [{"name": ..., "metadata": "<hex>"}], preference order
+    generation_id INT,                     -- generation this member last joined (NULL = pending)
     assignment BYTEA,
+    assignment_generation INT,             -- generation the assignment belongs to
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (group_id, member_id)
 );
@@ -196,6 +205,32 @@ mod tests {
     fn test_status() {
         let status = crate::status();
         assert!(status.0.is_object());
+    }
+
+    /// Regression (#120): pg_spi binds parameters; a value that is itself a
+    /// `$N` token or SQL fragment is stored literally, never re-substituted.
+    #[pg_test]
+    fn test_spi_bridge_binds_params_literally() {
+        use pg_spi::{execute_query_in_transaction, ColumnType, SpiParam};
+
+        Spi::run("CREATE TEMP TABLE spi_inj (a TEXT, b TEXT, c BOOLEAN)").unwrap();
+        let result = execute_query_in_transaction(
+            "INSERT INTO spi_inj (a, b, c) VALUES ($1, $2, $3::pg_catalog.bool) RETURNING a, b, c",
+            &[
+                SpiParam::Text(Some("||version()||".to_string())),
+                SpiParam::Text(Some("$1 ' -- $2".to_string())),
+                SpiParam::Text(Some("true".to_string())),
+            ],
+            &[ColumnType::Text, ColumnType::Text, ColumnType::Bool],
+        )
+        .expect("bound insert should succeed");
+        let row = result.first().expect("RETURNING row");
+        assert_eq!(row.get_string(0).as_deref(), Some("||version()||"));
+        assert_eq!(row.get_string(1).as_deref(), Some("$1 ' -- $2"));
+        assert_eq!(row.get_bool(2), Some(true));
+
+        let stored = Spi::get_one::<String>("SELECT b FROM spi_inj").unwrap();
+        assert_eq!(stored.as_deref(), Some("$1 ' -- $2"));
     }
 
     #[pg_test]

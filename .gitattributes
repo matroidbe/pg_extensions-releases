@@ -10,9 +10,8 @@ PUBLISH.md              export-ignore
 executed.md             export-ignore
 scripts/                export-ignore
 
-# Dev-machine config — contains local paths and tooling (mold, sccache)
+# Dev-machine config
 .vscode/                export-ignore
-.cargo/                 export-ignore
 
 # Extension-level internal files
 **/test.sh              export-ignore

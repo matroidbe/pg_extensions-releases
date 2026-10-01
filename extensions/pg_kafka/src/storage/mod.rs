@@ -6,6 +6,7 @@
 //! The SpiBridge provides a channel-based interface for tokio tasks to execute
 //! queries on the background worker's main thread where SPI is valid.
 
+pub mod groups;
 pub mod parse;
 pub mod source_insert;
 pub mod spi_bridge;

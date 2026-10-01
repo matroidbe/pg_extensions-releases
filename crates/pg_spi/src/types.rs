@@ -168,12 +168,35 @@ impl SpiRow {
 pub struct SpiResult {
     /// Result rows
     pub rows: Vec<SpiRow>,
+    /// Number of rows affected by the statement.
+    ///
+    /// This is PostgreSQL's `SPI_processed`. For a non-RETURNING
+    /// INSERT/UPDATE/DELETE it is the number of rows the statement touched —
+    /// which `rows` cannot tell you, because such a statement returns no
+    /// tuples at all. For a SELECT (or a RETURNING DML) it equals
+    /// `rows.len()`.
+    ///
+    /// Callers that need "did this UPDATE actually match anything?" — e.g.
+    /// optimistic-locking ladders that treat 0 affected rows as a stale-version
+    /// conflict — must read this rather than `rows.len()`.
+    pub rows_affected: u64,
 }
 
 impl SpiResult {
     /// Create a new empty result
     pub fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: Vec::new(),
+            rows_affected: 0,
+        }
+    }
+
+    /// Create a result carrying only an affected-row count (no returned tuples).
+    pub fn affected(rows_affected: u64) -> Self {
+        Self {
+            rows: Vec::new(),
+            rows_affected,
+        }
     }
 
     /// Get the first row
@@ -282,6 +305,7 @@ mod tests {
                     columns: vec![SpiValue::Text("second".to_string())],
                 },
             ],
+            rows_affected: 2,
         };
         assert_eq!(
             result.first().unwrap().get_string(0),
@@ -293,10 +317,27 @@ mod tests {
 
     #[test]
     fn test_spi_result_empty() {
-        let result = SpiResult { rows: vec![] };
+        let result = SpiResult {
+            rows: vec![],
+            rows_affected: 0,
+        };
         assert!(result.first().is_none());
         assert!(result.is_empty());
         assert_eq!(result.len(), 0);
+    }
+
+    /// A non-RETURNING UPDATE returns no tuples, so `rows` is empty while
+    /// `rows_affected` carries the real count. This distinction is what the
+    /// optimistic-locking ladder depends on: 0 affected == stale version.
+    #[test]
+    fn test_rows_affected_independent_of_returned_rows() {
+        let result = SpiResult::affected(3);
+        assert!(result.is_empty(), "a non-RETURNING DML returns no tuples");
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.rows_affected, 3);
+
+        assert_eq!(SpiResult::new().rows_affected, 0);
+        assert_eq!(SpiResult::default().rows_affected, 0);
     }
 
     #[test]

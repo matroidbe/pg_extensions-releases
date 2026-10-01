@@ -2,17 +2,39 @@
 //!
 //! Provides server readiness detection, graceful skipping, and SQL execution helpers.
 
+// Compiled separately into every test binary, so a helper used by only one of
+// them reads as dead code while building the others.
+#![allow(dead_code)]
+
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_postgres::NoTls;
 
-/// Kafka broker address — uses port 19092 to avoid conflicts with a dev PG
-/// running pg_kafka on the default 9092. test.sh sets pg_kafka.port = 19092
-/// in postgresql.conf to match.
 pub const KAFKA_HOST: &str = "127.0.0.1";
-pub const KAFKA_PORT: u16 = 19092;
-pub const KAFKA_ADDR: &str = "127.0.0.1:19092";
+
+/// The broker port, from `PG_KAFKA_PORT` — the same variable `test.sh`
+/// exports after choosing it and writing it into `postgresql.conf`.
+///
+/// It is resolved at RUNTIME rather than fixed at 19092 because the port is
+/// global to the machine: anything else on the host can hold it, and a test
+/// that dials a port someone else owns does not fail to connect, it connects
+/// to the WRONG SERVER. That is how a run once reported every new admin API
+/// as `UnsupportedFeature` — an older pg_kafka was answering on 19092.
+///
+/// The default keeps a bare `cargo test` working against a hand-started PG.
+pub fn kafka_port() -> u16 {
+    std::env::var("PG_KAFKA_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(19092)
+}
+
+/// `host:port` for the broker, resolved once per test binary.
+pub fn kafka_addr() -> &'static str {
+    static ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ADDR.get_or_init(|| format!("{}:{}", KAFKA_HOST, kafka_port()))
+}
 
 /// Default PostgreSQL connection parameters for pgrx-managed instance
 pub const PG_HOST: &str = "localhost";
@@ -76,10 +98,8 @@ pub fn run_sql(sql: &str) -> Result<String, String> {
                 v.to_string()
             } else if let Ok(v) = row.try_get::<_, i32>(0) {
                 v.to_string()
-            } else if let Ok(v) = row.try_get::<_, String>(0) {
-                v
             } else {
-                String::new()
+                row.try_get::<_, String>(0).unwrap_or_default()
             };
             Ok(val)
         }

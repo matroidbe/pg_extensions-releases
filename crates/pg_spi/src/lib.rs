@@ -41,5 +41,5 @@ mod execute;
 mod types;
 
 pub use bridge::{create_bridge, SpiBridge, SpiReceiver, SpiRequest};
-pub use execute::execute_spi_request;
+pub use execute::{execute_query_in_transaction, execute_spi_request};
 pub use types::{ColumnType, SpiError, SpiParam, SpiResult, SpiRow, SpiValue};

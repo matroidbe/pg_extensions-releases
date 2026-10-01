@@ -2,10 +2,22 @@
 //!
 //! This module contains the code that runs in PostgreSQL context to execute
 //! SPI queries. It must only be called from the background worker's main thread.
+//!
+//! # Parameter binding
+//!
+//! Parameters are bound as real, typed SQL arguments (`SPI_execute_with_args`),
+//! never spliced into the query text. A parameter value therefore can never be
+//! re-interpreted as SQL, regardless of its content — including values that
+//! themselves contain `$N` tokens or quote characters.
+//!
+//! Because arguments are typed, a `SpiParam::Text` is a `text` value, not an
+//! untyped literal. Where a query needs a text parameter coerced to another
+//! type (e.g. a dynamically discovered column type), cast it explicitly in the
+//! SQL: `$1::uuid`, `$2::jsonb`, `$3::my_type`.
 
 use crate::bridge::SpiRequest;
 use crate::types::{ColumnType, SpiError, SpiParam, SpiResult, SpiRow, SpiValue};
-use pgrx::bgworkers::BackgroundWorker;
+use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
 
 /// Execute a single SPI request
@@ -19,15 +31,88 @@ use pgrx::prelude::*;
 /// the background worker's main thread. Calling from any other thread will
 /// cause undefined behavior.
 pub fn execute_spi_request(request: SpiRequest) {
-    // Use BackgroundWorker::transaction to properly set up transaction context
-    // This sets the statement start timestamp, starts a transaction, pushes a snapshot,
-    // and commits when done.
-    let result = BackgroundWorker::transaction(|| {
-        execute_query(&request.query, &request.params, &request.column_types)
-    });
+    let result = run_request_in_transaction(&request);
 
     // Ignore send errors - the receiver may have been dropped
     let _ = request.response_tx.send(result);
+}
+
+/// Run one request inside its own transaction, converting a PostgreSQL ERROR
+/// into an `Err` instead of letting it escape.
+///
+/// This deliberately does NOT use `BackgroundWorker::transaction`. That helper
+/// calls `PgTryBuilder::new(body).execute()` with *no* catch handler, so a
+/// PostgreSQL ERROR re-throws straight past its `CommitTransactionCommand` and
+/// out of the worker's main function — killing the background worker. In a
+/// protocol server that is catastrophic: one ordinary, *expected* error (an RLS
+/// denial, a unique-violation, a `RAISE` inside a user command) takes down the
+/// whole server for every other connection, and the client sees a dropped TCP
+/// connection instead of a clean error response.
+///
+/// So we manage the transaction ourselves and catch. `PgTryBuilder` calls
+/// `FlushErrorState()` once the handler returns normally, which is what makes
+/// the session reusable; we just have to roll the transaction back, since the
+/// longjmp skipped the commit.
+fn run_request_in_transaction(request: &SpiRequest) -> Result<SpiResult, SpiError> {
+    use pgrx::pg_sys::PgTryBuilder;
+
+    unsafe {
+        pg_sys::SetCurrentStatementStartTimestamp();
+        pg_sys::StartTransactionCommand();
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+    }
+
+    let outcome = PgTryBuilder::new(std::panic::AssertUnwindSafe(|| {
+        execute_query(&request.query, &request.params, &request.column_types)
+    }))
+    .catch_others(|caught| Err(SpiError::QueryFailed(describe_caught(caught))))
+    .execute();
+
+    unsafe {
+        if outcome.is_ok() {
+            pg_sys::PopActiveSnapshot();
+            pg_sys::CommitTransactionCommand();
+        } else {
+            // Either a caught ERROR (whose longjmp skipped the commit) or a
+            // plain Err return. Aborting is correct and safe for both.
+            pg_sys::AbortCurrentTransaction();
+        }
+    }
+
+    outcome
+}
+
+/// Render a caught PostgreSQL error / Rust panic as a message string.
+///
+/// The message is what the HTTP layer classifies (RLS denial -> 403,
+/// unique violation -> 409, and so on), so it must preserve Postgres' own
+/// wording rather than a generic "query failed".
+fn describe_caught(caught: pgrx::pg_sys::panic::CaughtError) -> String {
+    use pgrx::pg_sys::panic::CaughtError;
+    match caught {
+        CaughtError::PostgresError(report)
+        | CaughtError::ErrorReport(report)
+        | CaughtError::RustPanic {
+            ereport: report, ..
+        } => report.message().to_string(),
+    }
+}
+
+/// Execute a query with bound parameters inside the *current* transaction.
+///
+/// This is the same executor that [`execute_spi_request`] uses, without the
+/// per-request transaction wrapper. It is intended for callers that are
+/// already inside a transaction (for example `#[pg_test]` regression tests or
+/// SQL-callable functions) and want the exact binding semantics of the bridge.
+///
+/// **IMPORTANT**: Must be called from a thread where SPI access is valid
+/// (a Postgres backend or background worker main thread).
+pub fn execute_query_in_transaction(
+    query: &str,
+    params: &[SpiParam],
+    column_types: &[ColumnType],
+) -> Result<SpiResult, SpiError> {
+    execute_query(query, params, column_types)
 }
 
 /// Execute a query using SPI
@@ -39,44 +124,37 @@ fn execute_query(
     params: &[SpiParam],
     column_types: &[ColumnType],
 ) -> Result<SpiResult, SpiError> {
-    // Determine if this is a mutating query (INSERT, UPDATE, DELETE, CREATE, DROP, ALTER)
-    let is_mutating = {
-        let upper = query.trim().to_uppercase();
-        upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
-            || upper.starts_with("CREATE")
-            || upper.starts_with("DROP")
-            || upper.starts_with("ALTER")
-    };
-
     // Use connect_mut for all queries since we might need to run mutating queries
     Spi::connect_mut(|client| {
-        // Build the query with parameters substituted
-        let query_str = if params.is_empty() {
-            query.to_string()
-        } else {
-            // IMPORTANT: Process parameters in REVERSE order (highest index first)
-            // to avoid $24 matching the start of $240, $241, etc.
-            let mut query_str = query.to_string();
-            for (i, param) in params.iter().enumerate().rev() {
-                let placeholder = format!("${}", i + 1);
-                let value_str = param_to_sql(param);
-                query_str = query_str.replace(&placeholder, &value_str);
-            }
-            query_str
-        };
+        // Bind parameters as typed SQL arguments. The query text is passed to
+        // Postgres verbatim; values never enter the SQL string.
+        let args: Vec<DatumWithOid> = params.iter().map(param_to_datum).collect();
 
-        // Use update() for mutating queries, select() for read-only
-        let table = if is_mutating {
-            client
-                .update(&query_str, None, &[])
-                .map_err(|e| SpiError::QueryFailed(e.to_string()))?
-        } else {
-            client
-                .select(&query_str, None, &[])
-                .map_err(|e| SpiError::QueryFailed(e.to_string()))?
-        };
+        // ALWAYS the mutable path. read-only SPI is only an optimisation, and
+        // guessing at it from the statement text is not just unreliable, it is
+        // unreliable in a way that produces hard errors:
+        //
+        //   * a leading `--` banner comment hid the real keyword, so generated
+        //     DDL ran read-only and every `DO $$ ... $$` failed;
+        //   * utility statements (GRANT/COMMENT/TRUNCATE/SET) are not reads;
+        //   * and even a genuine `SELECT` is not necessarily read-only — a
+        //     `SELECT schema.insert_reading(...)` calls a VOLATILE function
+        //     that writes, and read-only SPI rejects it with
+        //     "SELECT is not allowed in a non-volatile function".
+        //
+        // That last case is unknowable from the text without resolving the
+        // function, so there is no heuristic to fix. Running an ordinary read
+        // with read_only=false is harmless, so pay that and be correct.
+        let table = client
+            .update(query, None, &args)
+            .map_err(|e| SpiError::QueryFailed(e.to_string()))?;
+
+        // Capture the affected-row count BEFORE consuming the table by
+        // iteration. pgrx populates `SpiTupleTable::len()` from
+        // `SPI_processed` when `SPI_tuptable` is NULL (a non-RETURNING DML,
+        // which yields no tuples to iterate) and from `numvals` otherwise, so
+        // this is the correct count for both mutations and reads.
+        let rows_affected = table.len() as u64;
 
         let mut rows = Vec::new();
 
@@ -93,27 +171,47 @@ fn execute_query(
             rows.push(SpiRow { columns });
         }
 
-        Ok(SpiResult { rows })
+        Ok(SpiResult {
+            rows,
+            rows_affected,
+        })
     })
 }
 
-/// Convert an SpiParam to its SQL string representation
-fn param_to_sql(param: &SpiParam) -> String {
+/// The PostgreSQL type OID a parameter is bound with.
+///
+/// Kept separate from [`param_to_datum`] so the type mapping is testable
+/// without a running Postgres.
+pub(crate) fn param_type_oid(param: &SpiParam) -> pg_sys::Oid {
     match param {
-        SpiParam::Text(Some(s)) => format!("'{}'", s.replace('\'', "''")),
-        SpiParam::Text(None) => "NULL".to_string(),
-        SpiParam::Int4(Some(i)) => i.to_string(),
-        SpiParam::Int4(None) => "NULL".to_string(),
-        SpiParam::Int8(Some(i)) => i.to_string(),
-        SpiParam::Int8(None) => "NULL".to_string(),
-        SpiParam::Float8(Some(f)) => f.to_string(),
-        SpiParam::Float8(None) => "NULL".to_string(),
-        SpiParam::Bool(Some(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        SpiParam::Bool(None) => "NULL".to_string(),
-        SpiParam::Bytea(Some(b)) => format!("'\\x{}'::bytea", hex::encode(b)),
-        SpiParam::Bytea(None) => "NULL".to_string(),
-        SpiParam::Json(Some(j)) => format!("'{}'::jsonb", j.to_string().replace('\'', "''")),
-        SpiParam::Json(None) => "NULL".to_string(),
+        SpiParam::Text(_) => pg_sys::TEXTOID,
+        SpiParam::Int4(_) => pg_sys::INT4OID,
+        SpiParam::Int8(_) => pg_sys::INT8OID,
+        SpiParam::Float8(_) => pg_sys::FLOAT8OID,
+        SpiParam::Bool(_) => pg_sys::BOOLOID,
+        SpiParam::Bytea(_) => pg_sys::BYTEAOID,
+        SpiParam::Json(_) => pg_sys::JSONBOID,
+    }
+}
+
+/// Convert an `SpiParam` into a typed SPI argument (`Datum` + type OID).
+///
+/// `None` variants become a typed SQL NULL.
+fn param_to_datum(param: &SpiParam) -> DatumWithOid<'static> {
+    let oid = param_type_oid(param);
+    // SAFETY: each arm pairs a value with the OID of its own Rust->Postgres
+    // type mapping (the same one `IntoDatum::type_oid` would report), so the
+    // datum and the declared type always agree.
+    unsafe {
+        match param {
+            SpiParam::Text(v) => DatumWithOid::new(v.clone(), oid),
+            SpiParam::Int4(v) => DatumWithOid::new(*v, oid),
+            SpiParam::Int8(v) => DatumWithOid::new(*v, oid),
+            SpiParam::Float8(v) => DatumWithOid::new(*v, oid),
+            SpiParam::Bool(v) => DatumWithOid::new(*v, oid),
+            SpiParam::Bytea(v) => DatumWithOid::new(v.clone(), oid),
+            SpiParam::Json(v) => DatumWithOid::new(v.clone().map(pgrx::JsonB), oid),
+        }
     }
 }
 
@@ -167,75 +265,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_param_to_sql_text() {
+    fn test_param_type_oids() {
         assert_eq!(
-            param_to_sql(&SpiParam::Text(Some("hello".to_string()))),
-            "'hello'"
+            param_type_oid(&SpiParam::Text(Some("x".into()))),
+            pg_sys::TEXTOID
         );
-        assert_eq!(param_to_sql(&SpiParam::Text(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_text_escaping() {
+        assert_eq!(param_type_oid(&SpiParam::Text(None)), pg_sys::TEXTOID);
+        assert_eq!(param_type_oid(&SpiParam::Int4(Some(1))), pg_sys::INT4OID);
+        assert_eq!(param_type_oid(&SpiParam::Int8(None)), pg_sys::INT8OID);
         assert_eq!(
-            param_to_sql(&SpiParam::Text(Some("it's".to_string()))),
-            "'it''s'"
+            param_type_oid(&SpiParam::Float8(Some(1.0))),
+            pg_sys::FLOAT8OID
         );
-    }
-
-    #[test]
-    fn test_param_to_sql_int4() {
-        assert_eq!(param_to_sql(&SpiParam::Int4(Some(42))), "42");
-        assert_eq!(param_to_sql(&SpiParam::Int4(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_int8() {
+        assert_eq!(param_type_oid(&SpiParam::Bool(Some(true))), pg_sys::BOOLOID);
         assert_eq!(
-            param_to_sql(&SpiParam::Int8(Some(12345678901234))),
-            "12345678901234"
+            param_type_oid(&SpiParam::Bytea(Some(vec![1]))),
+            pg_sys::BYTEAOID
         );
-        assert_eq!(param_to_sql(&SpiParam::Int8(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_float8() {
-        assert_eq!(param_to_sql(&SpiParam::Float8(Some(3.14))), "3.14");
-        assert_eq!(param_to_sql(&SpiParam::Float8(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_bool() {
-        assert_eq!(param_to_sql(&SpiParam::Bool(Some(true))), "TRUE");
-        assert_eq!(param_to_sql(&SpiParam::Bool(Some(false))), "FALSE");
-        assert_eq!(param_to_sql(&SpiParam::Bool(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_bytea() {
         assert_eq!(
-            param_to_sql(&SpiParam::Bytea(Some(vec![0xde, 0xad, 0xbe, 0xef]))),
-            "'\\xdeadbeef'::bytea"
+            param_type_oid(&SpiParam::Json(Some(serde_json::json!({})))),
+            pg_sys::JSONBOID
         );
-        assert_eq!(param_to_sql(&SpiParam::Bytea(None)), "NULL");
     }
 
+    /// Regression for the textual `$N` substitution vulnerability: there must
+    /// be no code path that rewrites the query text based on parameter values.
+    /// The executor hands the query to Postgres verbatim, so a parameter equal
+    /// to `$1` (or containing `'`) is just data. This test pins the contract
+    /// at the type level: params are converted to datums, never to SQL text.
     #[test]
-    fn test_param_to_sql_json() {
-        let json = serde_json::json!({"key": "value"});
-        assert_eq!(
-            param_to_sql(&SpiParam::Json(Some(json))),
-            "'{\"key\":\"value\"}'::jsonb"
-        );
-        assert_eq!(param_to_sql(&SpiParam::Json(None)), "NULL");
-    }
-
-    #[test]
-    fn test_param_to_sql_json_escaping() {
-        let json = serde_json::json!({"key": "it's a value"});
-        // JSON serialization escapes the apostrophe differently, then we escape for SQL
-        let result = param_to_sql(&SpiParam::Json(Some(json)));
-        assert!(result.starts_with("'"));
-        assert!(result.ends_with("'::jsonb"));
+    fn test_no_sql_text_rendering_of_params() {
+        // If someone re-introduces a `param_to_sql`-style renderer this test
+        // will not compile against it; the only conversion is to a typed OID.
+        let hostile = SpiParam::Text(Some("$1 ' OR 1=1 --".to_string()));
+        assert_eq!(param_type_oid(&hostile), pg_sys::TEXTOID);
     }
 }

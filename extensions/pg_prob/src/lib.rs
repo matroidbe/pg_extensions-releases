@@ -11,6 +11,7 @@
 
 mod correlation;
 mod distribution;
+mod eidos_catalog;
 mod fitting;
 mod operators;
 mod sampling;

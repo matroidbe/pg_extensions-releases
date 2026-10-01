@@ -1,0 +1,29 @@
+# PostgreSQL configuration pg_swarm needs, read by pgbrew.
+#
+# `pgx install` reports this; `pgx install --configure` writes it to a
+# conf.d drop-in. It also travels inside a bottle, so a prebuilt install
+# configures the server too.
+
+[postgresql]
+# pg_swarm registers a background worker in _PG_init (the node manager and scheduler),
+# so its library must be loaded at server start. Without this the extension
+# installs and loads, but the worker never runs and it silently does nothing.
+#
+# This requirement is version-independent: a statically registered worker
+# needs preloading on every PostgreSQL version.
+shared_preload_libraries = true
+
+# No [postgresql.settings] block on purpose. Every GUC below already has a
+# working default, and writing defaults into postgresql.conf only creates
+# drift when the extension later changes one. Add a settings block here for
+# values that genuinely must differ for a deployment.
+#
+# Available settings:
+#   pg_swarm.enabled
+#   pg_swarm.workers
+#   pg_swarm.node_name
+#   pg_swarm.heartbeat_interval
+#   pg_swarm.node_timeout
+#   pg_swarm.task_timeout
+#   pg_swarm.poll_interval
+#   pg_swarm.max_retries

@@ -27,7 +27,6 @@ Self-contained tools — no dependencies on other pg_extensions, useful in any c
 | Extension | Description |
 |-----------|-------------|
 | [pg_ml](extensions/pg_ml/) | Machine learning with PyCaret — async training via background worker |
-| [pg_augur](extensions/pg_augur/) | Pure-Rust AutoML — model training and forecasting without Python |
 | [pg_feature](extensions/pg_feature/) | Automated feature engineering using Deep Feature Synthesis |
 | [pg_prob](extensions/pg_prob/) | Probabilistic data types with Monte Carlo simulation |
 | [pg_ortools](extensions/pg_ortools/) | Constraint optimization using HiGHS MIP solver |
@@ -81,6 +80,12 @@ cd pg_extensions
 cd extensions/pg_kafka
 cargo pgrx install --release
 ```
+
+The committed `.cargo/config.toml` holds only settings that are true for every
+clone. Machine-specific ones — mold, sccache, a pinned libclang — belong in
+your own `~/.cargo/config.toml`; `.cargo/config.toml.example`
+has them ready to copy, and explains why cargo cannot make them conditional on
+the host.
 
 ```sql
 CREATE EXTENSION pg_kafka;

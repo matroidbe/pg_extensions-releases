@@ -254,11 +254,11 @@ mod tests {
         set_search_path();
         let result =
             Spi::get_one::<bool>("SELECT '100.00'::ledgeramount > '50.00'::ledgeramount").unwrap();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let result =
             Spi::get_one::<bool>("SELECT '50.00'::ledgeramount = '50.0000'::ledgeramount").unwrap();
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[pg_test]

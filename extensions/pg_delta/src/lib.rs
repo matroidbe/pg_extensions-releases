@@ -12,6 +12,7 @@ use pgrx::prelude::*;
 use std::ffi::CString;
 use std::time::Duration;
 
+mod index;
 mod storage;
 mod streams;
 
@@ -1062,6 +1063,67 @@ fn list_exports() -> pgrx::JsonB {
         Err(e) => {
             pgrx::error!("Failed to list exports: {}", e);
         }
+    }
+}
+
+// =============================================================================
+// SQL Functions - Index Mode (query without copying)
+// =============================================================================
+
+/// Index a Delta table's transaction log into the `delta.indexed_tables` +
+/// `delta.files` catalog so selective queries can prune files without copying
+/// rows into Postgres. Returns the number of files catalogued.
+#[pg_extern]
+fn index_table(
+    name: &str,
+    location: &str,
+    storage_options: default!(Option<pgrx::JsonB>, "NULL"),
+) -> i64 {
+    index::index_table(name, location, storage_options)
+}
+
+/// Re-read the Delta log for an indexed table and replace its file catalog at
+/// the current version. Returns the number of files catalogued.
+#[pg_extern]
+fn refresh_index(name: &str) -> i64 {
+    index::refresh_index(name)
+}
+
+/// Drop an index registration (cascades to `delta.files`).
+#[pg_extern]
+fn drop_index(name: &str) -> bool {
+    index::drop_index(name)
+}
+
+/// List indexed tables with file counts.
+#[pg_extern]
+fn list_indexes() -> pgrx::JsonB {
+    index::list_indexes()
+}
+
+/// Detailed info for one indexed table (version, files, bytes, est. rows).
+#[pg_extern]
+fn index_info(name: &str) -> pgrx::JsonB {
+    index::index_info(name)
+}
+
+/// Query an indexed Delta table without copying. Prunes files via the catalog,
+/// reads only surviving parquet, applies the filter, and returns one JSONB
+/// object per row.
+///
+/// `filter` grammar: `{"col": v}` (equality) or
+/// `{"col": {"gte": .., "lt": .., "gt": .., "lte": .., "eq": ..}}` (range).
+#[pg_extern]
+fn fetch(
+    table: &str,
+    filter: default!(pgrx::JsonB, "'{}'"),
+    columns: default!(Option<Vec<String>>, "NULL"),
+    max_rows: default!(i64, "1000000"),
+) -> pgrx::iter::SetOfIterator<'static, pgrx::JsonB> {
+    let limit = if max_rows < 0 { 0 } else { max_rows as usize };
+    match index::fetch_rows(table, &filter.0, columns.as_deref(), limit) {
+        Ok(rows) => pgrx::iter::SetOfIterator::new(rows.into_iter().map(pgrx::JsonB)),
+        Err(e) => pgrx::error!("delta.fetch failed: {}", e),
     }
 }
 

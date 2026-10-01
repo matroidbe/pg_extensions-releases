@@ -8,7 +8,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use pg_spi::SpiBridge;
+use pg_spi::{SpiBridge, SpiParam};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -132,13 +132,13 @@ async fn handle_service_rpc(
 async fn trigger_sync(bridge: &SpiBridge, repo_id: &str, repo_path: &Path) {
     let branch = crate::git::current_branch(repo_path).unwrap_or_else(|_| "main".to_string());
 
+    // All client-derived values (repo id, commit metadata, paths, branch
+    // names, file contents) are passed as bound parameters — never spliced
+    // into the SQL text.
     let last_hash = bridge
         .query_one_string(
-            &format!(
-                "SELECT last_synced_hash FROM pggit.sync_state WHERE repo_id = '{}'",
-                repo_id.replace('\'', "''")
-            ),
-            vec![],
+            "SELECT last_synced_hash FROM pggit.sync_state WHERE repo_id = $1",
+            vec![text(repo_id)],
         )
         .await
         .ok()
@@ -155,23 +155,22 @@ async fn trigger_sync(bridge: &SpiBridge, repo_id: &str, repo_path: &Path) {
 
     for commit in &new_commits {
         // Insert commit
-        let parent = match &commit.parent_hash {
-            Some(h) => format!("'{}'", h),
-            None => "NULL".to_string(),
-        };
-        let sql = format!(
-            "INSERT INTO pggit.commits (repo_id, hash, parent_hash, message, author, author_email, committed_at)
-             VALUES ('{}', '{}', {}, '{}', '{}', '{}', to_timestamp({}))
-             ON CONFLICT DO NOTHING",
-            repo_id.replace('\'', "''"),
-            commit.hash,
-            parent,
-            commit.message.replace('\'', "''"),
-            commit.author.replace('\'', "''"),
-            commit.author_email.replace('\'', "''"),
-            commit.committed_at,
-        );
-        let _ = bridge.execute(&sql, vec![]).await;
+        let _ = bridge
+            .execute(
+                "INSERT INTO pggit.commits (repo_id, hash, parent_hash, message, author, author_email, committed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+                 ON CONFLICT DO NOTHING",
+                vec![
+                    text(repo_id),
+                    text(&commit.hash),
+                    SpiParam::Text(commit.parent_hash.clone()),
+                    text(&commit.message),
+                    text(&commit.author),
+                    text(&commit.author_email),
+                    SpiParam::Int8(Some(commit.committed_at)),
+                ],
+            )
+            .await;
 
         // Sync file_history and files for this commit
         let diff = crate::git::diff_commit_parent(repo_path, &commit.hash).unwrap_or_default();
@@ -190,26 +189,24 @@ async fn trigger_sync(bridge: &SpiBridge, repo_id: &str, repo_path: &Path) {
                 .get(entry.path.as_str())
                 .copied()
                 .unwrap_or((None, None));
-            let la_s = la
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string());
-            let lr_s = lr
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string());
 
-            let fh_sql = format!(
-                "INSERT INTO pggit.file_history (repo_id, path, commit_hash, change_type, lines_added, lines_removed, committed_at, author)
-                 VALUES ('{}', '{}', '{}', '{}', {}, {}, to_timestamp({}), '{}')
-                 ON CONFLICT DO NOTHING",
-                repo_id.replace('\'', "''"),
-                entry.path.replace('\'', "''"),
-                commit.hash,
-                entry.change_type,
-                la_s, lr_s,
-                commit.committed_at,
-                commit.author.replace('\'', "''"),
-            );
-            let _ = bridge.execute(&fh_sql, vec![]).await;
+            let _ = bridge
+                .execute(
+                    "INSERT INTO pggit.file_history (repo_id, path, commit_hash, change_type, lines_added, lines_removed, committed_at, author)
+                     VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), $8)
+                     ON CONFLICT DO NOTHING",
+                    vec![
+                        text(repo_id),
+                        text(&entry.path),
+                        text(&commit.hash),
+                        text(&entry.change_type),
+                        SpiParam::Int4(la),
+                        SpiParam::Int4(lr),
+                        SpiParam::Int8(Some(commit.committed_at)),
+                        text(&commit.author),
+                    ],
+                )
+                .await;
 
             // Update files table for adds/modifies
             if entry.change_type == "add" || entry.change_type == "modify" {
@@ -221,72 +218,67 @@ async fn trigger_sync(bridge: &SpiBridge, repo_id: &str, repo_path: &Path) {
                         .flatten()
                         .unwrap_or_default();
 
-                    let title_sql = title
-                        .map(|t| format!("'{}'", t.replace('\'', "''")))
-                        .unwrap_or_else(|| "NULL".to_string());
-                    let lang_sql = meta
-                        .language
-                        .as_ref()
-                        .map(|l| format!("'{}'", l))
-                        .unwrap_or_else(|| "NULL".to_string());
-                    let lc_sql = meta
-                        .line_count
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "NULL".to_string());
-
-                    let upsert_sql = format!(
-                        "INSERT INTO pggit.files (repo_id, path, branch, current_hash, mime_type, size_bytes, encoding, language, line_count, title, updated_at, updated_by, created_at)
-                         VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', {}, {}, {}, to_timestamp({}), '{}', to_timestamp({}))
-                         ON CONFLICT (repo_id, branch, path) DO UPDATE SET
-                           current_hash = EXCLUDED.current_hash, mime_type = EXCLUDED.mime_type,
-                           size_bytes = EXCLUDED.size_bytes, encoding = EXCLUDED.encoding,
-                           language = EXCLUDED.language, line_count = EXCLUDED.line_count,
-                           title = EXCLUDED.title, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by",
-                        repo_id.replace('\'', "''"),
-                        entry.path.replace('\'', "''"),
-                        branch.replace('\'', "''"),
-                        blob_hash,
-                        meta.mime_type, meta.size_bytes, meta.encoding,
-                        lang_sql, lc_sql, title_sql,
-                        commit.committed_at,
-                        commit.author.replace('\'', "''"),
-                        commit.committed_at,
-                    );
-                    let _ = bridge.execute(&upsert_sql, vec![]).await;
+                    let _ = bridge
+                        .execute(
+                            "INSERT INTO pggit.files (repo_id, path, branch, current_hash, mime_type, size_bytes, encoding, language, line_count, title, updated_at, updated_by, created_at)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11), $12, to_timestamp($11))
+                             ON CONFLICT (repo_id, branch, path) DO UPDATE SET
+                               current_hash = EXCLUDED.current_hash, mime_type = EXCLUDED.mime_type,
+                               size_bytes = EXCLUDED.size_bytes, encoding = EXCLUDED.encoding,
+                               language = EXCLUDED.language, line_count = EXCLUDED.line_count,
+                               title = EXCLUDED.title, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by",
+                            vec![
+                                text(repo_id),
+                                text(&entry.path),
+                                text(&branch),
+                                text(&blob_hash),
+                                text(&meta.mime_type),
+                                SpiParam::Int8(Some(meta.size_bytes)),
+                                text(&meta.encoding),
+                                SpiParam::Text(meta.language.clone()),
+                                SpiParam::Int4(meta.line_count),
+                                SpiParam::Text(title),
+                                SpiParam::Int8(Some(commit.committed_at)),
+                                text(&commit.author),
+                            ],
+                        )
+                        .await;
                 }
             } else if entry.change_type == "delete" {
-                let del_sql = format!(
-                    "DELETE FROM pggit.files WHERE repo_id = '{}' AND path = '{}' AND branch = '{}'",
-                    repo_id.replace('\'', "''"),
-                    entry.path.replace('\'', "''"),
-                    branch.replace('\'', "''"),
-                );
-                let _ = bridge.execute(&del_sql, vec![]).await;
+                let _ = bridge
+                    .execute(
+                        "DELETE FROM pggit.files WHERE repo_id = $1 AND path = $2 AND branch = $3",
+                        vec![text(repo_id), text(&entry.path), text(&branch)],
+                    )
+                    .await;
             }
         }
     }
 
     if let Some(last) = new_commits.last() {
-        let sql = format!(
-            "UPDATE pggit.sync_state SET last_synced_hash = '{}', last_synced_at = now() WHERE repo_id = '{}'",
-            last.hash,
-            repo_id.replace('\'', "''"),
-        );
-        let _ = bridge.execute(&sql, vec![]).await;
+        let _ = bridge
+            .execute(
+                "UPDATE pggit.sync_state SET last_synced_hash = $1, last_synced_at = now() WHERE repo_id = $2",
+                vec![text(&last.hash), text(repo_id)],
+            )
+            .await;
     }
+}
+
+/// Bound text parameter helper.
+fn text(value: &str) -> SpiParam {
+    SpiParam::Text(Some(value.to_string()))
 }
 
 async fn lookup_repo_path(
     bridge: &SpiBridge,
     repo_id: &str,
 ) -> Result<Option<PathBuf>, PgGitError> {
-    let sql = format!(
-        "SELECT path FROM pggit.repos WHERE id = '{}'",
-        repo_id.replace('\'', "''")
-    );
-
     let result = bridge
-        .query_one_string(&sql, vec![])
+        .query_one_string(
+            "SELECT path FROM pggit.repos WHERE id = $1",
+            vec![text(repo_id)],
+        )
         .await
         .map_err(|e| PgGitError::Spi(e.to_string()))?;
 

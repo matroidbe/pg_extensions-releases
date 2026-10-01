@@ -134,10 +134,8 @@ pub fn run_sql(sql: &str) -> Result<String, String> {
                 v.to_string()
             } else if let Ok(v) = row.try_get::<_, bool>(0) {
                 v.to_string()
-            } else if let Ok(v) = row.try_get::<_, String>(0) {
-                v
             } else {
-                String::new()
+                row.try_get::<_, String>(0).unwrap_or_default()
             };
             Ok(val)
         }

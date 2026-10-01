@@ -25,6 +25,10 @@ pub struct ColumnInfo {
     pub data_type: String,
     pub is_nullable: bool,
     pub column_default: Option<String>,
+    /// Schema of the column's underlying type (e.g. `pg_catalog`)
+    pub udt_schema: String,
+    /// Name of the column's underlying type (e.g. `int4`, `timestamptz`, `_text`)
+    pub udt_name: String,
 }
 
 /// Handles inserting messages into typed topic backing tables
@@ -47,7 +51,8 @@ impl MqttSourceInserter {
         let result = self
             .bridge
             .query(
-                "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text
+                "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text,
+                        udt_schema::text, udt_name::text
                  FROM information_schema.columns
                  WHERE table_schema = $1 AND table_name = $2
                  ORDER BY ordinal_position",
@@ -56,6 +61,8 @@ impl MqttSourceInserter {
                     SpiParam::Text(Some(table.to_string())),
                 ],
                 vec![
+                    ColumnType::Text,
+                    ColumnType::Text,
                     ColumnType::Text,
                     ColumnType::Text,
                     ColumnType::Text,
@@ -72,6 +79,8 @@ impl MqttSourceInserter {
                 data_type: row.get_string(1).unwrap_or_default(),
                 is_nullable: row.get_string(2).map(|s| s == "YES").unwrap_or(true),
                 column_default: row.get_string(3),
+                udt_schema: row.get_string(4).unwrap_or_default(),
+                udt_name: row.get_string(5).unwrap_or_default(),
             })
             .collect();
 
@@ -111,7 +120,7 @@ impl MqttSourceInserter {
 
             if let Some(val) = json_obj.get(&col.name) {
                 insert_columns.push(col.name.clone());
-                insert_values.push(format!("${}", param_idx));
+                insert_values.push(typed_placeholder(param_idx, Some(col)));
                 params.push(json_value_to_spi_param(val, &col.data_type));
                 param_idx += 1;
             } else if !col.is_nullable && col.column_default.is_none() {
@@ -167,6 +176,38 @@ fn parse_table_name(table_name: &str) -> (&str, &str) {
         (&table_name[..dot_pos], &table_name[dot_pos + 1..])
     } else {
         ("public", table_name)
+    }
+}
+
+/// Quote a SQL identifier (double quotes, embedded quotes doubled).
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build a `$N::<column type>` placeholder.
+///
+/// pg_spi binds parameters as *typed* SQL arguments (a `SpiParam::Text` is a
+/// `text` value, not an untyped literal), so a text parameter would not be
+/// assignment-coerced into a `uuid`, `timestamptz`, `numeric`, `boolean` or
+/// `jsonb` column. Casting the placeholder to the column's declared type
+/// restores the literal-style coercion while keeping the value bound (the
+/// value never enters the SQL text).
+fn typed_placeholder(idx: usize, col: Option<&ColumnInfo>) -> String {
+    match col {
+        Some(c) if !c.udt_name.is_empty() => {
+            let schema = if c.udt_schema.is_empty() {
+                "pg_catalog"
+            } else {
+                c.udt_schema.as_str()
+            };
+            format!(
+                "${}::{}.{}",
+                idx,
+                quote_ident(schema),
+                quote_ident(&c.udt_name)
+            )
+        }
+        _ => format!("${}", idx),
     }
 }
 
@@ -234,12 +275,13 @@ mod tests {
 
     #[test]
     fn test_json_value_to_spi_param_number_numeric() {
-        let value = json!(3.14);
+        // Not 3.14 — clippy::approx_constant reads that as a botched PI.
+        let value = json!(2.75);
         let param = json_value_to_spi_param(&value, "numeric");
         let SpiParam::Text(Some(s)) = param else {
             panic!("expected Text");
         };
-        assert!(s.starts_with("3.14"));
+        assert!(s.starts_with("2.75"));
     }
 
     #[test]
@@ -267,6 +309,35 @@ mod tests {
             panic!("expected Text");
         };
         assert!(s.contains("nested"));
+    }
+
+    fn col(name: &str, udt_schema: &str, udt_name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: String::new(),
+            is_nullable: true,
+            column_default: None,
+            udt_schema: udt_schema.to_string(),
+            udt_name: udt_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_typed_placeholder_casts_to_column_type() {
+        assert_eq!(
+            typed_placeholder(3, Some(&col("recorded_at", "pg_catalog", "timestamptz"))),
+            "$3::\"pg_catalog\".\"timestamptz\""
+        );
+        assert_eq!(
+            typed_placeholder(2, Some(&col("active", "pg_catalog", "bool"))),
+            "$2::\"pg_catalog\".\"bool\""
+        );
+    }
+
+    #[test]
+    fn test_typed_placeholder_without_type_info() {
+        assert_eq!(typed_placeholder(4, None), "$4");
+        assert_eq!(typed_placeholder(5, Some(&col("x", "", ""))), "$5");
     }
 
     #[test]

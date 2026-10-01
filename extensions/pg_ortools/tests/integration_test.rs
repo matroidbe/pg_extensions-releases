@@ -10,6 +10,11 @@
 //!
 //! Run with: cargo test --tests -- --test-threads=1
 
+// The scheduling fixtures index cost/request matrices by the model's own
+// decision-variable indices — `n * 21 + d * 3 + s` spells that out — so the
+// range loops are the readable form here.
+#![allow(clippy::needless_range_loop)]
+
 mod common;
 
 use common::*;
@@ -241,6 +246,391 @@ fn test_async_solve_via_worker() {
 
     cleanup_jobs("it_async");
     cleanup_problem("it_async");
+}
+
+/// Async CP-SAT scheduling solve through the background worker (`solve_cp`).
+/// Requires the extension to be installed with `--features cpsat` (test.sh does).
+/// Skips gracefully if the CP surface is absent (extension built without cpsat).
+#[test]
+fn test_async_solve_cp_via_worker() {
+    skip_if_not_running!();
+
+    if !cpsat_available() {
+        eprintln!("skipping: pgortools.solve_cp not present (built without --features cpsat)");
+        return;
+    }
+
+    cleanup_problem("it_cp_async");
+    cleanup_jobs("it_cp_async");
+
+    // A grill→plate ticket with a forced 5-minute wait; minimise the wait.
+    execute("SELECT pgortools.create_problem('it_cp_async')").unwrap();
+    execute("SELECT pgortools.add_interval_var('it_cp_async', 'g', 2, 0, 30)").unwrap();
+    execute("SELECT pgortools.add_interval_var('it_cp_async', 'p', 2, 0, 30)").unwrap();
+    execute("SELECT pgortools.add_precedence('it_cp_async', 'g', 'p', 5)").unwrap();
+    execute("SELECT pgortools.minimize_wait('it_cp_async', 'p', 'g', 1)").unwrap();
+
+    // Submit async CP solve — returns job_id
+    let job_id_str = query_one("SELECT pgortools.solve_cp('it_cp_async')")
+        .unwrap()
+        .unwrap();
+    let job_id: i64 = job_id_str.parse().unwrap();
+    assert!(job_id > 0, "job_id should be > 0");
+
+    // Poll for completion
+    let status_sql = format!("SELECT state FROM pgortools.solve_status({})", job_id);
+    wait_for("async cp solve", &status_sql, "completed", SOLVE_TIMEOUT)
+        .expect("async cp solve should complete");
+
+    // The stored solution is the full CP result document.
+    let solution = query_one("SELECT pgortools.get_solution('it_cp_async')::text")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&solution).unwrap();
+
+    assert_eq!(json["status"].as_str(), Some("OPTIMAL"), "sol: {json}");
+    assert_eq!(json["objective"].as_i64(), Some(5), "gap floor optimum");
+    // Interval bounds are present and respect the precedence gap.
+    let g_end = json["intervals"]["g"]["end"].as_i64().unwrap();
+    let p_start = json["intervals"]["p"]["start"].as_i64().unwrap();
+    assert!(p_start - g_end >= 5, "precedence gap not respected: {json}");
+
+    cleanup_jobs("it_cp_async");
+    cleanup_problem("it_cp_async");
+}
+
+/// True if the extension exposes the CP-SAT surface (built with `--features cpsat`).
+fn cpsat_available() -> bool {
+    query_one(
+        "SELECT count(*)::text FROM pg_proc p \
+         JOIN pg_namespace n ON p.pronamespace = n.oid \
+         WHERE n.nspname = 'pgortools' AND p.proname = 'solve_cp'",
+    )
+    .ok()
+    .flatten()
+    .map(|c| c != "0")
+    .unwrap_or(false)
+}
+
+/// Synchronous CP solve over a resource (`add_resource` + `add_demand`) — covers the
+/// cumulative / no-overlap SQL path and that `solve_cp_sync` stores its result.
+#[test]
+fn test_cp_sync_scheduling_with_resource() {
+    skip_if_not_running!();
+    if !cpsat_available() {
+        eprintln!("skipping: cpsat surface absent (built without --features cpsat)");
+        return;
+    }
+
+    cleanup_problem("it_cp_sync");
+
+    execute("SELECT pgortools.create_problem('it_cp_sync')").unwrap();
+    execute("SELECT pgortools.add_interval_var('it_cp_sync', 't1_grill', 8, 0, 60)").unwrap();
+    execute("SELECT pgortools.add_interval_var('it_cp_sync', 't3_grill', 10, 0, 60)").unwrap();
+    // one grill (unit-capacity resource) ⇒ the two ops may not overlap
+    execute("SELECT pgortools.add_resource('it_cp_sync', 'grill', 1)").unwrap();
+    execute("SELECT pgortools.add_demand('it_cp_sync', 'grill', 't1_grill', 1)").unwrap();
+    execute("SELECT pgortools.add_demand('it_cp_sync', 'grill', 't3_grill', 1)").unwrap();
+    execute("SELECT pgortools.add_precedence('it_cp_sync', 't1_grill', 't3_grill', 0)").unwrap();
+
+    let solution = query_one("SELECT pgortools.solve_cp_sync('it_cp_sync')::text")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&solution).unwrap();
+
+    assert_eq!(json["status"].as_str(), Some("FEASIBLE"), "sol: {json}");
+    let t1_end = json["intervals"]["t1_grill"]["end"].as_i64().unwrap();
+    let t3_start = json["intervals"]["t3_grill"]["start"].as_i64().unwrap();
+    assert!(
+        t1_end <= t3_start,
+        "grill ops overlap / FIFO broken: {json}"
+    );
+
+    // solve_cp_sync stores the result, so get_solution returns it.
+    let stored = query_one("SELECT pgortools.get_solution('it_cp_sync')::text")
+        .unwrap()
+        .unwrap();
+    assert!(stored.contains("intervals"), "stored solution: {stored}");
+
+    cleanup_problem("it_cp_sync");
+}
+
+/// A unit-capacity resource makes an over-packed horizon infeasible — proves the
+/// capacity constraint is enforced through the full SQL path.
+#[test]
+fn test_cp_sync_capacity_infeasible() {
+    skip_if_not_running!();
+    if !cpsat_available() {
+        eprintln!("skipping: cpsat surface absent (built without --features cpsat)");
+        return;
+    }
+
+    cleanup_problem("it_cp_inf");
+
+    execute("SELECT pgortools.create_problem('it_cp_inf')").unwrap();
+    // three dur-4 ops cannot be sequenced disjointly within horizon 9 (3×4=12>9)
+    for op in ["a", "b", "c"] {
+        execute(&format!(
+            "SELECT pgortools.add_interval_var('it_cp_inf', '{op}', 4, 0, 9)"
+        ))
+        .unwrap();
+        execute(&format!(
+            "SELECT pgortools.add_demand('it_cp_inf', 'station', '{op}', 1)"
+        ))
+        .unwrap();
+    }
+    execute("SELECT pgortools.add_resource('it_cp_inf', 'station', 1)").unwrap();
+
+    let solution = query_one("SELECT pgortools.solve_cp_sync('it_cp_inf')::text")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&solution).unwrap();
+    assert_eq!(json["status"].as_str(), Some("INFEASIBLE"), "sol: {json}");
+
+    cleanup_problem("it_cp_inf");
+}
+
+/// A root-infeasible model **with an objective** must return `INFEASIBLE`, not
+/// raise. The objective variable is created after the constraints are posted, so
+/// a too-tight horizon used to crash the solve with Pumpkin's "Variables cannot
+/// be created in an inconsistent state" — the exact error a nested `dispatch_cpsat`
+/// solve hit on a tight derived horizon. This is the end-to-end regression for
+/// that engine robustness fix.
+#[test]
+fn test_cp_sync_infeasible_with_objective_does_not_error() {
+    skip_if_not_running!();
+    if !cpsat_available() {
+        eprintln!("skipping: cpsat surface absent (built without --features cpsat)");
+        return;
+    }
+
+    cleanup_problem("it_cp_inf_obj");
+
+    execute("SELECT pgortools.create_problem('it_cp_inf_obj')").unwrap();
+    // three dur-4 ops on one unit-capacity station, horizon 9 (3×4=12>9): the
+    // individual start domains are valid ([0,5]) but the resource is infeasible.
+    for op in ["a", "b", "c"] {
+        execute(&format!(
+            "SELECT pgortools.add_interval_var('it_cp_inf_obj', '{op}', 4, 0, 9)"
+        ))
+        .unwrap();
+        execute(&format!(
+            "SELECT pgortools.add_demand('it_cp_inf_obj', 'station', '{op}', 1)"
+        ))
+        .unwrap();
+    }
+    execute("SELECT pgortools.add_resource('it_cp_inf_obj', 'station', 1)").unwrap();
+    execute("SELECT pgortools.add_precedence('it_cp_inf_obj', 'a', 'b', 0)").unwrap();
+    // an objective forces the after-constraints objective-var creation
+    execute("SELECT pgortools.minimize_wait('it_cp_inf_obj', 'b', 'a', 1)").unwrap();
+
+    // Must return a JSONB result (INFEASIBLE), not raise an error.
+    let solution = query_one("SELECT pgortools.solve_cp_sync('it_cp_inf_obj')::text")
+        .expect("solve_cp_sync must not raise on a root-infeasible model with an objective")
+        .expect("solve_cp_sync should return a row");
+    let json: serde_json::Value = serde_json::from_str(&solution).unwrap();
+    assert_eq!(json["status"].as_str(), Some("INFEASIBLE"), "sol: {json}");
+
+    cleanup_problem("it_cp_inf_obj");
+}
+
+/// Build a deliberately hard CP scheduling instance via SQL: `n` grill→plate
+/// tickets sharing one grill and one pass, each minimising wait. Proving
+/// optimality means searching the orderings — intractable for `n` in the twenties
+/// — so a bounded/cancellable solve is the *only* way this returns in finite time.
+/// This is the shape the user hit ("a hard job ran indefinitely at 99% CPU").
+fn build_hard_cp_problem(name: &str, n: usize) {
+    cleanup_problem(name);
+    cleanup_jobs(name);
+
+    let horizon = n * 12;
+    let mut sql = format!("SELECT pgortools.create_problem('{name}');\n");
+    sql.push_str(&format!(
+        "SELECT pgortools.add_resource('{name}', 'grill', 1);\n"
+    ));
+    sql.push_str(&format!(
+        "SELECT pgortools.add_resource('{name}', 'pass', 1);\n"
+    ));
+    for i in 0..n {
+        let dur = 3 + (i % 5);
+        let weight = 1 + (i % 3);
+        sql.push_str(&format!(
+            "SELECT pgortools.add_interval_var('{name}', 'g{i}', {dur}, 0, {horizon});\n\
+             SELECT pgortools.add_interval_var('{name}', 'p{i}', 2, 0, {horizon});\n\
+             SELECT pgortools.add_demand('{name}', 'grill', 'g{i}', 1);\n\
+             SELECT pgortools.add_demand('{name}', 'pass', 'p{i}', 1);\n\
+             SELECT pgortools.add_precedence('{name}', 'g{i}', 'p{i}', 0);\n\
+             SELECT pgortools.minimize_wait('{name}', 'p{i}', 'g{i}', {weight});\n"
+        ));
+    }
+    execute(&sql).expect("build hard cp problem");
+}
+
+/// The async CP path must be **time-bounded**: a hard instance submitted with a
+/// short limit must reach a terminal state and store a usable schedule, instead
+/// of pinning a core forever proving optimality (the core "async mode doesn't
+/// work" complaint — `solver_time_limit` was ignored for the CP solve).
+///
+/// `wait_for` fails the test if the job hasn't completed within `SOLVE_TIMEOUT`,
+/// which for a 3s budget is comfortable but which an unbounded solve of this
+/// instance would blow straight past.
+#[test]
+fn test_async_cp_time_limit_bounds_hard_solve() {
+    skip_if_not_running!();
+    if !cpsat_available() {
+        eprintln!("skipping: cpsat surface absent (built without --features cpsat)");
+        return;
+    }
+
+    build_hard_cp_problem("it_cp_bounded", 24);
+
+    // 3-second budget on an instance that is intractable to prove optimal.
+    let job_id_str = query_one("SELECT pgortools.solve_cp('it_cp_bounded', 3)")
+        .unwrap()
+        .unwrap();
+    let job_id: i64 = job_id_str.parse().unwrap();
+
+    let status_sql = format!("SELECT state FROM pgortools.solve_status({})", job_id);
+    wait_for("bounded cp solve", &status_sql, "completed", SOLVE_TIMEOUT)
+        .expect("time-limited cp solve must complete, not hang");
+
+    // Best-feasible-so-far was found and stored within the budget.
+    let solution = query_one("SELECT pgortools.get_solution('it_cp_bounded')::text")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&solution).unwrap();
+    let status = json["status"].as_str().unwrap_or("");
+    assert!(
+        status == "FEASIBLE" || status == "OPTIMAL",
+        "bounded solve should yield a schedule, got: {json}"
+    );
+    assert!(
+        json["intervals"].as_object().map(|m| !m.is_empty()) == Some(true),
+        "bounded solve stored no intervals: {json}"
+    );
+
+    cleanup_jobs("it_cp_bounded");
+    cleanup_problem("it_cp_bounded");
+}
+
+/// Cancelling a *running* CP solve must actually stop it — the headline async bug.
+/// Previously the whole solve ran inside one transaction, so (a) the job never
+/// showed `solving`, and (b) `cancel_solve` blocked on the claim row lock and the
+/// CP search ignored it anyway.
+///
+/// This proves all three fixes at once:
+///  - the job becomes visibly `solving` (per-step transactions),
+///  - `cancel_solve` returns `true` on a running job (no lock deadlock), and
+///  - the worker is freed promptly — a second job submitted right after the
+///    cancel completes quickly, which can only happen if the first solve was
+///    interrupted rather than running its full 30s budget.
+#[test]
+fn test_cancel_running_cp_solve_frees_worker() {
+    skip_if_not_running!();
+    if !cpsat_available() {
+        eprintln!("skipping: cpsat surface absent (built without --features cpsat)");
+        return;
+    }
+
+    build_hard_cp_problem("it_cp_cancel", 26);
+
+    // Big budget: without cancellation this would keep the single worker busy for
+    // 30s trying to prove optimality.
+    let job_id: i64 = query_one("SELECT pgortools.solve_cp('it_cp_cancel', 30)")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // The worker must publish `solving` (impossible under the old one-transaction
+    // design). Catching it here also tells us the solve is genuinely in flight.
+    let status_sql = format!("SELECT state FROM pgortools.solve_status({})", job_id);
+    wait_for(
+        "cp solve running",
+        &status_sql,
+        "solving",
+        Duration::from_secs(10),
+    )
+    .expect("job should become visibly 'solving'");
+
+    // Cancel the in-flight solve: must succeed without the SpiTupleTable error and
+    // without blocking.
+    let cancelled = query_one(&format!("SELECT pgortools.cancel_solve({})", job_id))
+        .expect("cancel_solve must not error")
+        .unwrap();
+    assert_eq!(
+        cancelled, "true",
+        "cancel of a running job should return true"
+    );
+
+    wait_for(
+        "cp solve cancelled",
+        &status_sql,
+        "cancelled",
+        Duration::from_secs(10),
+    )
+    .expect("cancelled job should settle in state 'cancelled'");
+
+    // The clincher: a fresh trivial job must complete quickly. With a single
+    // worker, that is only possible if the cancelled solve released it promptly
+    // instead of grinding through its 30s budget.
+    build_hard_cp_problem("it_cp_after_cancel", 2);
+    let job2: i64 = query_one("SELECT pgortools.solve_cp('it_cp_after_cancel', 5)")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let status2_sql = format!("SELECT state FROM pgortools.solve_status({})", job2);
+    wait_for(
+        "post-cancel job",
+        &status2_sql,
+        "completed",
+        Duration::from_secs(12),
+    )
+    .expect("worker must be free to run the next job soon after cancel");
+
+    cleanup_jobs("it_cp_cancel");
+    cleanup_problem("it_cp_cancel");
+    cleanup_jobs("it_cp_after_cancel");
+    cleanup_problem("it_cp_after_cancel");
+}
+
+/// Cancelling a job that is already finished (or never existed) must return
+/// `false` cleanly — not raise `SpiTupleTable positioned before the start or
+/// after the end`. Regression test for the `cancel_job` empty-`RETURNING` bug.
+#[test]
+fn test_cancel_finished_or_missing_job_returns_false() {
+    skip_if_not_running!();
+
+    cleanup_problem("it_cancel_done");
+    cleanup_jobs("it_cancel_done");
+
+    execute("SELECT pgortools.create_problem('it_cancel_done')").unwrap();
+    execute("SELECT pgortools.add_int_var('it_cancel_done', 'x', 0, 10)").unwrap();
+    execute("SELECT pgortools.minimize('it_cancel_done', 'x')").unwrap();
+
+    let job_id: i64 = query_one("SELECT pgortools.solve('it_cancel_done')")
+        .unwrap()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let status_sql = format!("SELECT state FROM pgortools.solve_status({})", job_id);
+    wait_for("mip solve", &status_sql, "completed", SOLVE_TIMEOUT)
+        .expect("trivial mip solve should complete");
+
+    // Cancelling the completed job: must be Ok(false), never an SPI error.
+    let done = query_one(&format!("SELECT pgortools.cancel_solve({})", job_id))
+        .expect("cancel_solve of a completed job must not raise");
+    assert_eq!(done, Some("false".to_string()), "completed job → false");
+
+    // Cancelling a job id that does not exist: also Ok(false), no error.
+    let missing = query_one("SELECT pgortools.cancel_solve(2000000000)")
+        .expect("cancel_solve of a missing job must not raise");
+    assert_eq!(missing, Some("false".to_string()), "missing job → false");
+
+    cleanup_jobs("it_cancel_done");
+    cleanup_problem("it_cancel_done");
 }
 
 #[test]

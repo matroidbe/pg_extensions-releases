@@ -746,8 +746,8 @@ mod tests {
     #[test]
     fn decode_f64_little_endian() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&3.14159f64.to_le_bytes());
-        bytes.extend_from_slice(&2.71828f64.to_le_bytes());
+        bytes.extend_from_slice(&std::f64::consts::PI.to_le_bytes());
+        bytes.extend_from_slice(&std::f64::consts::E.to_le_bytes());
         let out = decode_chunk_values(
             &bytes,
             "float64",
@@ -756,8 +756,8 @@ mod tests {
             &pgx_zarr_walker::CfPacking::identity(),
         )
         .unwrap();
-        assert!((out[0] - 3.14159).abs() < 1e-12);
-        assert!((out[1] - 2.71828).abs() < 1e-12);
+        assert!((out[0] - std::f64::consts::PI).abs() < 1e-12);
+        assert!((out[1] - std::f64::consts::E).abs() < 1e-12);
     }
 
     #[test]

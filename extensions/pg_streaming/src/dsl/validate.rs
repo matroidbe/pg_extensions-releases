@@ -3,6 +3,9 @@
 //! Structural validation is pure Rust. Semantic validation (SQL expression checking)
 //! uses SPI with EXPLAIN to validate expressions without executing them.
 
+use crate::connector::output::call::{
+    is_valid_function_name, is_valid_role_name, is_valid_setting_name,
+};
 use crate::dsl::types::*;
 
 /// Validate a pipeline definition structurally (no SPI needed)
@@ -99,6 +102,33 @@ fn validate_input(input: &InputConfig) -> Result<(), String> {
             if !obj.contains_key("pagination") {
                 return Err("input.http_paginated.pagination is required".to_string());
             }
+        }
+        InputConfig::Modbus(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "input.modbus: config must be a JSON object".to_string())?;
+            for required in ["host", "reads"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("input.modbus.{} is required", required));
+                }
+            }
+            // Deep structural validation at create time (pure Rust, no SPI).
+            // `${secret:...}` placeholders only ever occupy string fields, so
+            // parsing succeeds before secret resolution.
+            crate::connector::input::modbus::ModbusSource::from_config(cfg)
+                .map_err(|e| format!("input.{}", e))?;
+        }
+        InputConfig::S7(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "input.s7: config must be a JSON object".to_string())?;
+            for required in ["host", "reads"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("input.s7.{} is required", required));
+                }
+            }
+            crate::connector::input::s7::S7Source::from_config(cfg)
+                .map_err(|e| format!("input.{}", e))?;
         }
         InputConfig::Custom(c) => {
             if c.name.is_empty() {
@@ -387,6 +417,70 @@ fn validate_output(output: &OutputConfig) -> Result<(), String> {
                 if !obj.contains_key(required) {
                     return Err(format!("output.opendal.{} is required", required));
                 }
+            }
+        }
+        OutputConfig::Modbus(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "output.modbus: config must be a JSON object".to_string())?;
+            for required in ["host", "writes"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("output.modbus.{} is required", required));
+                }
+            }
+            crate::connector::output::modbus::ModbusSink::from_config(cfg)
+                .map_err(|e| format!("output.{}", e))?;
+        }
+        OutputConfig::S7(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "output.s7: config must be a JSON object".to_string())?;
+            for required in ["host", "writes"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("output.s7.{} is required", required));
+                }
+            }
+            crate::connector::output::s7::S7Sink::from_config(cfg)
+                .map_err(|e| format!("output.{}", e))?;
+        }
+        OutputConfig::Call(c) => {
+            if c.function.trim().is_empty() {
+                return Err("output.call.function is required".to_string());
+            }
+            // The function name is interpolated straight into SQL, so it must
+            // be a plain one- or two-part identifier.
+            if let Some(role) = &c.set_role {
+                if !is_valid_role_name(role) {
+                    return Err(format!(
+                        "output.call.set_role must be an unquoted identifier (got '{}')",
+                        role
+                    ));
+                }
+            }
+            if !is_valid_function_name(&c.function) {
+                return Err(format!(
+                    "output.call.function must be an unquoted identifier, optionally schema-qualified (got '{}')",
+                    c.function
+                ));
+            }
+            for (i, arg) in c.args.iter().enumerate() {
+                if arg.trim().is_empty() {
+                    return Err(format!("output.call.args[{}] must not be empty", i));
+                }
+            }
+            for key in c.set_config.keys() {
+                if !is_valid_setting_name(key) {
+                    return Err(format!(
+                        "output.call.set_config key '{}' must be a setting name like 'app.user_role'",
+                        key
+                    ));
+                }
+            }
+            if c.batch {
+                return Err(
+                    "output.call.batch is reserved and not yet implemented; use batch: false"
+                        .to_string(),
+                );
             }
         }
         OutputConfig::Custom(c) => {
@@ -1069,6 +1163,152 @@ mod tests {
         assert!(err.contains("pagination is required"));
     }
 
+    // =========================================================================
+    // Modbus validation
+    // =========================================================================
+
+    #[test]
+    fn test_validate_modbus_input_valid() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!({
+            "host": "10.0.0.5",
+            "reads": [
+                { "name": "temperature", "kind": "holding", "address": 100, "data_type": "f32" }
+            ]
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_modbus_input_missing_host() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!({
+            "reads": [{ "name": "a", "kind": "coil", "address": 0 }]
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("host is required"));
+    }
+
+    #[test]
+    fn test_validate_modbus_input_missing_reads() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!({ "host": "10.0.0.5" }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("reads is required"));
+    }
+
+    #[test]
+    fn test_validate_modbus_input_deep_validation_runs() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!({
+            "host": "10.0.0.5",
+            "reads": [
+                { "name": "dup", "kind": "coil", "address": 0 },
+                { "name": "dup", "kind": "coil", "address": 1 }
+            ]
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("duplicate name"));
+    }
+
+    #[test]
+    fn test_validate_modbus_input_must_be_object() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!("not an object"));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_validate_modbus_input_allows_secret_placeholder_host() {
+        let mut def = minimal_def();
+        def.input = InputConfig::Modbus(serde_json::json!({
+            "host": "${secret:plc_host}",
+            "reads": [{ "name": "a", "kind": "coil", "address": 0 }]
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    // =========================================================================
+    // S7 validation
+    // =========================================================================
+
+    #[test]
+    fn test_validate_s7_input_valid() {
+        let mut def = minimal_def();
+        def.input = InputConfig::S7(serde_json::json!({
+            "host": "192.168.0.100",
+            "reads": [
+                { "name": "speed", "area": "db", "db": 100, "offset": 2, "type": "int" }
+            ]
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_s7_input_missing_host() {
+        let mut def = minimal_def();
+        def.input = InputConfig::S7(serde_json::json!({
+            "reads": [{ "name": "a", "area": "markers", "offset": 0, "type": "int" }]
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("host is required"));
+    }
+
+    #[test]
+    fn test_validate_s7_input_deep_validation_runs() {
+        let mut def = minimal_def();
+        def.input = InputConfig::S7(serde_json::json!({
+            "host": "192.168.0.100",
+            "reads": [{ "name": "a", "area": "db", "offset": 0, "type": "int" }]
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("requires a 'db' number"));
+    }
+
+    #[test]
+    fn test_validate_modbus_output_valid() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Modbus(serde_json::json!({
+            "host": "10.0.0.5",
+            "writes": [
+                { "field": "setpoint", "kind": "holding", "address": 40, "data_type": "f32" }
+            ]
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_modbus_output_rejects_read_only_kind() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Modbus(serde_json::json!({
+            "host": "10.0.0.5",
+            "writes": [{ "field": "a", "kind": "input", "address": 0 }]
+        }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("read-only"));
+    }
+
+    #[test]
+    fn test_validate_s7_output_valid() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::S7(serde_json::json!({
+            "host": "192.168.0.100",
+            "writes": [
+                { "field": "setpoint", "area": "db", "db": 100, "offset": 8, "type": "real" }
+            ]
+        }));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_s7_output_missing_writes() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::S7(serde_json::json!({ "host": "x" }));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("writes is required"));
+    }
+
     #[test]
     fn test_validate_unnest_empty_as() {
         let mut def = minimal_def();
@@ -1079,5 +1319,118 @@ mod tests {
         let result = validate_definition(&def);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'as' field name is required"));
+    }
+
+    // =========================================================================
+    // call output connector
+    // =========================================================================
+
+    fn call_output(function: &str) -> CallOutputConfig {
+        CallOutputConfig {
+            function: function.to_string(),
+            args: vec!["record".to_string()],
+            set_config: Default::default(),
+            set_role: None,
+            on_record_error: OnRecordError::DeadLetter,
+            batch: false,
+        }
+    }
+
+    #[test]
+    fn test_validate_call_output_valid() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Call(call_output("myschema.ingest_order"));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_call_output_unqualified_is_valid() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Call(call_output("ingest_order"));
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    #[test]
+    fn test_validate_call_output_empty_function() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Call(call_output("   "));
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("function is required"));
+    }
+
+    #[test]
+    fn test_validate_call_output_rejects_injection_in_function() {
+        for bad in [
+            "app.ingest(1); DROP TABLE t; --",
+            "a.b.c",
+            "1bad",
+            "\"quoted\".fn",
+        ] {
+            let mut def = minimal_def();
+            def.output = OutputConfig::Call(call_output(bad));
+            let err = validate_definition(&def)
+                .unwrap_err_or_panic(&format!("'{}' should be rejected", bad));
+            assert!(
+                err.contains("unquoted identifier"),
+                "unexpected error for '{}': {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_call_output_empty_arg() {
+        let mut def = minimal_def();
+        let mut cfg = call_output("app.ingest");
+        cfg.args = vec!["record".to_string(), "  ".to_string()];
+        def.output = OutputConfig::Call(cfg);
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("args[1] must not be empty"));
+    }
+
+    #[test]
+    fn test_validate_call_output_bad_setting_name() {
+        let mut def = minimal_def();
+        let mut cfg = call_output("app.ingest");
+        cfg.set_config
+            .insert("app.role'); --".to_string(), "x".to_string());
+        def.output = OutputConfig::Call(cfg);
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("must be a setting name"));
+    }
+
+    #[test]
+    fn test_validate_call_output_batch_is_reserved() {
+        let mut def = minimal_def();
+        let mut cfg = call_output("app.ingest");
+        cfg.batch = true;
+        def.output = OutputConfig::Call(cfg);
+        let err = validate_definition(&def).unwrap_err();
+        assert!(err.contains("reserved and not yet implemented"));
+    }
+
+    /// `dead_letter` is the default `on_record_error`, so it must not force a
+    /// pipeline-level dead-letter output — failures fall back to error_log.
+    #[test]
+    fn test_validate_call_output_dead_letter_without_sink_is_ok() {
+        let mut def = minimal_def();
+        def.output = OutputConfig::Call(call_output("app.ingest"));
+        def.pipeline.dead_letter = None;
+        assert!(validate_definition(&def).is_ok());
+    }
+
+    /// Small helper so the injection loop reports which input slipped through.
+    trait UnwrapErrOrPanic {
+        fn unwrap_err_or_panic(self, msg: &str) -> String;
+    }
+
+    impl UnwrapErrOrPanic for Result<(), String> {
+        fn unwrap_err_or_panic(self, msg: &str) -> String {
+            match self {
+                Ok(()) => panic!("{}", msg),
+                Err(e) => e,
+            }
+        }
     }
 }

@@ -83,6 +83,14 @@ See [pg_delta Manual](../../docs/pg_delta.md) for cloud storage setup.
 | `export(table)` | Export changes to Delta |
 | `drop_export(table)` | Drop export registration |
 | `list_exports()` | List export registrations |
+| **Index (query without copying)** | |
+| `index_table(name, location)` | Catalogue a Delta table's files + stats |
+| `refresh_index(name)` | Re-read the log at the current version |
+| `drop_index(name)` | Drop an index registration |
+| `list_indexes()` | List indexed tables |
+| `index_info(name)` | Version, file/byte/row counts |
+| `fetch(table, filter, columns)` | Query an indexed table (SETOF jsonb) |
+| `pg_delta_server` (FDW) | Foreign tables with predicate pushdown |
 
 ## SQL API
 
@@ -406,6 +414,76 @@ SELECT delta.list_exports();
 ```
 
 **Returns:** `JSONB` - Array of export table registrations
+
+## Index Mode (query without copying)
+
+A third operating mode alongside ingest/export. Instead of copying rows into
+Postgres, pg_delta catalogues a Delta table's transaction log
+(`delta.indexed_tables` + `delta.files`: per-file URI, partition values, and
+`add.stats` min/max/null-count). Selective queries then prune files at plan time
+(tier 1, free) and read only the surviving parquet from object storage, pruning
+row groups via the footer (tier 2). See
+[../../design/pg_delta/indexing.md](../../design/pg_delta/indexing.md).
+
+Best for large Delta tables (>10 GB) where queries hit a small, well-pruned
+slice and full materialization would be wasteful.
+
+### index_table
+
+Catalogue a Delta table's files and stats. Returns the number of files indexed.
+
+```sql
+SELECT delta.index_table('events', 's3://lake/events');
+-- per-table credentials:
+SELECT delta.index_table('events', 's3://lake/events',
+    storage_options => '{"AWS_REGION": "eu-west-1"}'::jsonb);
+```
+
+### refresh_index / drop_index / list_indexes / index_info
+
+```sql
+SELECT delta.refresh_index('events');   -- re-read log at current version
+SELECT delta.index_info('events');      -- {version, file_count, total_bytes, estimated_rows, ...}
+SELECT delta.list_indexes();
+SELECT delta.drop_index('events');
+```
+
+### fetch
+
+Query an indexed table without copying. Prunes files via the catalog, reads only
+the survivors, applies the filter, and returns one `jsonb` object per row.
+
+Filter grammar: `{"col": v}` (equality) or
+`{"col": {"gte": .., "lt": .., "gt": .., "lte": .., "eq": ..}}` (range).
+
+```sql
+SELECT (r->>'user_id')::bigint, (r->>'amount')::numeric
+FROM delta.fetch(
+    'events',
+    '{"city": "BE", "ts": {"gte": "2024-06-01", "lt": "2024-06-08"}, "amount": {"gt": 1000}}'::jsonb,
+    columns => ARRAY['user_id', 'amount']
+) r;
+```
+
+**Returns:** `SETOF jsonb` — one object per row. `max_rows` (default 1,000,000)
+caps materialization.
+
+### FDW — typed columns + predicate pushdown
+
+`CREATE EXTENSION` installs a foreign-data wrapper and a `pg_delta_server`.
+Foreign tables give real typed columns; WHERE clauses are pushed down to prune
+files (and re-checked by Postgres, so results are always exact).
+
+```sql
+CREATE FOREIGN TABLE events_fdw (
+    ts TIMESTAMPTZ, city TEXT, user_id BIGINT, amount NUMERIC
+) SERVER pg_delta_server OPTIONS (delta_table 'events');
+
+SELECT user_id, sum(amount)
+FROM events_fdw
+WHERE city = 'BE' AND ts >= '2024-06-01'
+GROUP BY user_id;
+```
 
 ## Configuration
 

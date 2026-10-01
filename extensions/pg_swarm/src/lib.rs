@@ -2450,7 +2450,7 @@ mod tests {
         assert_eq!(watches[0].1, "pgswarm.watch_input");
         assert_eq!(watches[0].2, "watch_executor");
         assert_eq!(watches[0].3, 50); // batch_size
-        assert_eq!(watches[0].7, true); // enabled
+        assert!(watches[0].7); // enabled
     }
 
     #[pg_test]

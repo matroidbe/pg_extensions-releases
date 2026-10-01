@@ -41,6 +41,7 @@ mod tests {
                     columns: vec![SpiValue::Text("second".to_string())],
                 },
             ],
+            rows_affected: 2,
         };
         assert_eq!(
             result.first().unwrap().get_string(0),
@@ -52,7 +53,10 @@ mod tests {
 
     #[test]
     fn test_spi_result_empty() {
-        let result = SpiResult { rows: vec![] };
+        let result = SpiResult {
+            rows: vec![],
+            rows_affected: 0,
+        };
         assert!(result.first().is_none());
         assert!(result.is_empty());
         assert_eq!(result.len(), 0);

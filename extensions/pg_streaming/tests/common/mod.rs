@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod modbus_mock;
+
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_postgres::NoTls;
@@ -120,11 +122,18 @@ pub fn execute(sql: &str) -> Result<(), String> {
             }
         });
 
-        client
-            .batch_execute(sql)
-            .await
-            .map_err(|e| format!("SQL error: {}", e))
+        client.batch_execute(sql).await.map_err(format_sql_error)
     })
+}
+
+/// tokio_postgres' `Display` for a server error is just "db error" — the
+/// actual message hangs off the `DbError`. Surface it so tests can assert on
+/// what PostgreSQL actually said.
+fn format_sql_error(e: tokio_postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => format!("SQL error: {}", db.message()),
+        None => format!("SQL error: {}", e),
+    }
 }
 
 /// Wait for a condition to become true, polling at intervals.
@@ -187,6 +196,17 @@ pub fn wait_for_row_count(table: &str, min_count: i64, timeout: Duration) -> Res
 pub fn cleanup_pipeline(name: &str) {
     let _ = execute(&format!("SELECT pgstreams.stop('{}')", name));
     let _ = execute(&format!("SELECT pgstreams.drop_pipeline('{}')", name));
+}
+
+/// Ensure a plain (non source-backed) Kafka topic exists.
+///
+/// Lifecycle tests assert `state = 'running'` right after `pgstreams.start()`.
+/// That races the engine: a pipeline whose Kafka topic does not exist fails to
+/// initialize, and the executor legitimately flips it to 'failed' a second or
+/// two later. Creating the topic first removes the race instead of papering
+/// over it with a sleep.
+pub fn ensure_topic(name: &str) {
+    let _ = execute(&format!("SELECT pgkafka.create_topic('{}')", name));
 }
 
 /// Cleanup helper: drop a Kafka typed topic, ignore errors

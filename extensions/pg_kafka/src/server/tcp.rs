@@ -316,6 +316,12 @@ async fn handle_connection(
 
     let mut buf = BytesMut::with_capacity(4096);
 
+    // Peer address, reported as `client_host` in DescribeGroups.
+    let peer_host = socket
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
+
     loop {
         // Check for shutdown
         if is_shutdown_requested() {
@@ -361,7 +367,7 @@ async fn handle_connection(
                             match parse_request_header(&mut cursor) {
                                 Ok(header) => {
                                     // Handle the request
-                                    match handle_request(&header, &mut cursor, broker_host, broker_port, &storage)
+                                    match handle_request(&header, &mut cursor, broker_host, broker_port, &peer_host, &storage)
                                         .await
                                     {
                                         Ok(response_body) => {

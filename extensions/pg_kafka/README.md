@@ -228,17 +228,45 @@ SET pg_kafka.advertised_host = 'kafka.example.com';
 
 ## Supported Kafka APIs
 
+Every API listed here is both advertised in `ApiVersions` and handled; the
+broker never advertises an API it cannot answer. Flexible (compact) request
+versions are not supported yet, so clients negotiate the highest non-flexible
+version of each API.
+
 | API | Status | Notes |
 |-----|--------|-------|
 | Metadata | Implemented | Topic discovery |
 | Produce | Implemented | Single partition |
 | Fetch | Implemented | Consumer reads |
 | ListOffsets | Implemented | Offset queries |
-| FindCoordinator | Implemented | Group coordination |
-| JoinGroup | Implemented | Consumer groups |
+| FindCoordinator | Implemented | This broker coordinates every group |
+| JoinGroup | Implemented | Consumer groups (DB-backed coordinator, works across workers) |
 | SyncGroup | Implemented | Partition assignment |
-| Heartbeat | Implemented | Group liveness |
+| Heartbeat | Implemented | Group liveness, session expiry |
 | LeaveGroup | Implemented | Clean disconnect |
 | OffsetFetch | Implemented | Committed offsets |
 | OffsetCommit | Implemented | Offset persistence |
+| ListGroups | Implemented | Group enumeration (GUIs, `kafka-consumer-groups --list`) |
+| DescribeGroups | Implemented | Group state, members, assignments |
+| CreateTopics | Implemented | Creates a native topic; more than one partition is rejected |
+| DeleteTopics | Implemented | Drops the topic (messages and offsets cascade) |
 | ApiVersions | Implemented | Protocol negotiation |
+
+### Consumer groups
+
+Group state lives in `pgkafka.consumer_groups`, `pgkafka.consumer_group_members`
+and `pgkafka.consumer_offsets`, so it is shared by all protocol workers and
+survives restarts. Standard clients (`subscribe()` in librdkafka/kafkajs/Java)
+go through the normal JoinGroup → SyncGroup → Heartbeat cycle; the group
+leader computes the assignment with its own assignor. Since every topic has
+exactly one partition, one member of a group owns it and the others receive
+an empty assignment until a rebalance.
+
+```sql
+-- Inspect groups from SQL
+SELECT group_id, state, generation_id, protocol, leader_id FROM pgkafka.consumer_groups;
+SELECT g.group_id, t.name, o.committed_offset
+FROM pgkafka.consumer_offsets o
+JOIN pgkafka.consumer_groups g ON g.id = o.group_id
+JOIN pgkafka.topics t ON t.id = o.topic_id;
+```

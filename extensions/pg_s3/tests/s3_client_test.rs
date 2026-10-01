@@ -71,10 +71,10 @@ fn cleanup_test_bucket(client: &Client, rt: &tokio::runtime::Runtime) {
 /// Test: S3 server is accepting connections
 #[test]
 fn test_server_running() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     println!(
         "pg_s3 server is accepting connections at {}",
-        common::S3_ADDR
+        common::s3_addr()
     );
 }
 
@@ -85,7 +85,7 @@ fn test_server_running() {
 /// Test: List buckets (GET /)
 #[test]
 fn test_list_buckets() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
 
@@ -103,7 +103,7 @@ fn test_list_buckets() {
 /// Test: Create and delete a bucket using real S3 SDK
 #[test]
 fn test_create_and_delete_bucket() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     let bucket = "test-create-delete";
@@ -138,7 +138,7 @@ fn test_create_and_delete_bucket() {
 /// Test: Head bucket (check existence)
 #[test]
 fn test_head_bucket() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     let bucket = "test-head-bucket";
@@ -163,7 +163,7 @@ fn test_head_bucket() {
 /// Test: Create bucket with invalid name returns error
 #[test]
 fn test_create_bucket_invalid_name() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
 
@@ -183,7 +183,7 @@ fn test_create_bucket_invalid_name() {
 /// Test: Delete non-empty bucket fails
 #[test]
 fn test_delete_nonempty_bucket_fails() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     let bucket = "test-nonempty-delete";
@@ -220,7 +220,7 @@ fn test_delete_nonempty_bucket_fails() {
 /// Test: Put and Get an object via real S3 SDK
 #[test]
 fn test_put_and_get_object() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -286,7 +286,7 @@ fn test_put_and_get_object() {
 /// Test: Put object overwrites existing
 #[test]
 fn test_put_object_overwrite() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -355,7 +355,7 @@ fn test_put_object_overwrite() {
 /// Test: Delete an object
 #[test]
 fn test_delete_object() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -409,7 +409,7 @@ fn test_delete_object() {
 /// Test: Head object returns metadata
 #[test]
 fn test_head_object_metadata() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -472,7 +472,7 @@ fn test_head_object_metadata() {
 /// Test: Get nonexistent object returns NoSuchKey error
 #[test]
 fn test_get_nonexistent_object() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -496,7 +496,7 @@ fn test_get_nonexistent_object() {
 /// Test: Binary object round-trip preserves all bytes
 #[test]
 fn test_binary_object() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -542,7 +542,7 @@ fn test_binary_object() {
 /// Test: Put object with custom x-amz-meta-* headers
 #[test]
 fn test_put_object_with_metadata() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -582,7 +582,7 @@ fn test_put_object_with_metadata() {
 /// Test: List objects in a bucket using SDK's list_objects_v2
 #[test]
 fn test_list_objects() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -603,7 +603,7 @@ fn test_list_objects() {
                 .body(ByteStream::from(body.to_vec()))
                 .send(),
         )
-        .expect(&format!("PutObject {} failed", key));
+        .unwrap_or_else(|_| panic!("PutObject {} failed", key));
     }
 
     // List all objects
@@ -635,7 +635,7 @@ fn test_list_objects() {
 /// Test: List objects with prefix filter
 #[test]
 fn test_list_objects_with_prefix() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -654,7 +654,7 @@ fn test_list_objects_with_prefix() {
                 .body(ByteStream::from(body.to_vec()))
                 .send(),
         )
-        .expect(&format!("PutObject {} failed", key));
+        .unwrap_or_else(|_| panic!("PutObject {} failed", key));
     }
 
     // List only images/
@@ -684,7 +684,7 @@ fn test_list_objects_with_prefix() {
 /// Test: List objects with delimiter shows CommonPrefixes (virtual folders)
 #[test]
 fn test_list_objects_with_delimiter() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -704,7 +704,7 @@ fn test_list_objects_with_delimiter() {
                 .body(ByteStream::from(body.to_vec()))
                 .send(),
         )
-        .expect(&format!("PutObject {} failed", key));
+        .unwrap_or_else(|_| panic!("PutObject {} failed", key));
     }
 
     // List with delimiter — should show "folders" as CommonPrefixes
@@ -758,7 +758,7 @@ fn test_list_objects_with_delimiter() {
 /// Test: Object uploaded via HTTP is visible via SQL
 #[test]
 fn test_http_upload_visible_in_sql() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -808,7 +808,7 @@ fn test_http_upload_visible_in_sql() {
 /// Test: Object created via SQL is retrievable via HTTP (S3 SDK)
 #[test]
 fn test_sql_insert_visible_via_http() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     let bucket = "test-sql-to-http";
@@ -861,7 +861,7 @@ fn test_sql_insert_visible_via_http() {
 /// Test: Identical content is deduplicated on disk
 #[test]
 fn test_content_deduplication() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     ensure_test_bucket(&client, &rt);
@@ -924,7 +924,7 @@ fn test_content_deduplication() {
 /// Test: Operations on nonexistent bucket return proper errors
 #[test]
 fn test_nonexistent_bucket_errors() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
 
@@ -958,7 +958,7 @@ fn test_nonexistent_bucket_errors() {
 /// Test: Duplicate bucket creation returns proper error
 #[test]
 fn test_create_duplicate_bucket() {
-    skip_if_no_server!(common::S3_ADDR);
+    skip_if_no_server!(common::s3_addr());
     let client = s3_client();
     let rt = runtime();
     let bucket = "test-dup-create";
@@ -973,4 +973,53 @@ fn test_create_duplicate_bucket() {
 
     // Cleanup
     let _ = rt.block_on(client.delete_bucket().bucket(bucket).send());
+}
+
+/// Regression (#121 / #120): object key, Content-Type and metadata containing
+/// `$N` placeholder tokens and quotes round-trip as literals — the exact
+/// payload from the injection report must be stored verbatim.
+#[test]
+fn test_put_object_dollar_placeholder_stored_literally() {
+    skip_if_no_server!(common::s3_addr());
+    let client = s3_client();
+    let rt = runtime();
+    ensure_test_bucket(&client, &rt);
+
+    let key = "inj/||version()||'.txt";
+    let content_type = "$2";
+
+    rt.block_on(
+        client
+            .put_object()
+            .bucket(TEST_BUCKET)
+            .key(key)
+            .content_type(content_type)
+            .metadata("note", "$1 '||version()||'")
+            .body(ByteStream::from(b"injection regression".to_vec()))
+            .send(),
+    )
+    .expect("PutObject failed");
+
+    let head = rt
+        .block_on(client.head_object().bucket(TEST_BUCKET).key(key).send())
+        .expect("HeadObject failed");
+    assert_eq!(head.content_type(), Some(content_type));
+
+    // pg_s3 does not echo x-amz-meta-* on HEAD, so check the stored row:
+    // key, content type and metadata must all be the literal strings.
+    let stored = common::run_sql(&format!(
+        "SELECT o.content_type || '|' || (o.custom_metadata->>'note') \
+         FROM pgs3.objects o JOIN pgs3.buckets b ON o.bucket_id = b.id \
+         WHERE b.name = '{}' AND o.key = '{}';",
+        TEST_BUCKET,
+        key.replace('\'', "''")
+    ))
+    .expect("SQL query failed");
+    assert_eq!(
+        stored, "$2|$1 '||version()||'",
+        "content_type and metadata must round-trip as literals"
+    );
+
+    let _ = rt.block_on(client.delete_object().bucket(TEST_BUCKET).key(key).send());
+    cleanup_test_bucket(&client, &rt);
 }

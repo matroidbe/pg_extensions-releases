@@ -1,0 +1,19 @@
+# Cargo configuration that is true for every clone.
+#
+# Only host-independent settings belong in this file. Cargo has no
+# `cfg(target_os = ...)` for `[build]` or `[env]`, so anything machine-specific
+# put here is forced onto every clone: this file used to pin a Linux compiler
+# cache and a Debian libclang path, and every macOS build died within seconds
+# on paths that cannot exist there.
+#
+# Keep build-speed and host-toolchain settings in your own
+# `~/.cargo/config.toml` instead. See .cargo/config.toml.example for the ones
+# that used to live here.
+
+[resolver]
+# Prefer dependency versions whose rust-version is compatible with the
+# active toolchain. Cargo.lock is gitignored, so CI resolves fresh every
+# run; without this, newly published transitive deps that require a newer
+# rustc than the CI runner's (e.g. aws-* crates via deltalake-aws needing
+# 1.94.1 on a 1.92.0 runner) abort resolution outright.
+incompatible-rust-versions = "fallback"

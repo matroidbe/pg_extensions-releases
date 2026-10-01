@@ -60,8 +60,8 @@ fn send_request(stream: &mut TcpStream, request: &[u8]) -> Vec<u8> {
 /// Test ApiVersions request/response
 #[test]
 fn test_api_versions() {
-    skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -89,8 +89,8 @@ fn test_api_versions() {
 /// Test Metadata request/response
 #[test]
 fn test_metadata() {
-    skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -119,8 +119,8 @@ fn test_metadata() {
 /// Test Metadata request for specific topic (unknown)
 #[test]
 fn test_metadata_unknown_topic() {
-    skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -249,8 +249,8 @@ fn put_varint(buf: &mut BytesMut, value: i32) {
 /// Test Produce request (requires topic to exist)
 #[test]
 fn test_produce() {
-    skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -305,8 +305,8 @@ fn build_fetch_request(topic: &str, offset: i64, max_bytes: i32) -> BytesMut {
 /// Test Fetch request (requires topic with messages)
 #[test]
 fn test_fetch() {
-    skip_if_no_server!(common::KAFKA_ADDR);
-    let mut stream = TcpStream::connect(common::KAFKA_ADDR).expect("Failed to connect");
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -321,4 +321,82 @@ fn test_fetch() {
     assert_eq!(correlation_id, 5, "Correlation ID mismatch");
 
     println!("Fetch response: {} bytes", response.len());
+}
+
+/// Regression (#126): ListGroups (16) is advertised and answered with a
+/// well-formed v1 response instead of a bare error code.
+#[test]
+fn test_list_groups_v1() {
+    skip_if_no_server!(common::kafka_addr());
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // ListGroups v1 has an empty body.
+    let request = build_request(16, 1, 7, "proto-test", &[]);
+    let response = send_request(&mut stream, &request);
+
+    // correlation_id(4) throttle_time_ms(4) error_code(2) groups count(4)
+    assert!(
+        response.len() >= 14,
+        "response too short: {} bytes",
+        response.len()
+    );
+    let correlation_id = i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+    assert_eq!(correlation_id, 7);
+    let throttle = i32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+    assert_eq!(throttle, 0);
+    let error_code = i16::from_be_bytes([response[8], response[9]]);
+    assert_eq!(error_code, 0, "ListGroups should succeed");
+    let count = i32::from_be_bytes([response[10], response[11], response[12], response[13]]);
+    assert!(count >= 0);
+}
+
+/// Regression (#126): OffsetCommit v7 response starts with throttle_time_ms
+/// (librdkafka reported a buffer underflow when it did not).
+#[test]
+fn test_offset_commit_v7_wire_format() {
+    skip_if_no_server!(common::kafka_addr());
+    common::ensure_topic("test-topic").expect("Failed to ensure topic");
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut body = BytesMut::new();
+    let group = "proto-commit-group";
+    body.put_i16(group.len() as i16);
+    body.put_slice(group.as_bytes());
+    body.put_i32(-1); // generation_id (manual assignment)
+    body.put_i16(0); // member_id = ""
+    body.put_i16(-1); // group_instance_id = null
+    body.put_i32(1); // topics
+    body.put_i16(10);
+    body.put_slice(b"test-topic");
+    body.put_i32(1); // partitions
+    body.put_i32(0); // partition_index
+    body.put_i64(5); // committed_offset
+    body.put_i32(-1); // committed_leader_epoch
+    body.put_i16(-1); // committed_metadata = null
+
+    let request = build_request(8, 7, 9, "proto-test", &body);
+    let response = send_request(&mut stream, &request);
+
+    // correlation_id(4) throttle(4) topics(4) name(2+10) partitions(4) index(4) error(2)
+    assert_eq!(response.len(), 4 + 4 + 4 + 12 + 4 + 4 + 2);
+    let throttle = i32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+    assert_eq!(throttle, 0);
+    let error_code = i16::from_be_bytes([response[32], response[33]]);
+    assert_eq!(error_code, 0, "commit should succeed");
+
+    let committed = common::run_sql(&format!(
+        "SELECT o.committed_offset::bigint FROM pgkafka.consumer_offsets o \
+         JOIN pgkafka.consumer_groups g ON g.id = o.group_id \
+         JOIN pgkafka.topics t ON t.id = o.topic_id \
+         WHERE g.group_id = '{}' AND t.name = 'test-topic';",
+        group
+    ))
+    .expect("SQL failed");
+    assert_eq!(committed.trim(), "5");
 }

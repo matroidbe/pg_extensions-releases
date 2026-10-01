@@ -36,8 +36,14 @@ impl KafkaInput {
             return Ok(id);
         }
 
+        // Scalar subquery, not `SELECT id FROM ... WHERE`: a query returning
+        // zero rows makes `get_one` fail with "SpiTupleTable positioned before
+        // the start" rather than yielding Ok(None), which left the "topic not
+        // found" arm below unreachable and reported a missing topic as though
+        // pg_kafka were not installed. Wrapped this way a miss is one row of
+        // NULL, and a genuine Err again means what the message says.
         let result = Spi::get_one_with_args::<i32>(
-            "SELECT id FROM pgkafka.topics WHERE name = $1",
+            "SELECT (SELECT id FROM pgkafka.topics WHERE name = $1)",
             &[self.topic_name.as_str().into()],
         );
 

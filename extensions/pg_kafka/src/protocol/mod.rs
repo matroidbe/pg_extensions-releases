@@ -2,8 +2,10 @@
 //!
 //! This module handles encoding/decoding of Kafka wire protocol messages.
 
+mod admin;
 mod api;
 mod codec;
+mod groups;
 mod records;
 mod types;
 

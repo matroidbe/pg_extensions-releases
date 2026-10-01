@@ -1,0 +1,46 @@
+# Dev-machine cargo settings that used to be committed in .cargo/config.toml.
+#
+# They are not committed any more, and must not be copied into that file:
+# cargo has no `cfg(target_os = ...)` for `[build]` or `[env]`, so a committed
+# copy applies to every clone on every OS. That is what broke macOS —
+# `pgx install github.com/matroidbe/pg_extensions/extensions/pg_kafka` stopped
+# on `sccache` not found and `/usr/lib/llvm-20/lib` missing, neither of which
+# the person running it could do anything about.
+#
+# Put what you want in one of the two places cargo already reads, both outside
+# this repository:
+#
+#   ~/.cargo/config.toml
+#       Applies to all your Rust projects. Relative paths resolve against ~,
+#       so use absolute paths in any [patch] table here.
+#
+#   <dir containing your checkouts>/.cargo/config.toml
+#       Cargo reads a .cargo/config.toml in every ancestor directory, nearest
+#       winning. If you keep several checkouts side by side under ~/dev, then
+#       ~/dev/.cargo/config.toml is the natural home for a [patch] table
+#       pointing at a sibling — `../<repo>/...` resolves correctly from there,
+#       and it covers every checkout without touching any of them.
+#
+# Nothing here is needed to compile correctly; it is all build speed and host
+# toolchain. What every clone does need stays in the committed
+# .cargo/config.toml.
+
+# Faster linking on Linux: mold is 10-20x faster than ld.
+# Needs `clang` and `mold` installed.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+# sccache caches compiled artifacts across builds (a large win on clean builds).
+# Install with `cargo install sccache` or your package manager.
+rustc-wrapper = "sccache"
+
+[env]
+# Pin bindgen (pgrx-pg-sys) to clang-20 from apt on a Debian/Ubuntu box that
+# also has Homebrew LLVM installed: the brew-shipped libclang 22 mis-resolves
+# the anonymous union inside HeapTupleHeaderData, leaving every
+# t_choice/t_infomask/t_hoff field as opaque `_address` and breaking the
+# pgrx-pg-sys build. Adjust the version to whatever you have, or leave this out
+# entirely if bindgen already picks a working libclang — on macOS it does.
+LIBCLANG_PATH = "/usr/lib/llvm-20/lib"

@@ -4,9 +4,17 @@
 //! - A literal (certain) value
 //! - A parametric distribution (normal, uniform, etc.)
 //! - A computed distribution (lazy expression tree)
+//!
+//! The math and the data model live in the pure `prob_core` crate — this
+//! module is the pgrx surface: the PostgresType wrapper, SQL constructors,
+//! and casts. `Dist` is a `#[serde(transparent)]` newtype over
+//! `prob_core::Dist`, so the JSON text I/O and the varlena binary format are
+//! byte-identical to what previous pg_prob versions wrote.
 
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
+
+pub use prob_core::{DistParams, DistType};
 
 /// The core distribution type stored as JSONB internally.
 ///
@@ -15,119 +23,33 @@ use serde::{Deserialize, Serialize};
 /// a complex custom binary format.
 #[derive(Debug, Clone, Serialize, Deserialize, PostgresType)]
 #[inoutfuncs]
-pub struct Dist {
-    /// The type of distribution or operation
-    #[serde(rename = "t")]
-    pub dist_type: DistType,
+#[serde(transparent)]
+pub struct Dist(pub prob_core::Dist);
 
-    /// Parameters specific to each distribution type
-    #[serde(rename = "p")]
-    pub params: DistParams,
+impl Dist {
+    /// Check if this distribution is a literal (certain value)
+    pub fn is_literal(&self) -> bool {
+        self.0.is_literal()
+    }
+
+    /// Get literal value if this is a literal distribution
+    pub fn as_literal(&self) -> Option<f64> {
+        self.0.as_literal()
+    }
 }
 
-/// Types of distributions and operations
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum DistType {
-    // Certain value
-    Literal,
-
-    // Parametric distributions
-    Normal,
-    Uniform,
-    Triangular,
-    Beta,
-    LogNormal,
-    Pert,
-    Poisson,
-    Exponential,
-
-    // Binary operations (lazy evaluation)
-    Add,
-    Sub,
-    Mul,
-    Div,
-
-    // Unary operations
-    Neg,
-    Abs,
-    Sqrt,
-    Exp,
-    Ln,
-
-    // Aggregate operations
-    Min,
-    Max,
-
-    // Conditional operations
-    IfAbove,
-    IfBelow,
-    IfThen,
+impl From<prob_core::Dist> for Dist {
+    fn from(d: prob_core::Dist) -> Self {
+        Dist(d)
+    }
 }
 
-/// Parameters for distributions and operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DistParams {
-    /// Literal value
-    Literal { value: f64 },
-
-    /// Normal distribution: N(mu, sigma)
-    Normal { mu: f64, sigma: f64 },
-
-    /// Uniform distribution: U(min, max)
-    Uniform { min: f64, max: f64 },
-
-    /// Triangular distribution: Tri(min, mode, max)
-    Triangular { min: f64, mode: f64, max: f64 },
-
-    /// Beta distribution: Beta(alpha, beta) scaled to [min, max]
-    Beta {
-        alpha: f64,
-        beta: f64,
-        min: f64,
-        max: f64,
-    },
-
-    /// Log-normal distribution: LogN(mu, sigma)
-    LogNormal { mu: f64, sigma: f64 },
-
-    /// PERT distribution: modified beta with min, mode, max
-    Pert {
-        min: f64,
-        mode: f64,
-        max: f64,
-        lambda: f64,
-    },
-
-    /// Poisson distribution: Pois(lambda)
-    Poisson { lambda: f64 },
-
-    /// Exponential distribution: Exp(lambda)
-    Exponential { lambda: f64 },
-
-    /// Binary operation with two distribution operands
-    BinaryOp { left: Box<Dist>, right: Box<Dist> },
-
-    /// Binary operation with distribution and scalar
-    ScalarOp { dist: Box<Dist>, scalar: f64 },
-
-    /// Unary operation
-    UnaryOp { operand: Box<Dist> },
-
-    /// Conditional: if test > threshold → then_dist, else → else_dist
-    Conditional {
-        test: Box<Dist>,
-        threshold: f64,
-        then_dist: Box<Dist>,
-        else_dist: Box<Dist>,
-    },
-
-    /// Probability branch: with probability p → then_dist, else → else_dist
-    ProbBranch {
-        probability: f64,
-        then_dist: Box<Dist>,
-        else_dist: Box<Dist>,
-    },
+/// Unwrap a `Result` from prob_core into the SQL error surface
+pub(crate) fn ok_or_pg<T>(result: Result<T, prob_core::ProbError>) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) => pgrx::error!("{}", e),
+    }
 }
 
 // =============================================================================
@@ -156,10 +78,7 @@ impl InOutFuncs for Dist {
 /// Create a literal (certain) distribution from float8
 #[pg_extern(immutable, parallel_safe, name = "literal")]
 pub fn literal_f64(value: f64) -> Dist {
-    Dist {
-        dist_type: DistType::Literal,
-        params: DistParams::Literal { value },
-    }
+    Dist(prob_core::constructors::literal(value))
 }
 
 /// Alias for literal_f64 (used in tests and internal code)
@@ -170,23 +89,13 @@ pub fn literal(value: f64) -> Dist {
 /// Create a literal (certain) distribution from float4
 #[pg_extern(immutable, parallel_safe, name = "literal")]
 pub fn literal_f32(value: f32) -> Dist {
-    Dist {
-        dist_type: DistType::Literal,
-        params: DistParams::Literal {
-            value: value as f64,
-        },
-    }
+    Dist(prob_core::constructors::literal(value as f64))
 }
 
 /// Create a literal (certain) distribution from integer
 #[pg_extern(immutable, parallel_safe, name = "literal")]
 pub fn literal_i32(value: i32) -> Dist {
-    Dist {
-        dist_type: DistType::Literal,
-        params: DistParams::Literal {
-            value: value as f64,
-        },
-    }
+    Dist(prob_core::constructors::literal(value as f64))
 }
 
 /// Create a literal (certain) distribution from numeric
@@ -195,128 +104,63 @@ pub fn literal_numeric(value: pgrx::AnyNumeric) -> Dist {
     let f: f64 = value.try_into().unwrap_or_else(|_| {
         pgrx::error!("Failed to convert numeric to float8");
     });
-    Dist {
-        dist_type: DistType::Literal,
-        params: DistParams::Literal { value: f },
-    }
+    Dist(prob_core::constructors::literal(f))
 }
 
 /// Create a normal distribution N(mu, sigma)
 #[pg_extern(immutable, parallel_safe)]
 pub fn normal(mu: f64, sigma: f64) -> Dist {
-    if sigma < 0.0 {
-        pgrx::error!("normal distribution sigma must be non-negative");
-    }
-    Dist {
-        dist_type: DistType::Normal,
-        params: DistParams::Normal { mu, sigma },
-    }
+    Dist(ok_or_pg(prob_core::constructors::normal(mu, sigma)))
 }
 
 /// Create a uniform distribution U(min, max)
 #[pg_extern(immutable, parallel_safe)]
 pub fn uniform(min: f64, max: f64) -> Dist {
-    if min > max {
-        pgrx::error!("uniform distribution min must be <= max");
-    }
-    Dist {
-        dist_type: DistType::Uniform,
-        params: DistParams::Uniform { min, max },
-    }
+    Dist(ok_or_pg(prob_core::constructors::uniform(min, max)))
 }
 
 /// Create a triangular distribution Tri(min, mode, max)
 #[pg_extern(immutable, parallel_safe)]
 pub fn triangular(min: f64, mode: f64, max: f64) -> Dist {
-    if !(min <= mode && mode <= max) {
-        pgrx::error!("triangular distribution requires min <= mode <= max");
-    }
-    Dist {
-        dist_type: DistType::Triangular,
-        params: DistParams::Triangular { min, mode, max },
-    }
+    Dist(ok_or_pg(prob_core::constructors::triangular(
+        min, mode, max,
+    )))
 }
 
 /// Create a beta distribution scaled to [min, max]
 #[pg_extern(immutable, parallel_safe)]
 pub fn beta(alpha: f64, beta_param: f64, min: default!(f64, 0.0), max: default!(f64, 1.0)) -> Dist {
-    if alpha <= 0.0 || beta_param <= 0.0 {
-        pgrx::error!("beta distribution alpha and beta must be positive");
-    }
-    if min >= max {
-        pgrx::error!("beta distribution min must be < max");
-    }
-    Dist {
-        dist_type: DistType::Beta,
-        params: DistParams::Beta {
-            alpha,
-            beta: beta_param,
-            min,
-            max,
-        },
-    }
+    Dist(ok_or_pg(prob_core::constructors::beta(
+        alpha, beta_param, min, max,
+    )))
 }
 
 /// Create a log-normal distribution LogN(mu, sigma)
 /// mu and sigma are the mean and std of the underlying normal distribution
 #[pg_extern(immutable, parallel_safe)]
 pub fn lognormal(mu: f64, sigma: f64) -> Dist {
-    if sigma < 0.0 {
-        pgrx::error!("lognormal distribution sigma must be non-negative");
-    }
-    Dist {
-        dist_type: DistType::LogNormal,
-        params: DistParams::LogNormal { mu, sigma },
-    }
+    Dist(ok_or_pg(prob_core::constructors::lognormal(mu, sigma)))
 }
 
 /// Create a PERT distribution (modified beta) with min, mode, max
 /// lambda controls the weight of the mode (default 4.0)
 #[pg_extern(immutable, parallel_safe)]
 pub fn pert(min: f64, mode: f64, max: f64, lambda: default!(f64, 4.0)) -> Dist {
-    if !(min <= mode && mode <= max) {
-        pgrx::error!("PERT distribution requires min <= mode <= max");
-    }
-    if min == max {
-        // Degenerate case: return literal
-        return Dist {
-            dist_type: DistType::Literal,
-            params: DistParams::Literal { value: min },
-        };
-    }
-    Dist {
-        dist_type: DistType::Pert,
-        params: DistParams::Pert {
-            min,
-            mode,
-            max,
-            lambda,
-        },
-    }
+    Dist(ok_or_pg(prob_core::constructors::pert(
+        min, mode, max, lambda,
+    )))
 }
 
 /// Create a Poisson distribution Pois(lambda)
 #[pg_extern(immutable, parallel_safe)]
 pub fn poisson(lambda: f64) -> Dist {
-    if lambda <= 0.0 {
-        pgrx::error!("poisson distribution lambda must be positive");
-    }
-    Dist {
-        dist_type: DistType::Poisson,
-        params: DistParams::Poisson { lambda },
-    }
+    Dist(ok_or_pg(prob_core::constructors::poisson(lambda)))
 }
 
 /// Create an exponential distribution Exp(lambda)
 #[pg_extern(immutable, parallel_safe)]
 pub fn exponential(lambda: f64) -> Dist {
-    if lambda <= 0.0 {
-        pgrx::error!("exponential distribution lambda must be positive");
-    }
-    Dist {
-        dist_type: DistType::Exponential,
-        params: DistParams::Exponential { lambda },
-    }
+    Dist(ok_or_pg(prob_core::constructors::exponential(lambda)))
 }
 
 // =============================================================================
@@ -326,58 +170,45 @@ pub fn exponential(lambda: f64) -> Dist {
 /// Create a conditional distribution: if test_dist > threshold → then_dist, else → else_dist
 #[pg_extern(immutable, parallel_safe)]
 pub fn if_above(test_dist: Dist, threshold: f64, then_dist: Dist, else_dist: Dist) -> Dist {
-    Dist {
-        dist_type: DistType::IfAbove,
-        params: DistParams::Conditional {
-            test: Box::new(test_dist),
-            threshold,
-            then_dist: Box::new(then_dist),
-            else_dist: Box::new(else_dist),
-        },
-    }
+    Dist(prob_core::constructors::if_above(
+        test_dist.0,
+        threshold,
+        then_dist.0,
+        else_dist.0,
+    ))
 }
 
 /// Create a conditional distribution: if test_dist < threshold → then_dist, else → else_dist
 #[pg_extern(immutable, parallel_safe)]
 pub fn if_below(test_dist: Dist, threshold: f64, then_dist: Dist, else_dist: Dist) -> Dist {
-    Dist {
-        dist_type: DistType::IfBelow,
-        params: DistParams::Conditional {
-            test: Box::new(test_dist),
-            threshold,
-            then_dist: Box::new(then_dist),
-            else_dist: Box::new(else_dist),
-        },
-    }
+    Dist(prob_core::constructors::if_below(
+        test_dist.0,
+        threshold,
+        then_dist.0,
+        else_dist.0,
+    ))
 }
 
 /// Create a probability-based conditional: with probability p → then_dist, else → else_dist
 #[pg_extern(immutable, parallel_safe)]
 pub fn if_then(probability: f64, then_dist: Dist, else_dist: Dist) -> Dist {
-    if !(0.0..=1.0).contains(&probability) {
-        pgrx::error!("probability must be between 0 and 1");
-    }
-    Dist {
-        dist_type: DistType::IfThen,
-        params: DistParams::ProbBranch {
-            probability,
-            then_dist: Box::new(then_dist),
-            else_dist: Box::new(else_dist),
-        },
-    }
+    Dist(ok_or_pg(prob_core::constructors::if_then(
+        probability,
+        then_dist.0,
+        else_dist.0,
+    )))
 }
 
 // =============================================================================
 // DistAvgState (aggregate state for AVG)
 // =============================================================================
 
-/// State type for the AVG(dist) aggregate — tracks sum and count
+/// State type for the AVG(dist) aggregate — tracks sum and count.
+/// Transparent wrapper over `prob_core::ops::AvgState` (same JSON shape).
 #[derive(Debug, Clone, Serialize, Deserialize, PostgresType)]
 #[inoutfuncs]
-pub struct DistAvgState {
-    pub sum: Dist,
-    pub count: i64,
-}
+#[serde(transparent)]
+pub struct DistAvgState(pub prob_core::ops::AvgState);
 
 impl InOutFuncs for DistAvgState {
     fn input(input: &core::ffi::CStr) -> Self
@@ -443,26 +274,6 @@ CREATE CAST (text AS @extschema@.dist)
 );
 
 // =============================================================================
-// Helper methods
-// =============================================================================
-
-impl Dist {
-    /// Check if this distribution is a literal (certain value)
-    pub fn is_literal(&self) -> bool {
-        self.dist_type == DistType::Literal
-    }
-
-    /// Get literal value if this is a literal distribution
-    pub fn as_literal(&self) -> Option<f64> {
-        if let DistParams::Literal { value } = &self.params {
-            Some(*value)
-        } else {
-            None
-        }
-    }
-}
-
-// =============================================================================
 // Unit Tests (run inside PostgreSQL via pgrx)
 // =============================================================================
 
@@ -489,7 +300,18 @@ mod tests {
         assert!(json.contains("normal"));
 
         let parsed: Dist = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.dist_type, DistType::Normal);
+        assert_eq!(parsed.0.dist_type, DistType::Normal);
+    }
+
+    #[pg_test]
+    fn test_wrapper_json_matches_core() {
+        // The transparent wrapper must serialize byte-identically to prob_core
+        let wrapped = normal(100.0, 15.0);
+        let core = prob_core::constructors::normal(100.0, 15.0).unwrap();
+        assert_eq!(
+            serde_json::to_string(&wrapped).unwrap(),
+            serde_json::to_string(&core).unwrap()
+        );
     }
 
     #[pg_test]

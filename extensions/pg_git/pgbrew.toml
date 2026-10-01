@@ -1,0 +1,26 @@
+# PostgreSQL configuration pg_git needs, read by pgbrew.
+#
+# `pgx install` reports this; `pgx install --configure` writes it to a
+# conf.d drop-in. It also travels inside a bottle, so a prebuilt install
+# configures the server too.
+
+[postgresql]
+# pg_git registers a background worker in _PG_init (the git HTTP server and sync workers),
+# so its library must be loaded at server start. Without this the extension
+# installs and loads, but the worker never runs and it silently does nothing.
+#
+# This requirement is version-independent: a statically registered worker
+# needs preloading on every PostgreSQL version.
+shared_preload_libraries = true
+
+# No [postgresql.settings] block on purpose. Every GUC below already has a
+# working default, and writing defaults into postgresql.conf only creates
+# drift when the extension later changes one. Add a settings block here for
+# values that genuinely must differ for a deployment.
+#
+# Available settings:
+#   pg_git.enabled
+#   pg_git.database
+#   pg_git.http_port
+#   pg_git.sync_interval
+#   pg_git.default_repo_path

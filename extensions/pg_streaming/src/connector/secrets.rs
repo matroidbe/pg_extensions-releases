@@ -127,8 +127,14 @@ fn parse_placeholder(body: &str) -> Option<(SecretKind, &str)> {
 /// via `std::env`.
 fn spi_loader(kind: SecretKind, name: &str) -> Result<Option<String>, String> {
     match kind {
+        // Scalar subquery so a missing secret comes back as Ok(None) — the
+        // caller turns that into "Unknown secret: <name>". Written as
+        // `SELECT value FROM ... WHERE`, a miss is zero rows, which `get_one`
+        // reports as Err("SpiTupleTable positioned before the start"): the
+        // caller's Unknown-secret message was unreachable and a typo'd
+        // `${secret:...}` surfaced as SPI internals.
         SecretKind::Secret => Spi::get_one_with_args::<String>(
-            "SELECT value FROM pgstreams.secrets WHERE name = $1",
+            "SELECT (SELECT value FROM pgstreams.secrets WHERE name = $1)",
             &[name.into()],
         )
         .map_err(|e| format!("Failed to load secret {}: {}", name, e)),

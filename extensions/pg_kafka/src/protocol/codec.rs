@@ -157,3 +157,142 @@ pub fn write_unsigned_varint(buf: &mut BytesMut, mut value: u32) {
 pub fn write_empty_tagged_fields(buf: &mut BytesMut) {
     buf.put_u8(0);
 }
+
+/// Read a big-endian i8
+pub fn read_i8(buf: &mut Cursor<&[u8]>) -> Result<i8, ProtocolError> {
+    if buf.remaining() < 1 {
+        return Err(ProtocolError::Incomplete);
+    }
+    Ok(buf.get_i8())
+}
+
+/// Read a boolean (single byte)
+pub fn read_bool(buf: &mut Cursor<&[u8]>) -> Result<bool, ProtocolError> {
+    Ok(read_i8(buf)? != 0)
+}
+
+/// Read a non-nullable string (i16 length prefix). A null (-1) length is
+/// tolerated and returned as an empty string, as brokers do.
+pub fn read_string(buf: &mut Cursor<&[u8]>) -> Result<String, ProtocolError> {
+    Ok(read_nullable_string(buf)?.unwrap_or_default())
+}
+
+/// Read an array length (i32). Negative means null/empty.
+pub fn read_array_len(buf: &mut Cursor<&[u8]>) -> Result<usize, ProtocolError> {
+    let len = read_i32(buf)?;
+    if len < 0 {
+        return Ok(0);
+    }
+    // Guard against absurd lengths from a corrupt/hostile frame.
+    if len as usize > buf.remaining() {
+        return Err(ProtocolError::Invalid(format!(
+            "array length {} exceeds remaining bytes {}",
+            len,
+            buf.remaining()
+        )));
+    }
+    Ok(len as usize)
+}
+
+/// Read a nullable array length (i32): `None` for a null (-1) array.
+pub fn read_nullable_array_len(buf: &mut Cursor<&[u8]>) -> Result<Option<usize>, ProtocolError> {
+    let len = read_i32(buf)?;
+    if len < 0 {
+        return Ok(None);
+    }
+    if len as usize > buf.remaining() {
+        return Err(ProtocolError::Invalid(format!(
+            "array length {} exceeds remaining bytes {}",
+            len,
+            buf.remaining()
+        )));
+    }
+    Ok(Some(len as usize))
+}
+
+/// Read an array of non-nullable strings
+pub fn read_string_array(buf: &mut Cursor<&[u8]>) -> Result<Vec<String>, ProtocolError> {
+    let len = read_array_len(buf)?;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        out.push(read_string(buf)?);
+    }
+    Ok(out)
+}
+
+/// Write a boolean (single byte)
+#[allow(dead_code)]
+pub fn write_bool(buf: &mut BytesMut, value: bool) {
+    buf.put_u8(u8::from(value));
+}
+
+/// Write bytes (i32 length prefix)
+pub fn write_bytes(buf: &mut BytesMut, value: &[u8]) {
+    write_i32(buf, value.len() as i32);
+    buf.put_slice(value);
+}
+
+/// Write nullable bytes (i32 length prefix, -1 = null)
+#[allow(dead_code)]
+pub fn write_nullable_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
+    match value {
+        None => write_i32(buf, -1),
+        Some(v) => write_bytes(buf, v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_string_roundtrip() {
+        let mut buf = BytesMut::new();
+        write_string(&mut buf, "hello");
+        write_nullable_string(&mut buf, None);
+        write_nullable_string(&mut buf, Some(""));
+        let data = buf.freeze();
+        let mut cur = Cursor::new(data.as_ref());
+        assert_eq!(read_string(&mut cur).unwrap(), "hello");
+        assert_eq!(read_nullable_string(&mut cur).unwrap(), None);
+        assert_eq!(read_nullable_string(&mut cur).unwrap(), Some(String::new()));
+        assert_eq!(cur.remaining(), 0);
+    }
+
+    #[test]
+    fn test_bytes_roundtrip() {
+        let mut buf = BytesMut::new();
+        write_bytes(&mut buf, b"\x01\x02");
+        write_nullable_bytes(&mut buf, None);
+        write_bool(&mut buf, true);
+        let data = buf.freeze();
+        let mut cur = Cursor::new(data.as_ref());
+        assert_eq!(read_bytes(&mut cur).unwrap().as_ref(), b"\x01\x02");
+        assert_eq!(read_bytes(&mut cur).unwrap().len(), 0);
+        assert!(read_bool(&mut cur).unwrap());
+    }
+
+    #[test]
+    fn test_string_array_roundtrip() {
+        let mut buf = BytesMut::new();
+        write_i32(&mut buf, 2);
+        write_string(&mut buf, "a");
+        write_string(&mut buf, "bc");
+        let data = buf.freeze();
+        let mut cur = Cursor::new(data.as_ref());
+        assert_eq!(read_string_array(&mut cur).unwrap(), vec!["a", "bc"]);
+    }
+
+    #[test]
+    fn test_array_len_rejects_hostile_length() {
+        let data = [0x7f, 0xff, 0xff, 0xff];
+        let mut cur = Cursor::new(data.as_ref());
+        assert!(matches!(
+            read_array_len(&mut cur),
+            Err(ProtocolError::Invalid(_))
+        ));
+        let null = [0xff, 0xff, 0xff, 0xff];
+        let mut cur = Cursor::new(null.as_ref());
+        assert_eq!(read_nullable_array_len(&mut cur).unwrap(), None);
+    }
+}

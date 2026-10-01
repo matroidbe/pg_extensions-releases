@@ -158,7 +158,8 @@ mod tests {
 
     #[test]
     fn test_ifc_value_conversions() {
-        assert_eq!(IfcValue::Real(3.14).as_f64(), Some(3.14));
+        // Not 3.14 — clippy::approx_constant reads that as a botched PI.
+        assert_eq!(IfcValue::Real(2.75).as_f64(), Some(2.75));
         assert_eq!(IfcValue::Integer(42).as_i64(), Some(42));
         assert_eq!(IfcValue::Integer(42).as_f64(), Some(42.0));
         assert_eq!(IfcValue::Bool(true).as_bool(), Some(true));

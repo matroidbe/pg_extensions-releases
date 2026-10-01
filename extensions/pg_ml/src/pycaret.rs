@@ -2553,6 +2553,79 @@ pub fn run_predict_single(
     })
 }
 
+/// Build a 1-row pandas DataFrame from a JSON object keyed by column name.
+///
+/// Shared by `run_predict_row` and `run_predict_proba_row` so a label and its
+/// probabilities are always scored from an identically-typed frame — a number
+/// stays a number and a string stays a string, which is the whole reason the
+/// by-name form exists alongside the positional `float8[]` one.
+fn row_dataframe<'py>(
+    py: Python<'py>,
+    row: &serde_json::Value,
+    feature_columns: &[String],
+) -> Result<Bound<'py, PyAny>, PgMlError> {
+    let pd = py.import("pandas").map_err(PgMlError::from)?;
+    let data = PyDict::new(py);
+    if let serde_json::Value::Object(map) = row {
+        for col in feature_columns {
+            if let Some(val) = map.get(col) {
+                let py_val: Bound<'_, PyAny> = match val {
+                    serde_json::Value::Number(n) => {
+                        if let Some(f) = n.as_f64() {
+                            PyList::new(py, [f]).map_err(PgMlError::from)?.into_any()
+                        } else {
+                            PyList::new(py, [n.to_string()])
+                                .map_err(PgMlError::from)?
+                                .into_any()
+                        }
+                    }
+                    serde_json::Value::Bool(b) => {
+                        PyList::new(py, [*b]).map_err(PgMlError::from)?.into_any()
+                    }
+                    serde_json::Value::String(s) => PyList::new(py, [s.as_str()])
+                        .map_err(PgMlError::from)?
+                        .into_any(),
+                    _ => PyList::new(py, [val.to_string()])
+                        .map_err(PgMlError::from)?
+                        .into_any(),
+                };
+                data.set_item(col, py_val).map_err(PgMlError::from)?;
+            }
+        }
+    }
+
+    pd.call_method1("DataFrame", (data,))
+        .map_err(PgMlError::from)
+}
+
+/// Class probabilities for a row given by name, the shape `run_predict_row`
+/// takes. One probability per class, in the model's class order.
+pub fn run_predict_proba_row(
+    model_bytes: &[u8],
+    row: &serde_json::Value,
+    feature_columns: &[String],
+) -> Result<Vec<f64>, PgMlError> {
+    crate::ensure_python()?;
+
+    Python::with_gil(|py| {
+        let module = get_pycaret_module(py)?;
+        let predict_proba_fn = module.getattr("predict_proba").map_err(PgMlError::from)?;
+
+        let df = row_dataframe(py, row, feature_columns)?;
+        let py_bytes = PyBytes::new(py, model_bytes);
+
+        let result = predict_proba_fn
+            .call1((py_bytes, df))
+            .map_err(PgMlError::from)?;
+
+        let probas: Vec<Vec<f64>> = result.extract().map_err(PgMlError::from)?;
+        probas
+            .first()
+            .cloned()
+            .ok_or_else(|| PgMlError::PythonError("No probabilities returned".to_string()))
+    })
+}
+
 /// Predict from a JSONB row (preserves categorical/string feature types)
 pub fn run_predict_row(
     model_bytes: &[u8],
@@ -2566,39 +2639,7 @@ pub fn run_predict_row(
         let module = get_pycaret_module(py)?;
         let predict_fn = module.getattr("predict").map_err(PgMlError::from)?;
 
-        let pd = py.import("pandas").map_err(PgMlError::from)?;
-        let data = PyDict::new(py);
-        if let serde_json::Value::Object(map) = row {
-            for col in feature_columns {
-                if let Some(val) = map.get(col) {
-                    let py_val: Bound<'_, PyAny> = match val {
-                        serde_json::Value::Number(n) => {
-                            if let Some(f) = n.as_f64() {
-                                PyList::new(py, [f]).map_err(PgMlError::from)?.into_any()
-                            } else {
-                                PyList::new(py, [n.to_string()])
-                                    .map_err(PgMlError::from)?
-                                    .into_any()
-                            }
-                        }
-                        serde_json::Value::Bool(b) => {
-                            PyList::new(py, [*b]).map_err(PgMlError::from)?.into_any()
-                        }
-                        serde_json::Value::String(s) => PyList::new(py, [s.as_str()])
-                            .map_err(PgMlError::from)?
-                            .into_any(),
-                        _ => PyList::new(py, [val.to_string()])
-                            .map_err(PgMlError::from)?
-                            .into_any(),
-                    };
-                    data.set_item(col, py_val).map_err(PgMlError::from)?;
-                }
-            }
-        }
-
-        let df = pd
-            .call_method1("DataFrame", (data,))
-            .map_err(PgMlError::from)?;
+        let df = row_dataframe(py, row, feature_columns)?;
 
         let py_bytes = PyBytes::new(py, model_bytes);
 

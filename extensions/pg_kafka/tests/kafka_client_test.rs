@@ -18,36 +18,49 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::TopicPartitionList;
 use std::time::Duration;
 
-// Use the test broker address from common (port 19092 to avoid dev-PG conflicts)
-use common::KAFKA_ADDR as BOOTSTRAP_SERVERS;
+// The broker address from common, resolved from PG_KAFKA_PORT at runtime.
+use common::kafka_addr as bootstrap_servers;
 const TEST_TOPIC: &str = "test-topic";
 
 /// Create a producer with common configuration
 fn create_producer() -> BaseProducer {
     ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP_SERVERS)
+        .set("bootstrap.servers", bootstrap_servers())
         .set("message.timeout.ms", "5000")
         .set("debug", "broker,protocol")
         .create()
         .expect("Failed to create producer")
 }
 
+/// Client context that forwards librdkafka's `debug` log lines to stderr
+/// (visible with `--nocapture`), so protocol-level failures are diagnosable.
+struct DebugContext;
+
+impl rdkafka::client::ClientContext for DebugContext {
+    fn log(&self, level: rdkafka::config::RDKafkaLogLevel, fac: &str, log_message: &str) {
+        eprintln!("librdkafka {:?} {}: {}", level, fac, log_message);
+    }
+}
+
+impl rdkafka::consumer::ConsumerContext for DebugContext {}
+
 /// Create a consumer with common configuration
-fn create_consumer(group_id: &str) -> BaseConsumer {
+fn create_consumer(group_id: &str) -> BaseConsumer<DebugContext> {
     ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP_SERVERS)
+        .set("bootstrap.servers", bootstrap_servers())
         .set("group.id", group_id)
         .set("auto.offset.reset", "earliest")
         .set("enable.auto.commit", "false")
-        .set("debug", "broker,protocol")
-        .create()
+        .set("debug", "broker,protocol,cgrp")
+        .set_log_level(rdkafka::config::RDKafkaLogLevel::Debug)
+        .create_with_context(DebugContext)
         .expect("Failed to create consumer")
 }
 
 /// Test: Connect and get cluster metadata
 #[test]
 fn test_metadata() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let producer = create_producer();
 
     // Fetch metadata for all topics
@@ -79,7 +92,7 @@ fn test_metadata() {
     }
 
     assert!(
-        metadata.brokers().len() > 0,
+        !metadata.brokers().is_empty(),
         "Should have at least one broker"
     );
 }
@@ -87,7 +100,7 @@ fn test_metadata() {
 /// Test: Produce a single message
 #[test]
 fn test_produce_single() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let producer = create_producer();
 
     let key = "test-key-1";
@@ -108,7 +121,7 @@ fn test_produce_single() {
 /// Test: Produce multiple messages
 #[test]
 fn test_produce_batch() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let producer = create_producer();
 
     let messages = vec![
@@ -133,7 +146,7 @@ fn test_produce_batch() {
 /// Test: Consume messages from beginning
 #[test]
 fn test_consume() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-consume");
 
     // Subscribe to topic
@@ -186,7 +199,7 @@ fn test_consume() {
 /// Test: Assign specific partition and offset
 #[test]
 fn test_consume_from_offset() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-offset");
 
     // Manually assign partition 0 starting at offset 0
@@ -225,7 +238,7 @@ fn test_consume_from_offset() {
 /// consumed back, confirming end-to-end functionality.
 #[test]
 fn test_produce_consume_roundtrip() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     common::ensure_topic(TEST_TOPIC).expect("Failed to ensure topic");
 
     // Generate unique message content
@@ -316,7 +329,7 @@ fn test_produce_consume_roundtrip() {
 /// Test: Get watermark offsets (earliest and latest)
 #[test]
 fn test_watermarks() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-watermarks");
 
     match consumer.fetch_watermarks(TEST_TOPIC, 0, Duration::from_secs(30)) {
@@ -340,7 +353,7 @@ fn test_watermarks() {
 /// Note: pg_kafka may not fully support consumer group coordination yet.
 #[test]
 fn test_offset_commit_fetch() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-offset-commit");
 
     // Assign to partition 0
@@ -400,13 +413,13 @@ fn test_offset_commit_fetch() {
 /// Note: pg_kafka may not support this operation yet.
 #[test]
 fn test_list_groups() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     use rdkafka::admin::{AdminClient, AdminOptions};
     use rdkafka::client::DefaultClientContext;
 
     let admin_client: AdminClient<DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", BOOTSTRAP_SERVERS)
+        .set("bootstrap.servers", bootstrap_servers())
         .create()
         .expect("Failed to create admin client");
 
@@ -440,7 +453,7 @@ fn test_list_groups() {
 /// This test verifies that the consumer position is tracked correctly.
 #[test]
 fn test_consumer_position() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-position");
 
     // Assign to partition 0 at beginning
@@ -494,7 +507,7 @@ fn test_consumer_position() {
 /// This test verifies that seeking to a specific offset works correctly.
 #[test]
 fn test_seek_to_offset() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     let consumer = create_consumer("test-group-seek");
 
     // Assign to partition 0
@@ -605,7 +618,7 @@ fn ensure_orders_topic() {
 /// This test verifies that messages from a source table can be consumed via Kafka protocol.
 #[test]
 fn test_consume_table_backed_topic() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     ensure_orders_topic();
 
     let consumer = create_consumer("test-group-table-backed");
@@ -676,7 +689,7 @@ fn test_consume_table_backed_topic() {
 /// a Kafka consumer can fetch the new message.
 #[test]
 fn test_sql_insert_to_kafka_consumer() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     ensure_orders_topic();
 
     // First, get the current high watermark
@@ -763,7 +776,7 @@ fn test_sql_insert_to_kafka_consumer() {
 /// it doesn't receive old messages unless a new SQL insert happens.
 #[test]
 fn test_consumer_restart_no_duplicates() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     ensure_orders_topic();
 
     // Get current high watermark
@@ -849,7 +862,7 @@ fn test_consumer_restart_no_duplicates() {
 /// Run with: cargo test --test kafka_client_test test_produce_to_readonly_topic_fails -- --ignored
 #[test]
 fn test_produce_to_readonly_topic_fails() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     ensure_orders_topic();
 
     let producer = create_producer();
@@ -911,7 +924,7 @@ fn test_produce_to_readonly_topic_fails() {
 /// Run with: cargo test --test kafka_client_test test_produce_json_columns -- --ignored
 #[test]
 fn test_produce_json_columns() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     common::ensure_topic(TEST_TOPIC).expect("Failed to ensure topic");
 
     use std::process::Command;
@@ -1030,9 +1043,8 @@ fn setup_typed_topic() {
     }"#;
 
     let _ = common::run_sql(&format!(
-        "SELECT pgkafka.register_schema('{}', '{}'::jsonb, 'Order schema');",
-        format!("{}-value", TYPED_TOPIC),
-        schema
+        "SELECT pgkafka.register_schema('{}-value', '{}'::jsonb, 'Order schema');",
+        TYPED_TOPIC, schema
     ));
 
     // Get the schema ID and bind it to the topic
@@ -1054,7 +1066,7 @@ fn setup_typed_topic() {
 /// Test: Register and retrieve a schema
 #[test]
 fn test_schema_register_and_get() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     // Register a simple schema
     let schema = r#"{"type": "object", "properties": {"name": {"type": "string"}}}"#;
@@ -1088,7 +1100,7 @@ fn test_schema_register_and_get() {
 /// Test: Bind schema to topic
 #[test]
 fn test_schema_bind_to_topic() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     // Create a test topic
     let topic_name = "schema-bind-test-topic";
@@ -1146,7 +1158,7 @@ fn test_schema_bind_to_topic() {
 /// This test verifies that producing a message that conforms to the schema succeeds.
 #[test]
 fn test_produce_valid_message_to_typed_topic() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     setup_typed_topic();
 
     let producer = create_producer();
@@ -1192,7 +1204,7 @@ fn test_produce_valid_message_to_typed_topic() {
 /// is rejected when validation mode is STRICT.
 #[test]
 fn test_produce_invalid_message_to_typed_topic() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     setup_typed_topic();
 
     let producer = create_producer();
@@ -1242,7 +1254,7 @@ fn test_produce_invalid_message_to_typed_topic() {
 /// Test: Schema versioning - registering same schema returns same ID
 #[test]
 fn test_schema_versioning_idempotent() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let schema = r#"{"type": "object", "properties": {"version_test": {"type": "string"}}}"#;
     let subject = "version-test-subject";
@@ -1287,7 +1299,7 @@ fn test_schema_versioning_idempotent() {
 /// Test: Get latest schema for subject
 #[test]
 fn test_get_latest_schema() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let subject = "latest-schema-test";
 
@@ -1323,7 +1335,7 @@ fn test_get_latest_schema() {
 /// Test: Drop schema
 #[test]
 fn test_drop_schema() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     // Register a schema
     let schema = r#"{"type": "string"}"#;
@@ -1450,7 +1462,7 @@ fn setup_upsert_topic() {
 /// 4. Verify table has only one row (upsert, not duplicate)
 #[test]
 fn test_table_mode_upsert_roundtrip() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     setup_upsert_topic();
 
     let producer = create_producer();
@@ -1624,7 +1636,7 @@ fn test_table_mode_upsert_roundtrip() {
 /// while same keys update existing rows.
 #[test]
 fn test_table_mode_multiple_products() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     setup_upsert_topic();
 
     let producer = create_producer();
@@ -1717,7 +1729,7 @@ fn test_table_mode_multiple_products() {
 /// Test: Schema validation rejects invalid message in table mode
 #[test]
 fn test_table_mode_schema_validation_rejects_invalid() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
     setup_upsert_topic();
 
     let producer = create_producer();
@@ -1777,7 +1789,7 @@ fn test_table_mode_schema_validation_rejects_invalid() {
 /// 5. Binds the schema
 #[test]
 fn test_create_typed_topic_stream_mode() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1903,7 +1915,7 @@ fn test_create_typed_topic_stream_mode() {
 /// Test: Create typed topic in table mode (upsert)
 #[test]
 fn test_create_typed_topic_table_mode() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1990,7 +2002,7 @@ fn test_create_typed_topic_table_mode() {
 /// 5. Binds the schema
 #[test]
 fn test_create_typed_topic_from_table() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2109,7 +2121,7 @@ fn test_create_typed_topic_from_table() {
 /// Test: schema_from_table generates correct JSON Schema
 #[test]
 fn test_schema_from_table() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2179,7 +2191,7 @@ fn test_schema_from_table() {
 /// Test: table_from_schema creates correct table structure
 #[test]
 fn test_table_from_schema() {
-    skip_if_no_server!(common::KAFKA_ADDR);
+    skip_if_no_server!(common::kafka_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2273,4 +2285,321 @@ fn test_table_from_schema() {
 
     // Cleanup
     let _ = common::execute_sql(&format!("DROP TABLE IF EXISTS public.{};", table_name));
+}
+
+// ============================================================================
+// Consumer groups & admin APIs (#126) and pg_spi injection regression (#122)
+// ============================================================================
+
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{}", nanos, std::process::id())
+}
+
+/// Poll a consumer until `wanted` messages arrive or `timeout` elapses.
+fn poll_messages(
+    consumer: &BaseConsumer<DebugContext>,
+    wanted: usize,
+    timeout: Duration,
+) -> Vec<(i64, String)> {
+    let start = std::time::Instant::now();
+    let mut got = Vec::new();
+    while got.len() < wanted && start.elapsed() < timeout {
+        match consumer.poll(Duration::from_secs(1)) {
+            Some(Ok(msg)) => {
+                let value = msg
+                    .payload()
+                    .map(|v| String::from_utf8_lossy(v).to_string())
+                    .unwrap_or_default();
+                got.push((msg.offset(), value));
+            }
+            Some(Err(e)) => println!("poll error: {}", e),
+            None => {}
+        }
+    }
+    got
+}
+
+/// Test (#126): a consumer-group subscription (JoinGroup/SyncGroup/Heartbeat)
+/// delivers messages, OffsetCommit/OffsetFetch persist the position, and a
+/// second consumer in the same group resumes from the committed offset.
+#[test]
+fn test_consumer_group_subscribe_commit_resume() {
+    skip_if_no_server!(common::kafka_addr());
+    let topic = format!("cg-topic-{}", unique_suffix());
+    let group = format!("cg-group-{}", unique_suffix());
+    common::ensure_topic(&topic).expect("Failed to ensure topic");
+
+    // Produce three messages.
+    let producer = create_producer();
+    for i in 0..3 {
+        let value = format!("cg-msg-{}", i);
+        producer
+            .send(BaseRecord::to(&topic).key("k").payload(&value))
+            .expect("Failed to enqueue");
+    }
+    producer
+        .flush(Duration::from_secs(30))
+        .expect("Failed to flush");
+
+    // First consumer: subscribe (group protocol), consume, commit.
+    let consumer = create_consumer(&group);
+    consumer.subscribe(&[&topic]).expect("Failed to subscribe");
+    let got = poll_messages(&consumer, 3, Duration::from_secs(60));
+    assert_eq!(
+        got.len(),
+        3,
+        "consumer group should deliver all 3 messages, got {:?}",
+        got
+    );
+    let last_offset = got.iter().map(|(o, _)| *o).max().unwrap();
+    println!("consumer 1 received {:?}", got);
+
+    consumer
+        .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+        .expect("OffsetCommit failed");
+
+    // NOTE: a TopicPartitionList holds librdkafka partition references;
+    // it must be dropped before the consumer or destroy() blocks forever.
+    let committed_offset = {
+        let committed = consumer
+            .committed(Duration::from_secs(30))
+            .expect("OffsetFetch failed");
+        committed
+            .find_partition(&topic, 0)
+            .expect("committed offsets should include our partition")
+            .offset()
+    };
+    assert_eq!(
+        committed_offset,
+        rdkafka::Offset::Offset(last_offset + 1),
+        "committed offset should be last consumed + 1"
+    );
+
+    // The group is visible to admin tooling (ListGroups / DescribeGroups).
+    let groups = consumer
+        .fetch_group_list(Some(&group), Duration::from_secs(30))
+        .expect("ListGroups/DescribeGroups failed");
+    let info = groups
+        .groups()
+        .iter()
+        .find(|g| g.name() == group)
+        .expect("our group should be listed");
+    assert_eq!(info.state(), "Stable", "group should be Stable");
+    assert_eq!(info.members().len(), 1, "group should have one member");
+    assert_eq!(info.protocol_type(), "consumer");
+
+    // Leave the group.
+    consumer.unsubscribe();
+    drop(consumer);
+
+    // Produce one more message, then a fresh consumer in the same group must
+    // resume from the committed offset and see only the new message.
+    let value = "cg-msg-after-commit";
+    producer
+        .send(BaseRecord::to(&topic).key("k").payload(value))
+        .expect("Failed to enqueue");
+    producer
+        .flush(Duration::from_secs(30))
+        .expect("Failed to flush");
+
+    let consumer2 = create_consumer(&group);
+    consumer2.subscribe(&[&topic]).expect("Failed to subscribe");
+    let got2 = poll_messages(&consumer2, 1, Duration::from_secs(60));
+    assert_eq!(
+        got2.len(),
+        1,
+        "second consumer should get exactly the new message"
+    );
+    assert_eq!(got2[0].0, last_offset + 1);
+    assert_eq!(got2[0].1, value);
+    consumer2.unsubscribe();
+
+    let _ = common::execute_sql(&format!("SELECT pgkafka.drop_topic('{}');", topic));
+}
+
+/// Test (#126): two consumers in one group rebalance; exactly one owns the
+/// single partition and the other gets an empty assignment.
+#[test]
+fn test_consumer_group_two_members_rebalance() {
+    skip_if_no_server!(common::kafka_addr());
+    let topic = format!("cg2-topic-{}", unique_suffix());
+    let group = format!("cg2-group-{}", unique_suffix());
+    common::ensure_topic(&topic).expect("Failed to ensure topic");
+
+    let c1 = create_consumer(&group);
+    c1.subscribe(&[&topic]).expect("subscribe 1");
+    // Drive the first join to completion.
+    let _ = poll_messages(&c1, 1, Duration::from_secs(5));
+
+    let c2 = create_consumer(&group);
+    c2.subscribe(&[&topic]).expect("subscribe 2");
+
+    // Poll both until the group settles with two members.
+    let start = std::time::Instant::now();
+    let mut settled = false;
+    while start.elapsed() < Duration::from_secs(90) {
+        let _ = c1.poll(Duration::from_millis(200));
+        let _ = c2.poll(Duration::from_millis(200));
+        let groups = c1
+            .fetch_group_list(Some(&group), Duration::from_secs(10))
+            .expect("fetch_group_list");
+        if let Some(g) = groups.groups().iter().find(|g| g.name() == group) {
+            if g.state() == "Stable" && g.members().len() == 2 {
+                settled = true;
+                break;
+            }
+        }
+    }
+    assert!(settled, "group should become Stable with two members");
+
+    // The broker is Stable, but each client only applies its SyncGroup
+    // response on its next poll, so keep polling until the assignments show.
+    // Partition lists must not outlive the consumers (see above).
+    let start = std::time::Instant::now();
+    let (mut n1, mut n2) = (0, 0);
+    while start.elapsed() < Duration::from_secs(30) {
+        let _ = c1.poll(Duration::from_millis(200));
+        let _ = c2.poll(Duration::from_millis(200));
+        (n1, n2) = {
+            let a1 = c1.assignment().expect("assignment 1");
+            let a2 = c2.assignment().expect("assignment 2");
+            (a1.count(), a2.count())
+        };
+        if n1 + n2 == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        n1 + n2,
+        1,
+        "exactly one member owns the single partition (got {} + {})",
+        n1,
+        n2
+    );
+
+    c1.unsubscribe();
+    c2.unsubscribe();
+    let _ = common::execute_sql(&format!("SELECT pgkafka.drop_topic('{}');", topic));
+}
+
+/// Test (#126): CreateTopics / DeleteTopics via the admin API.
+#[test]
+fn test_admin_create_and_delete_topics() {
+    skip_if_no_server!(common::kafka_addr());
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+    use rdkafka::types::RDKafkaErrorCode;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap_servers())
+        .create()
+        .expect("Failed to create admin client");
+    let opts = AdminOptions::new().request_timeout(Some(Duration::from_secs(30)));
+    let name = format!("admin-topic-{}", unique_suffix());
+
+    let results = rt
+        .block_on(admin.create_topics(
+            &[NewTopic::new(&name, 1, TopicReplication::Fixed(1))],
+            &opts,
+        ))
+        .expect("CreateTopics request failed");
+    assert_eq!(
+        results[0].as_deref(),
+        Ok(name.as_str()),
+        "topic should be created"
+    );
+
+    let count = common::run_sql(&format!(
+        "SELECT COUNT(*)::bigint FROM pgkafka.topics WHERE name = '{}';",
+        name
+    ))
+    .expect("SQL failed");
+    assert_eq!(count.trim(), "1", "topic row should exist");
+
+    // Creating it again reports TOPIC_ALREADY_EXISTS.
+    let results = rt
+        .block_on(admin.create_topics(
+            &[NewTopic::new(&name, 1, TopicReplication::Fixed(1))],
+            &opts,
+        ))
+        .expect("CreateTopics request failed");
+    assert_eq!(
+        results[0].as_ref().unwrap_err().1,
+        RDKafkaErrorCode::TopicAlreadyExists
+    );
+
+    // More than one partition is rejected honestly.
+    let multi = format!("{}-multi", name);
+    let results = rt
+        .block_on(admin.create_topics(
+            &[NewTopic::new(&multi, 3, TopicReplication::Fixed(1))],
+            &opts,
+        ))
+        .expect("CreateTopics request failed");
+    assert_eq!(
+        results[0].as_ref().unwrap_err().1,
+        RDKafkaErrorCode::InvalidPartitions
+    );
+
+    let results = rt
+        .block_on(admin.delete_topics(&[&name], &opts))
+        .expect("DeleteTopics request failed");
+    assert_eq!(
+        results[0].as_deref(),
+        Ok(name.as_str()),
+        "topic should be deleted"
+    );
+    let count = common::run_sql(&format!(
+        "SELECT COUNT(*)::bigint FROM pgkafka.topics WHERE name = '{}';",
+        name
+    ))
+    .expect("SQL failed");
+    assert_eq!(count.trim(), "0", "topic row should be gone");
+
+    // Deleting an unknown topic reports UNKNOWN_TOPIC_OR_PARTITION.
+    let results = rt
+        .block_on(admin.delete_topics(&[&name], &opts))
+        .expect("DeleteTopics request failed");
+    assert_eq!(
+        results[0].as_ref().unwrap_err().1,
+        RDKafkaErrorCode::UnknownTopicOrPartition
+    );
+}
+
+/// Regression (#122 / #120): message key/value text containing `$N`
+/// placeholder tokens and quotes must be stored verbatim — never
+/// re-substituted into the INSERT.
+#[test]
+fn test_produce_dollar_placeholder_stored_literally() {
+    skip_if_no_server!(common::kafka_addr());
+    common::ensure_topic(TEST_TOPIC).expect("Failed to ensure topic");
+
+    let key = format!("$1-{}", unique_suffix());
+    let value = "$2 '||version()||' $1 \\x00 -- ; DROP TABLE pgkafka.topics";
+    let producer = create_producer();
+    producer
+        .send(BaseRecord::to(TEST_TOPIC).key(&key).payload(value))
+        .expect("Failed to enqueue");
+    producer
+        .flush(Duration::from_secs(30))
+        .expect("Failed to flush");
+
+    let stored = common::run_sql(&format!(
+        "SELECT value_text FROM pgkafka.messages m JOIN pgkafka.topics t ON m.topic_id = t.id \
+         WHERE t.name = '{}' AND key_text = '{}' ORDER BY offset_id DESC LIMIT 1;",
+        TEST_TOPIC,
+        key.replace('\'', "''")
+    ))
+    .expect("SQL failed");
+    assert_eq!(stored, value, "value must round-trip as a literal");
+
+    // And the schema is intact.
+    let topics =
+        common::run_sql("SELECT COUNT(*)::bigint FROM pgkafka.topics;").expect("SQL failed");
+    assert!(topics.trim().parse::<i64>().unwrap() >= 1);
 }

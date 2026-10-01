@@ -81,9 +81,34 @@ impl SpiBridge {
     }
 
     /// Execute a query that doesn't return results
+    /// Execute a statement, discarding both results and the affected-row count.
+    ///
+    /// Use [`SpiBridge::execute_affected`] when you need to know how many rows
+    /// the statement actually touched.
     pub async fn execute(&self, sql: &str, params: Vec<SpiParam>) -> Result<(), SpiError> {
         self.query(sql, params, vec![]).await?;
         Ok(())
+    }
+
+    /// Execute a statement and return the number of rows it affected.
+    ///
+    /// This is PostgreSQL's `SPI_processed` — see [`SpiResult::rows_affected`].
+    /// A non-RETURNING INSERT/UPDATE/DELETE returns no tuples at all, so
+    /// `SpiResult::rows` is empty and cannot answer "did this match anything?".
+    /// Callers implementing an optimistic-locking ladder (0 affected rows ==
+    /// stale version) must use this rather than [`SpiBridge::execute`].
+    ///
+    /// Kept as a separate method rather than changing `execute`'s return type:
+    /// several consumers (`pg_mqtt`, `pg_s3`) use `execute(..).await` as the
+    /// tail expression of a `-> Result<(), SpiError>` function, so widening the
+    /// return type would break them for no benefit.
+    pub async fn execute_affected(
+        &self,
+        sql: &str,
+        params: Vec<SpiParam>,
+    ) -> Result<u64, SpiError> {
+        let result = self.query(sql, params, vec![]).await?;
+        Ok(result.rows_affected)
     }
 }
 
@@ -176,6 +201,7 @@ mod tests {
             rows: vec![SpiRow {
                 columns: vec![SpiValue::Int32(1)],
             }],
+            rows_affected: 1,
         };
         let _ = request.response_tx.send(Ok(result));
 

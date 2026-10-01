@@ -7,7 +7,23 @@ pub fn create_machine(
     name: &str,
     initial_state: &str,
     description: default!(Option<&str>, "NULL"),
+    if_not_exists: default!(Option<bool>, "false"),
 ) -> i32 {
+    // Idempotent seeding: return the existing machine's id instead of raising on
+    // a duplicate name. Lets an extension re-run its install seeds (e.g. after a
+    // DROP EXTENSION left pgfsm rows orphaned) without erroring.
+    if if_not_exists.unwrap_or(false) {
+        if let Some(existing) = Spi::get_one_with_args::<i32>(
+            "SELECT id FROM pgfsm.machine WHERE name = $1",
+            &[name.into()],
+        )
+        .ok()
+        .flatten()
+        {
+            return existing;
+        }
+    }
+
     // Insert the machine
     let machine_id = Spi::get_one_with_args::<i32>(
         r#"
@@ -40,15 +56,27 @@ pub fn add_state(
     state_name: &str,
     is_final: default!(Option<bool>, "false"),
     description: default!(Option<&str>, "NULL"),
+    if_not_exists: default!(Option<bool>, "false"),
 ) {
     let machine_id = get_machine_id(machine_name);
     let is_final = is_final.unwrap_or(false);
 
-    Spi::run_with_args(
+    // Idempotent seeding: skip a state that already exists (UNIQUE(machine_id, name)).
+    let sql = if if_not_exists.unwrap_or(false) {
         r#"
         INSERT INTO pgfsm.state (machine_id, name, is_final, description)
         VALUES ($1, $2, $3, $4)
-        "#,
+        ON CONFLICT (machine_id, name) DO NOTHING
+        "#
+    } else {
+        r#"
+        INSERT INTO pgfsm.state (machine_id, name, is_final, description)
+        VALUES ($1, $2, $3, $4)
+        "#
+    };
+
+    Spi::run_with_args(
+        sql,
         &[
             machine_id.into(),
             state_name.into(),
@@ -73,8 +101,37 @@ pub fn add_transition(
     variant: default!(Option<&str>, "NULL"),
     sort_order: default!(Option<i32>, "0"),
     confirm_required: default!(Option<bool>, "false"),
+    if_not_exists: default!(Option<bool>, "false"),
 ) -> i32 {
     let machine_id = get_machine_id(machine_name);
+
+    // Idempotent seeding: a re-run must not create a duplicate transition. The
+    // unique key includes the auto-assigned priority, so ON CONFLICT can't catch
+    // a re-seed — match the logical transition (from, to, event, guard) instead
+    // and return the existing id.
+    if if_not_exists.unwrap_or(false) {
+        if let Some(existing) = Spi::get_one_with_args::<i32>(
+            r#"
+            SELECT id FROM pgfsm.transition
+            WHERE machine_id = $1 AND from_state = $2 AND to_state = $3
+              AND event = $4 AND guard IS NOT DISTINCT FROM $5
+            ORDER BY id
+            LIMIT 1
+            "#,
+            &[
+                machine_id.into(),
+                from_state.into(),
+                to_state.into(),
+                event.into(),
+                guard.into(),
+            ],
+        )
+        .ok()
+        .flatten()
+        {
+            return existing;
+        }
+    }
 
     // Validate from_state exists
     validate_state_exists(machine_id, from_state);

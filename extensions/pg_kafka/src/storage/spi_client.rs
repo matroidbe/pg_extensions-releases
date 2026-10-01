@@ -101,7 +101,7 @@ pub struct MessageToStore {
 
 /// SPI-based storage client
 pub struct SpiStorageClient {
-    bridge: Arc<SpiBridge>,
+    pub(crate) bridge: Arc<SpiBridge>,
 }
 
 impl SpiStorageClient {
@@ -726,7 +726,7 @@ mod tests {
 
     fn make_message(key: Option<&[u8]>, value: &[u8]) -> MessageToStore {
         MessageToStore {
-            key: key.map(|k| Bytes::copy_from_slice(k)),
+            key: key.map(Bytes::copy_from_slice),
             key_text: key.and_then(|k| std::str::from_utf8(k).ok().map(|s| s.to_string())),
             key_json: None,
             value: Bytes::copy_from_slice(value),

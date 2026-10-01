@@ -1,6 +1,6 @@
 [package]
 name = "pg_prob"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,6 +27,9 @@ pgrx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# Pure distribution core (shared with non-PG consumers, e.g. Eidos SQLite mode)
+prob_core = { path = "../../crates/prob_core" }
 
 # For random sampling (pure Rust, no Python needed for basics)
 rand = "0.8"

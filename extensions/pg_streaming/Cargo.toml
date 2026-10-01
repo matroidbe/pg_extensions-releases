@@ -1,6 +1,6 @@
 [package]
 name = "pg_streaming"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -55,6 +55,9 @@ glob = "0.3"
 uuid = { version = "1", features = ["v7"] }
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
+rust7 = "0.1"
+hex.workspace = true
 url = { workspace = true }
 async-stream = "0.3"
 pg_spi = { git = "https://github.com/matroidbe/pg_extensions", default-features = false }
@@ -68,3 +71,5 @@ pgx_zarr_walker = { path = "../../crates/pgx_zarr_walker" }
 pgrx-tests = "0.16"
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-postgres.workspace = true
+# tcp-server enables the in-process mock Modbus server used in tests.
+tokio-modbus = { version = "0.17", default-features = false, features = ["tcp", "tcp-server"] }

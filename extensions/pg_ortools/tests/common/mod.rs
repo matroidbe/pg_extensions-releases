@@ -60,10 +60,8 @@ pub fn query_one(sql: &str) -> Result<Option<String>, String> {
             Some(v.to_string())
         } else if let Ok(v) = row.try_get::<_, bool>(0) {
             Some(v.to_string())
-        } else if let Ok(v) = row.try_get::<_, String>(0) {
-            Some(v)
         } else {
-            None
+            row.try_get::<_, String>(0).ok()
         };
         Ok(val)
     })

@@ -7,7 +7,12 @@ use pg_observability::{
 use std::io::Cursor;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use super::admin::{handle_create_topics, handle_delete_topics};
 use super::codec::*;
+use super::groups::{
+    handle_describe_groups, handle_heartbeat, handle_join_group, handle_leave_group,
+    handle_list_groups, handle_offset_commit, handle_offset_fetch, handle_sync_group,
+};
 use super::records::{create_record_batch, decode_record_batch, encode_record_batch};
 use super::types::*;
 use crate::storage::parse::parse_bytes;
@@ -743,32 +748,42 @@ pub async fn handle_list_offsets(
 }
 
 /// Route a request to the appropriate handler
+///
+/// The match on [`ApiKey`] is exhaustive on purpose: every API we advertise
+/// in ApiVersions has a handler here (see #126). An API key we do not know
+/// at all is rejected with `UNSUPPORTED_VERSION`, which is what a real broker
+/// returns for an unsupported request type.
 pub async fn handle_request(
     header: &RequestHeader,
     body: &mut Cursor<&[u8]>,
     broker_host: &str,
     broker_port: i32,
+    peer_host: &str,
     storage: &SpiStorageClient,
 ) -> Result<BytesMut, ProtocolError> {
-    let api_key = ApiKey::from_i16(header.api_key);
+    let Some(api_key) = ApiKey::from_i16(header.api_key) else {
+        let mut buf = BytesMut::with_capacity(16);
+        write_i16(&mut buf, ErrorCode::UnsupportedVersion as i16);
+        return Ok(buf);
+    };
 
     match api_key {
-        Some(ApiKey::ApiVersions) => handle_api_versions(header, body),
-        Some(ApiKey::Metadata) => {
-            handle_metadata(header, body, broker_host, broker_port, storage).await
-        }
-        Some(ApiKey::Produce) => handle_produce(header, body, storage).await,
-        Some(ApiKey::Fetch) => handle_fetch(header, body, storage).await,
-        Some(ApiKey::ListOffsets) => handle_list_offsets(header, body, storage).await,
-        Some(ApiKey::FindCoordinator) => {
-            handle_find_coordinator(header, body, broker_host, broker_port)
-        }
-        _ => {
-            // Unsupported API - return error
-            let mut buf = BytesMut::with_capacity(16);
-            write_i16(&mut buf, ErrorCode::InvalidRequest as i16);
-            Ok(buf)
-        }
+        ApiKey::ApiVersions => handle_api_versions(header, body),
+        ApiKey::Metadata => handle_metadata(header, body, broker_host, broker_port, storage).await,
+        ApiKey::Produce => handle_produce(header, body, storage).await,
+        ApiKey::Fetch => handle_fetch(header, body, storage).await,
+        ApiKey::ListOffsets => handle_list_offsets(header, body, storage).await,
+        ApiKey::FindCoordinator => handle_find_coordinator(header, body, broker_host, broker_port),
+        ApiKey::OffsetCommit => handle_offset_commit(header, body, storage).await,
+        ApiKey::OffsetFetch => handle_offset_fetch(header, body, storage).await,
+        ApiKey::JoinGroup => handle_join_group(header, body, peer_host, storage).await,
+        ApiKey::Heartbeat => handle_heartbeat(header, body, storage).await,
+        ApiKey::LeaveGroup => handle_leave_group(header, body, storage).await,
+        ApiKey::SyncGroup => handle_sync_group(header, body, storage).await,
+        ApiKey::DescribeGroups => handle_describe_groups(header, body, storage).await,
+        ApiKey::ListGroups => handle_list_groups(header, body, storage).await,
+        ApiKey::CreateTopics => handle_create_topics(header, body, storage).await,
+        ApiKey::DeleteTopics => handle_delete_topics(header, body, storage).await,
     }
 }
 
@@ -956,7 +971,7 @@ mod tests {
         write_i16(&mut buf, 0); // error code
         write_i64(&mut buf, 100); // base offset
 
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 
     #[test]
@@ -976,6 +991,6 @@ mod tests {
         write_i64(&mut buf, 100); // high watermark
         write_i32(&mut buf, 0); // empty records
 
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
     }
 }

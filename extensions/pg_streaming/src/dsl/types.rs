@@ -3,7 +3,7 @@
 //! These types map directly to the JSON DSL described in design/pg_streaming/dsl.md
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Top-level pipeline definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +51,12 @@ pub enum InputConfig {
     /// page_number, link_header. Auth: none, basic, bearer, api_key_header.
     /// See `crate::connector::input::http_paginated::HttpPaginatedConfig`.
     HttpPaginated(serde_json::Value),
+    /// Modbus TCP polling source. Config passed through; see
+    /// `crate::connector::input::modbus::ModbusSourceConfig`.
+    Modbus(serde_json::Value),
+    /// Siemens S7 polling source. Config passed through; see
+    /// `crate::connector::input::s7::S7SourceConfig`.
+    S7(serde_json::Value),
     /// Reference to a custom source registered via `pg_streaming_sdk`.
     Custom(CustomConnectorConfig),
     // Future phases: Webhook, Ldes, Mqtt, Broker, Generate
@@ -133,6 +139,14 @@ pub enum OutputConfig {
     /// OpenDAL-backed sink. Config passed through; see
     /// `crate::connector::output::opendal_sink::OpendalSinkConfig`.
     Opendal(serde_json::Value),
+    /// Modbus TCP write sink. Config passed through; see
+    /// `crate::connector::output::modbus::ModbusSinkConfig`.
+    Modbus(serde_json::Value),
+    /// Siemens S7 write sink. Config passed through; see
+    /// `crate::connector::output::s7::S7SinkConfig`.
+    S7(serde_json::Value),
+    /// Lands each record by calling a PostgreSQL function.
+    Call(CallOutputConfig),
     /// Reference to a custom sink registered via `pg_streaming_sdk`.
     Custom(CustomConnectorConfig),
     // Future phases: Http, Mqtt, Broker
@@ -170,6 +184,63 @@ pub struct TableOutputConfig {
 
 fn default_write_mode() -> String {
     "append".to_string()
+}
+
+/// Call output connector — lands each record through a PostgreSQL function
+/// instead of writing a table directly. See design/pg_streaming/call-sink.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallOutputConfig {
+    /// Schema-qualified function name (e.g. `myschema.ingest_order`)
+    pub function: String,
+    /// SQL expressions evaluated per record, one per function argument.
+    /// The bare word `record` passes the whole record as `jsonb`.
+    #[serde(default = "default_call_args")]
+    pub args: Vec<String>,
+    /// Session settings applied before each call via
+    /// `set_config(key, value, true)` — transaction-local.
+    /// BTreeMap so the generated SQL is deterministic.
+    #[serde(default)]
+    pub set_config: BTreeMap<String, String>,
+    /// Database role assumed for each call, via `SET LOCAL ROLE`. Applied
+    /// alongside `set_config` and reset after the call returns.
+    ///
+    /// Needed because neither side can do it instead: PostgreSQL forbids
+    /// `SET ROLE` inside a `SECURITY DEFINER` function, and making the called
+    /// function `SECURITY DEFINER` to dodge that would bypass the row-level
+    /// security it was supposed to be subject to. Without this the write runs
+    /// as the worker's own role, which silently bypasses RLS if that role owns
+    /// the target tables.
+    #[serde(default)]
+    pub set_role: Option<String>,
+    /// What to do when the called function raises: `dead_letter`, `skip`, `fail`.
+    #[serde(default)]
+    pub on_record_error: OnRecordError,
+    /// Reserved: pass the whole batch as `jsonb[]` in one call. Not implemented.
+    #[serde(default)]
+    pub batch: bool,
+}
+
+fn default_call_args() -> Vec<String> {
+    vec!["record".to_string()]
+}
+
+/// Per-record error strategy for the `call` output connector.
+///
+/// Distinct from pipeline-level [`ErrorHandling`], which governs the processor
+/// chain and is batch-granular. This one governs failures *inside* the called
+/// function and is per-record.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRecordError {
+    /// Roll back the record's subtransaction, log it, and hand it to the
+    /// pipeline's dead-letter output. Continue with the next record.
+    #[default]
+    DeadLetter,
+    /// Roll back the record's subtransaction, log it, continue.
+    Skip,
+    /// Let the error propagate and abort the batch. Takes no subtransaction,
+    /// so this is the cheapest path at high throughput.
+    Fail,
 }
 
 /// Drop output (discard all records)
@@ -975,6 +1046,93 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_modbus_input() {
+        let json = r#"{
+            "input": {"modbus": {
+                "host": "10.0.0.5",
+                "unit": 2,
+                "poll": "1s",
+                "reads": [
+                    {"name": "temperature", "kind": "holding", "address": 100, "data_type": "f32"}
+                ]
+            }},
+            "pipeline": {"processors": []},
+            "output": {"drop": {}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.input {
+            InputConfig::Modbus(v) => {
+                assert_eq!(v["host"], "10.0.0.5");
+                assert_eq!(v["unit"], 2);
+                assert_eq!(v["reads"][0]["name"], "temperature");
+            }
+            _ => panic!("expected modbus input"),
+        }
+    }
+
+    #[test]
+    fn test_parse_s7_input() {
+        let json = r#"{
+            "input": {"s7": {
+                "host": "192.168.0.100",
+                "model": "s7-1200",
+                "reads": [
+                    {"name": "speed", "area": "db", "db": 100, "offset": 2, "type": "int"}
+                ]
+            }},
+            "pipeline": {"processors": []},
+            "output": {"drop": {}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.input {
+            InputConfig::S7(v) => {
+                assert_eq!(v["host"], "192.168.0.100");
+                assert_eq!(v["reads"][0]["type"], "int");
+            }
+            _ => panic!("expected s7 input"),
+        }
+    }
+
+    #[test]
+    fn test_parse_modbus_output() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"modbus": {
+                "host": "10.0.0.5",
+                "writes": [{"field": "setpoint", "kind": "holding", "address": 40}]
+            }}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::Modbus(v) => {
+                assert_eq!(v["host"], "10.0.0.5");
+                assert_eq!(v["writes"][0]["field"], "setpoint");
+            }
+            _ => panic!("expected modbus output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_s7_output() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"s7": {
+                "host": "192.168.0.100",
+                "writes": [{"field": "setpoint", "area": "db", "db": 100, "offset": 8, "type": "real"}]
+            }}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::S7(v) => {
+                assert_eq!(v["writes"][0]["area"], "db");
+            }
+            _ => panic!("expected s7 output"),
+        }
+    }
+
+    #[test]
     fn test_parse_custom_input() {
         let json = r#"{
             "input": {"custom": {"name": "acme_proto", "config": {"endpoint": "x"}}},
@@ -1053,5 +1211,88 @@ mod tests {
             }
             _ => panic!("expected cep"),
         }
+    }
+
+    // =========================================================================
+    // call output connector
+    // =========================================================================
+
+    #[test]
+    fn test_parse_call_output_defaults() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"call": {"function": "myschema.ingest_order"}}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::Call(c) => {
+                assert_eq!(c.function, "myschema.ingest_order");
+                assert_eq!(c.args, vec!["record".to_string()]);
+                assert!(c.set_config.is_empty());
+                assert_eq!(c.on_record_error, OnRecordError::DeadLetter);
+                assert!(!c.batch);
+            }
+            _ => panic!("expected call output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_call_output_full() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"call": {
+                "function": "app.ingest",
+                "args": ["record", "value_json->>'id'"],
+                "set_config": {"app.user_role": "ingest_service"},
+                "on_record_error": "skip"
+            }}
+        }"#;
+        let def: PipelineDefinition = serde_json::from_str(json).unwrap();
+        match &def.output {
+            OutputConfig::Call(c) => {
+                assert_eq!(c.args.len(), 2);
+                assert_eq!(
+                    c.set_config.get("app.user_role").map(String::as_str),
+                    Some("ingest_service")
+                );
+                assert_eq!(c.on_record_error, OnRecordError::Skip);
+            }
+            _ => panic!("expected call output"),
+        }
+    }
+
+    #[test]
+    fn test_parse_call_output_on_record_error_variants() {
+        for (text, expected) in [
+            ("dead_letter", OnRecordError::DeadLetter),
+            ("skip", OnRecordError::Skip),
+            ("fail", OnRecordError::Fail),
+        ] {
+            let json = format!(
+                r#"{{
+                    "input": {{"kafka": {{"topic": "t"}}}},
+                    "pipeline": {{"processors": []}},
+                    "output": {{"call": {{"function": "f", "on_record_error": "{}"}}}}
+                }}"#,
+                text
+            );
+            let def: PipelineDefinition = serde_json::from_str(&json).unwrap();
+            match &def.output {
+                OutputConfig::Call(c) => assert_eq!(c.on_record_error, expected),
+                _ => panic!("expected call output"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_call_output_requires_function() {
+        let json = r#"{
+            "input": {"kafka": {"topic": "t"}},
+            "pipeline": {"processors": []},
+            "output": {"call": {"args": ["record"]}}
+        }"#;
+        assert!(serde_json::from_str::<PipelineDefinition>(json).is_err());
     }
 }

@@ -1,0 +1,50 @@
+# Native libraries pg_solid needs at build time.
+#
+# Consumed by pgbrew (`pgx install`, `pgx doctor <path>`), which probes for each
+# dependency before building, reports the exact install command for the
+# platform when one is missing, and exports the discovered location into the
+# build so build.rs can find it.
+#
+# Nothing here is required to build pg_solid by hand — `cargo build` probes for
+# OCCT on its own (see build.rs). This file exists so a package manager can
+# diagnose and install the dependency instead of letting the compile fail.
+
+[[system_dependencies]]
+name = "opencascade"
+header = "opencascade/Standard_Version.hxx"
+library = "TKernel"
+
+# 7.6 is the oldest release pg_solid supports. Ubuntu 24.04 LTS and Debian 12
+# ship 7.6; Debian 13 and Homebrew ship 7.8+. build.rs adapts to both — the
+# DataExchange toolkits were renamed in 7.8, and STEPControl_Writer::WriteStream
+# only exists from 7.8 onward.
+min_version = "7.6"
+
+brew_formula = "opencascade"
+
+# If any of these are already set, the user has pointed the build at a specific
+# installation; pgbrew defers to that rather than probing. Same variables
+# build.rs itself honours.
+env_vars = ["OCCT_ROOT", "OCCT_INCLUDE_DIR", "CASROOT"]
+
+# OCCT publishes its version as integer macros in Standard_Version.hxx.
+[system_dependencies.version]
+major = "OCC_VERSION_MAJOR"
+minor = "OCC_VERSION_MINOR"
+patch = "OCC_VERSION_MAINTENANCE"
+
+# Hand the discovered prefix to build.rs. Only set when the user has not already
+# chosen one.
+[system_dependencies.env]
+OCCT_ROOT = "{prefix}"
+
+[system_dependencies.packages]
+apt = [
+    "libocct-foundation-dev",
+    "libocct-modeling-data-dev",
+    "libocct-modeling-algorithms-dev",
+    "libocct-data-exchange-dev",
+]
+dnf = ["opencascade-devel"]
+pacman = ["opencascade"]
+brew = ["opencascade"]

@@ -372,7 +372,8 @@ mod tests {
 
     #[test]
     fn test_real() {
-        assert_eq!(tokens(b"3.14159"), vec![Token::Real(3.14159)]);
+        // Avoid digits of PI/E here — clippy::approx_constant flags them.
+        assert_eq!(tokens(b"12.34567"), vec![Token::Real(12.34567)]);
     }
 
     #[test]

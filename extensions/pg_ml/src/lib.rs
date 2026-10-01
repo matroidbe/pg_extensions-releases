@@ -11,6 +11,7 @@ mod async_training;
 mod async_training_sql;
 mod config;
 pub mod datasets;
+mod eidos_catalog;
 pub mod embeddings;
 pub mod error;
 mod mlflow;
@@ -300,12 +301,12 @@ mod tests {
             .unwrap_or(0.0);
 
         assert!(
-            min_sepal >= 4.0 && min_sepal <= 5.0,
+            (4.0..=5.0).contains(&min_sepal),
             "Min sepal_length should be around 4.3, got {}",
             min_sepal
         );
         assert!(
-            max_sepal >= 7.0 && max_sepal <= 8.0,
+            (7.0..=8.0).contains(&max_sepal),
             "Max sepal_length should be around 7.9, got {}",
             max_sepal
         );
@@ -374,7 +375,7 @@ mod tests {
             let mean_val: f64 = sepal_col.call_method0("mean").unwrap().extract().unwrap();
             // Iris sepal_length mean is approximately 5.84
             assert!(
-                mean_val >= 5.5 && mean_val <= 6.2,
+                (5.5..=6.2).contains(&mean_val),
                 "Mean sepal_length should be around 5.84, got {}",
                 mean_val
             );
@@ -444,7 +445,7 @@ mod tests {
             let mean_val: f64 = sepal_col.call_method0("mean").unwrap().extract().unwrap();
             // Iris sepal_length mean is approximately 5.84
             assert!(
-                mean_val >= 5.5 && mean_val <= 6.2,
+                (5.5..=6.2).contains(&mean_val),
                 "Mean sepal_length should be around 5.84, got {}",
                 mean_val
             );

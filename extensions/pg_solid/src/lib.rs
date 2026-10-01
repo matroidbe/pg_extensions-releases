@@ -1,5 +1,6 @@
 pgrx::pg_module_magic!();
 
+mod eidos_catalog;
 mod ffi;
 mod functions;
 mod gist;

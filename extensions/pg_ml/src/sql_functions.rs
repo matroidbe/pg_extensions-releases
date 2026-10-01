@@ -812,6 +812,25 @@ pub fn predict_row(project_name: &str, row: pgrx::JsonB) -> String {
     }
 }
 
+/// Class probabilities for a row given **by name**, the shape `predict_row`
+/// takes: `{"col": value, ...}`. Prefer this over the positional
+/// `predict_proba` — an array is silently wrong the moment a feature column is
+/// added or reordered.
+/// Usage: SELECT pgml.predict_proba_row('my_project', '{"amount": 100, "channel": "web"}'::jsonb)
+#[pg_extern]
+pub fn predict_proba_row(project_name: &str, row: pgrx::JsonB) -> Vec<f64> {
+    let deployed = match models::get_deployed_model(project_name) {
+        Ok(Some(m)) => m,
+        Ok(None) => pgrx::error!("No deployed model found for project '{}'", project_name),
+        Err(e) => pgrx::error!("Model not found: {}", e),
+    };
+
+    match pycaret::run_predict_proba_row(&deployed.model_bytes, &row.0, &deployed.feature_columns) {
+        Ok(probas) => probas,
+        Err(e) => pgrx::error!("Prediction failed: {}", e),
+    }
+}
+
 /// Get class probabilities using deployed model
 #[pg_extern]
 pub fn predict_proba(project_name: &str, features: Vec<f64>) -> Vec<f64> {
