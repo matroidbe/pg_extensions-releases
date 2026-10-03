@@ -39,11 +39,12 @@ static TRAINING_WORKER_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool
 /// Job polling interval in milliseconds
 static TRAINING_POLL_INTERVAL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1000);
 
-/// Database name for worker to connect to
+/// Database the worker connects to (`pg_ml.database`)
+static DATABASE: pgrx::GucSetting<Option<CString>> = pgrx::GucSetting::<Option<CString>>::new(None);
+
+/// Deprecated alias of `pg_ml.database`, still read when it is unset
 static TRAINING_DATABASE: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
-
-const DEFAULT_DATABASE: &str = "postgres";
 
 /// Register async training GUC settings
 pub fn register_gucs() {
@@ -68,9 +69,18 @@ pub fn register_gucs() {
     );
 
     pgrx::GucRegistry::define_string_guc(
+        c"pg_ml.database",
+        c"Database for the training worker to connect to",
+        c"The database where pg_ml is installed. Defaults to 'postgres'.",
+        &DATABASE,
+        pgrx::GucContext::Sighup,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_string_guc(
         c"pg_ml.training_database",
-        c"Database for training worker to connect to",
-        c"Database name the training worker uses for SPI connections",
+        c"Deprecated: use pg_ml.database",
+        c"Read only when pg_ml.database is unset.",
         &TRAINING_DATABASE,
         pgrx::GucContext::Sighup,
         pgrx::GucFlags::default(),
@@ -89,10 +99,10 @@ pub fn get_poll_interval() -> Duration {
 
 /// Get database name for worker connection
 pub fn get_database() -> String {
-    TRAINING_DATABASE
-        .get()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| DEFAULT_DATABASE.to_string())
+    pg_bgworker::resolve_database(
+        pg_bgworker::guc_str(&DATABASE).as_deref(),
+        pg_bgworker::guc_str(&TRAINING_DATABASE).as_deref(),
+    )
 }
 
 // =============================================================================
@@ -770,6 +780,11 @@ pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
     // Check if enabled
     if !is_worker_enabled() {
         pgrx::log!("pg_ml_training: disabled via pg_ml.training_worker_enabled=false");
+        return;
+    }
+
+    // Do nothing (not even start Python) until the extension exists here.
+    if !pg_bgworker::wait_for_extension("pg_ml", &database) {
         return;
     }
 

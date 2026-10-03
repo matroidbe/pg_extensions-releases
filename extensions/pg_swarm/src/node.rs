@@ -25,8 +25,13 @@ pub fn node_manager_main() {
 
     log!("pg_swarm node manager started");
 
-    // Wait for the database to be ready
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    let database = crate::worker_database();
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
+
+    // Register nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_swarm", &database) {
+        return;
+    }
 
     // Register this node
     let node_id = BackgroundWorker::transaction(register_node);

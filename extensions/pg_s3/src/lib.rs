@@ -20,7 +20,10 @@ pub mod storage;
 pgrx::pg_module_magic!();
 
 // GUC settings
-static PG_S3_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(9100);
+/// Default S3 listener port
+const DEFAULT_PORT: i32 = 9100;
+
+static PG_S3_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(DEFAULT_PORT);
 static PG_S3_HOST: pgrx::GucSetting<Option<std::ffi::CString>> =
     pgrx::GucSetting::<Option<std::ffi::CString>>::new(None);
 static PG_S3_DATA_DIR: pgrx::GucSetting<Option<std::ffi::CString>> =
@@ -33,7 +36,6 @@ static PG_S3_MAX_OBJECT_SIZE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_DATA_DIR: &str = "pgs3_data";
-const DEFAULT_DATABASE: &str = "postgres";
 
 // Bootstrap SQL — creates metadata tables
 pgrx::extension_sql!(
@@ -181,12 +183,9 @@ pub extern "C-unwind" fn pg_s3_worker_main(arg: pg_sys::Datum) {
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let db_setting = PG_S3_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database =
+        pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_S3_DATABASE).as_deref(), None);
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     log!(
         "pg_s3 worker {}: started, pid={}",
@@ -199,6 +198,11 @@ pub extern "C-unwind" fn pg_s3_worker_main(arg: pg_sys::Datum) {
             "pg_s3 worker {}: disabled via pg_s3.enabled=false",
             worker_id
         );
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_s3", &database) {
         return;
     }
 
@@ -1112,5 +1116,33 @@ pub mod pg_test {
             "max_worker_processes = 16",
             "pg_s3.enabled = false",
         ]
+    }
+}
+
+/// The settings this extension's bottle ships (pgbrew.toml) are the code's
+/// defaults, so `pgx install --configure` writes nothing surprising
+/// (design/bgworker-config).
+#[cfg(test)]
+mod pgbrew_manifest_tests {
+    #[test]
+    fn declared_settings_match_code_defaults() {
+        let manifest: toml::Table = include_str!("../pgbrew.toml").parse().expect("pgbrew.toml");
+        let declared = manifest["postgresql"]
+            .get("settings")
+            .and_then(|s| s.as_table())
+            .expect("pgbrew.toml declares [postgresql.settings]");
+        let expected: Vec<(&str, String)> = vec![
+            ("pg_s3.database", pg_bgworker::DEFAULT_DATABASE.to_string()),
+            ("pg_s3.host", crate::DEFAULT_HOST.to_string()),
+            ("pg_s3.port", crate::DEFAULT_PORT.to_string()),
+        ];
+        let mut keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(k, _)| *k).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "settings declared in pgbrew.toml");
+        for (key, default) in expected {
+            assert_eq!(declared[key].as_str(), Some(default.as_str()), "{key}");
+        }
     }
 }

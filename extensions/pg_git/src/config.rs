@@ -1,7 +1,10 @@
 use pgrx::GucSetting;
 
 pub static PG_GIT_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
-pub static PG_GIT_HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(5433);
+/// Default Git smart-HTTP listener port
+pub const DEFAULT_HTTP_PORT: i32 = 5433;
+
+pub static PG_GIT_HTTP_PORT: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_HTTP_PORT);
 pub static PG_GIT_SYNC_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(5);
 pub static PG_GIT_DEFAULT_REPO_PATH: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
@@ -71,10 +74,5 @@ pub fn get_default_repo_path() -> String {
 }
 
 pub fn get_database() -> String {
-    PG_GIT_DATABASE
-        .get()
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or("postgres")
-        .to_string()
+    pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_GIT_DATABASE).as_deref(), None)
 }

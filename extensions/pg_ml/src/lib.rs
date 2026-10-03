@@ -961,3 +961,28 @@ pub mod pg_test {
         ]
     }
 }
+
+/// The settings this extension's bottle ships (pgbrew.toml) are the code's
+/// defaults, so `pgx install --configure` writes nothing surprising
+/// (design/bgworker-config).
+#[cfg(test)]
+mod pgbrew_manifest_tests {
+    #[test]
+    fn declared_settings_match_code_defaults() {
+        let manifest: toml::Table = include_str!("../pgbrew.toml").parse().expect("pgbrew.toml");
+        let declared = manifest["postgresql"]
+            .get("settings")
+            .and_then(|s| s.as_table())
+            .expect("pgbrew.toml declares [postgresql.settings]");
+        let expected: Vec<(&str, String)> =
+            vec![("pg_ml.database", pg_bgworker::DEFAULT_DATABASE.to_string())];
+        let mut keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(k, _)| *k).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "settings declared in pgbrew.toml");
+        for (key, default) in expected {
+            assert_eq!(declared[key].as_str(), Some(default.as_str()), "{key}");
+        }
+    }
+}

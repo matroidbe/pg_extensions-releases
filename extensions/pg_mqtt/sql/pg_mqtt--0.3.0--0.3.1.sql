@@ -1,0 +1,3 @@
+-- pg_mqtt 0.3.0 -> 0.3.1
+-- No SQL changes: background workers read <prefix>.database and wait for
+-- CREATE EXTENSION instead of exiting (design/bgworker-config).

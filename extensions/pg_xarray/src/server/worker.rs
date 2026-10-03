@@ -46,8 +46,14 @@ pub extern "C-unwind" fn pg_xarray_wms_worker_main(_arg: pgrx::pg_sys::Datum) {
             continue;
         }
 
-        // Enabled — run the TCP accept loop. This blocks until SIGTERM
-        // breaks the loop inside tcp::run, then returns here.
+        // Enabled — serve nothing until the extension's catalog exists in
+        // this database.
+        if !pg_bgworker::wait_for_extension("pg_xarray", &db) {
+            return;
+        }
+
+        // Run the TCP accept loop. This blocks until SIGTERM breaks the
+        // loop inside tcp::run, then returns here.
         let host = bind_host();
         let port = WMS_PORT.get() as u16;
         let cache = WMS_CACHE_SECONDS.get().max(0) as u32;

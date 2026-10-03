@@ -57,6 +57,11 @@ pub extern "C-unwind" fn pg_git_http_worker_main(_arg: pg_sys::Datum) {
         return;
     }
 
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_git", &database) {
+        return;
+    }
+
     let port = config::PG_GIT_HTTP_PORT.get() as u16;
 
     if let Err(e) = crate::server::run_server(DEFAULT_HOST, port) {
@@ -83,6 +88,11 @@ pub extern "C-unwind" fn pg_git_sync_worker_main(_arg: pg_sys::Datum) {
 
     if !config::PG_GIT_ENABLED.get() {
         pgrx::log!("pg_git sync worker: disabled via pg_git.enabled=false");
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_git", &database) {
         return;
     }
 

@@ -5,9 +5,8 @@ use pgrx::prelude::*;
 use std::time::Duration;
 
 use crate::config::{
-    DEFAULT_DATABASE, DEFAULT_HOST, PG_KAFKA_ADVERTISED_HOST, PG_KAFKA_DATABASE, PG_KAFKA_ENABLED,
-    PG_KAFKA_HOST, PG_KAFKA_METRICS_ENABLED, PG_KAFKA_METRICS_PORT, PG_KAFKA_PORT,
-    PG_KAFKA_WORKER_COUNT,
+    DEFAULT_HOST, PG_KAFKA_ADVERTISED_HOST, PG_KAFKA_DATABASE, PG_KAFKA_ENABLED, PG_KAFKA_HOST,
+    PG_KAFKA_METRICS_ENABLED, PG_KAFKA_METRICS_PORT, PG_KAFKA_PORT, PG_KAFKA_WORKER_COUNT,
 };
 use crate::server::{run_server, MetricsConfig};
 
@@ -119,12 +118,9 @@ pub extern "C-unwind" fn pg_kafka_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     // Connect to the database for SPI access
-    let db_setting = PG_KAFKA_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database =
+        pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_KAFKA_DATABASE).as_deref(), None);
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     log!(
         "pg_kafka worker {}: started, pid={}",
@@ -138,6 +134,11 @@ pub extern "C-unwind" fn pg_kafka_worker_main(arg: pg_sys::Datum) {
             "pg_kafka worker {}: disabled via pg_kafka.enabled=false",
             worker_id
         );
+        return;
+    }
+
+    // Serve nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_kafka", &database) {
         return;
     }
 

@@ -4,6 +4,34 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.4.1 — 2026-10-03
+
+**Background-worker configuration.** Every extension with background workers
+reads `<prefix>.database` (pg_delta: `delta.database`; new for pg_delta and
+pg_swarm, which always used `postgres`; pg_ortools and pg_ml keep
+`solver_database` / `training_database` as deprecated aliases). A worker whose
+database does not have the extension yet now logs once and waits for
+`CREATE EXTENSION` instead of exiting and being restarted in a loop. Bottles
+declare the database and listen addresses in `[postgresql.settings]`, so
+`pgx install --configure --set <ext>.database=<db>` (pgbrew) configures them
+(design/bgworker-config).
+
+Install bottles with pgx from pgbrew 1b25cc4 or later: `--set` needs
+pgbrew#8, and older pgx wrote values such as `0.0.0.0` unquoted into the
+conf.d drop-in, which stops PostgreSQL from starting (pgbrew#9).
+
+Extension versions: **pg_delta 0.3.2, pg_git 0.3.1, pg_kafka 0.3.1, pg_mqtt
+0.3.1, pg_ml 0.3.1, pg_ortools 0.3.1, pg_s3 0.3.1, pg_streaming 0.3.1,
+pg_swarm 0.3.1, pg_xarray 0.4.1**; all others unchanged. Upgrade with
+`ALTER EXTENSION <ext> UPDATE`.
+
+### Fixed
+- Bottle verification left files in the CI checkout that the runner could
+  not delete, failing every later CI run at checkout.
+- Bottles: the builder image pins Rust to CI's toolchain, and pgx no longer
+  packs a stale install script of an earlier version from the build cache
+  (pgbrew#10).
+
 ## v0.4.0 — 2026-10-02
 
 **PostgreSQL 18 is the default target.** Every crate's default feature is now

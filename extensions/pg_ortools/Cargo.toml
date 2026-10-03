@@ -1,6 +1,6 @@
 [package]
 name = "pg_ortools"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,11 +15,11 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg18", "cpsat"]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "ortools_core/pg14"]
-pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "ortools_core/pg15"]
-pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "ortools_core/pg16"]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "ortools_core/pg17"]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "ortools_core/pg18"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "ortools_core/pg14", "pg_bgworker/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "ortools_core/pg15", "pg_bgworker/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "ortools_core/pg16", "pg_bgworker/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "ortools_core/pg17", "pg_bgworker/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "ortools_core/pg18", "pg_bgworker/pg18"]
 pg_test = []
 # CP-SAT scheduling engine (pure-Rust Pumpkin). On by default: it adds SQL
 # objects, and an extension's SQL surface must not depend on how it was built,
@@ -30,6 +30,7 @@ pg_test = []
 cpsat = ["ortools_core/cpsat"]
 
 [dependencies]
+pg_bgworker = { git = "https://github.com/matroidbe/pg_extensions", default-features = false }
 pgrx.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -37,6 +38,7 @@ serde_json.workspace = true
 ortools_core = { path = "../../crates/ortools_core" }
 
 [dev-dependencies]
+toml.workspace = true
 pgrx-tests.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-postgres.workspace = true

@@ -47,14 +47,16 @@ fn extension_docs() -> &'static str {
 
 // GUC settings
 static PG_MQTT_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
-static PG_MQTT_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1883);
+/// Default MQTT listener port
+const DEFAULT_PORT: i32 = 1883;
+
+static PG_MQTT_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(DEFAULT_PORT);
 static PG_MQTT_WORKER_COUNT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(4);
 static PG_MQTT_DATABASE: pgrx::GucSetting<Option<std::ffi::CString>> =
     pgrx::GucSetting::<Option<std::ffi::CString>>::new(None);
 
 // Default host for binding
 const DEFAULT_HOST: &str = "0.0.0.0";
-const DEFAULT_DATABASE: &str = "postgres";
 
 extension_sql!(
     r#"
@@ -203,12 +205,9 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
     // Connect to the database for SPI access
-    let db_setting = PG_MQTT_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database =
+        pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_MQTT_DATABASE).as_deref(), None);
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     pgrx::log!(
         "pg_mqtt worker {}: started, pid={}",
@@ -222,6 +221,11 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
             "pg_mqtt worker {}: disabled via pg_mqtt.enabled=false",
             worker_id
         );
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_mqtt", &database) {
         return;
     }
 
@@ -866,5 +870,35 @@ pub mod pg_test {
         // bind TCP ports and interfere with the pgrx test lifecycle.
         // SQL functions are tested directly without the MQTT server.
         vec![]
+    }
+}
+
+/// The settings this extension's bottle ships (pgbrew.toml) are the code's
+/// defaults, so `pgx install --configure` writes nothing surprising
+/// (design/bgworker-config).
+#[cfg(test)]
+mod pgbrew_manifest_tests {
+    #[test]
+    fn declared_settings_match_code_defaults() {
+        let manifest: toml::Table = include_str!("../pgbrew.toml").parse().expect("pgbrew.toml");
+        let declared = manifest["postgresql"]
+            .get("settings")
+            .and_then(|s| s.as_table())
+            .expect("pgbrew.toml declares [postgresql.settings]");
+        let expected: Vec<(&str, String)> = vec![
+            (
+                "pg_mqtt.database",
+                pg_bgworker::DEFAULT_DATABASE.to_string(),
+            ),
+            ("pg_mqtt.port", crate::DEFAULT_PORT.to_string()),
+        ];
+        let mut keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(k, _)| *k).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "settings declared in pgbrew.toml");
+        for (key, default) in expected {
+            assert_eq!(declared[key].as_str(), Some(default.as_str()), "{key}");
+        }
     }
 }

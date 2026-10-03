@@ -25,6 +25,3 @@ pub static PG_STREAMING_METRICS_ENABLED: pgrx::GucSetting<bool> =
 /// GUC setting for the database to connect to
 pub static PG_STREAMING_DATABASE: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
-
-/// Default database name
-pub const DEFAULT_DATABASE: &str = "postgres";

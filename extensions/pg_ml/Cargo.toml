@@ -1,6 +1,6 @@
 [package]
 name = "pg_ml"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,14 +15,15 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg18"]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
-pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
-pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
-pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "pg_bgworker/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "pg_bgworker/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "pg_bgworker/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17", "pg_bgworker/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "pg_bgworker/pg18"]
 pg_test = []
 
 [dependencies]
+pg_bgworker = { git = "https://github.com/matroidbe/pg_extensions", default-features = false }
 pgrx.workspace = true
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
 which = "7"
@@ -39,4 +40,5 @@ pyo3-arrow = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
+toml.workspace = true
 pgrx-tests = "0.16"

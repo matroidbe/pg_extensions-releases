@@ -15,9 +15,7 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::config::{
-    DEFAULT_DATABASE, PG_STREAMING_DATABASE, PG_STREAMING_ENABLED, PG_STREAMING_POLL_INTERVAL_MS,
-};
+use crate::config::{PG_STREAMING_DATABASE, PG_STREAMING_ENABLED, PG_STREAMING_POLL_INTERVAL_MS};
 use crate::engine::coordinator::run_coordinator_tick;
 use crate::engine::executor::run_executor_tick;
 
@@ -27,12 +25,11 @@ use crate::engine::executor::run_executor_tick;
 pub extern "C-unwind" fn pg_streaming_coordinator_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let db_setting = PG_STREAMING_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database = pg_bgworker::resolve_database(
+        pg_bgworker::guc_str(&PG_STREAMING_DATABASE).as_deref(),
+        None,
+    );
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     log!(
         "pg_streaming coordinator: started, pid={}",
@@ -41,6 +38,11 @@ pub extern "C-unwind" fn pg_streaming_coordinator_main(_arg: pg_sys::Datum) {
 
     if !PG_STREAMING_ENABLED.get() {
         log!("pg_streaming coordinator: disabled via pg_streaming.enabled=false");
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_streaming", &database) {
         return;
     }
 
@@ -66,12 +68,11 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let db_setting = PG_STREAMING_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database = pg_bgworker::resolve_database(
+        pg_bgworker::guc_str(&PG_STREAMING_DATABASE).as_deref(),
+        None,
+    );
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     log!(
         "pg_streaming executor {}: started, pid={}",
@@ -84,6 +85,11 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
             "pg_streaming executor {}: disabled via pg_streaming.enabled=false",
             worker_id
         );
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_streaming", &database) {
         return;
     }
 
@@ -112,17 +118,21 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
 pub extern "C-unwind" fn pg_streaming_timer_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let db_setting = PG_STREAMING_DATABASE.get();
-    let database = db_setting
-        .as_ref()
-        .and_then(|s| s.to_str().ok())
-        .unwrap_or(DEFAULT_DATABASE);
-    BackgroundWorker::connect_worker_to_spi(Some(database), None);
+    let database = pg_bgworker::resolve_database(
+        pg_bgworker::guc_str(&PG_STREAMING_DATABASE).as_deref(),
+        None,
+    );
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     log!("pg_streaming timer: started, pid={}", std::process::id());
 
     if !PG_STREAMING_ENABLED.get() {
         log!("pg_streaming timer: disabled via pg_streaming.enabled=false");
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_streaming", &database) {
         return;
     }
 

@@ -77,17 +77,22 @@ Every release attaches a prebuilt bottle of each extension (except pg_ml) for
 PostgreSQL 18 on linux-amd64 (glibc 2.36+: Debian 12+, Ubuntu 24.04+, the
 official `postgres:18` images) to the
 [public release](https://github.com/matroidbe/pg_extensions-releases/releases).
-Install one with [pgbrew](https://github.com/matroidbe/pgbrew)'s `pgx`; the
-file name carries the extension's own version:
+Install one with [pgbrew](https://github.com/matroidbe/pgbrew)'s `pgx` (from
+pgbrew `1b25cc4` or later: `go install github.com/matroidbe/pgbrew/cmd/pgx@main`);
+the file name carries the extension's own version:
 
 ```bash
-pgx install --configure --bottle \
+pgx install --configure --set pg_kafka.database=app --bottle \
   https://github.com/matroidbe/pg_extensions-releases/releases/download/vX.Y.Z/pg_kafka-<version>-pg18-linux-amd64.tar.gz
 ```
 
-`--configure` writes the server settings the extension needs (e.g.
-`shared_preload_libraries`) to a conf.d drop-in. Each release's `SHA256SUMS`
-covers its bottles. Runtime libraries are not bundled: pg_solid needs
+`--configure` writes the server settings the extension needs to a conf.d
+drop-in: `shared_preload_libraries`, and for extensions with background
+workers the database they connect to (`<prefix>.database`, default
+`postgres`) and where they listen. `--set` overrides any of them; the
+workers wait until `CREATE EXTENSION` has run in that database.
+
+Each release's `SHA256SUMS` covers its bottles. Runtime libraries are not bundled: pg_solid needs
 OpenCASCADE 7.6 (Debian 12 / Ubuntu 24.04; build from source against 7.8),
 pg_xarray needs PostGIS, and pg_image's ONNX functions need ONNX Runtime.
 

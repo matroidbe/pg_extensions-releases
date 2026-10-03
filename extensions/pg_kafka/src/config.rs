@@ -3,7 +3,10 @@
 use std::ffi::CString;
 
 /// GUC setting for the Kafka protocol server port
-pub static PG_KAFKA_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(9092);
+/// Default Kafka listener port
+pub const DEFAULT_PORT: i32 = 9092;
+
+pub static PG_KAFKA_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(DEFAULT_PORT);
 
 /// GUC setting for the host address to bind to
 pub static PG_KAFKA_HOST: pgrx::GucSetting<Option<CString>> =
@@ -28,9 +31,6 @@ pub static PG_KAFKA_METRICS_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32
 
 /// GUC setting to enable/disable Prometheus metrics endpoint (default false)
 pub static PG_KAFKA_METRICS_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
-
-/// Default database name
-pub const DEFAULT_DATABASE: &str = "postgres";
 
 /// Default host address
 pub const DEFAULT_HOST: &str = "0.0.0.0";

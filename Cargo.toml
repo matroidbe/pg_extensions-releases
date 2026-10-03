@@ -9,6 +9,7 @@ repository = "https://github.com/matroidbe/pg_extensions"
 authors = ["Tom Michiels <tom@matroid.be>"]
 
 [workspace.dependencies]
+toml = "0.8"
 pgrx = "0.16"
 pgrx-tests = "0.16"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
@@ -87,3 +88,4 @@ codegen-units = 1
 [patch."https://github.com/matroidbe/pg_extensions"]
 pg_spi = { path = "crates/pg_spi" }
 pg_observability = { path = "crates/pg_observability" }
+pg_bgworker = { path = "crates/pg_bgworker" }

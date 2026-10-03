@@ -24,6 +24,10 @@ pgrx::pg_module_magic!();
 
 // Worker settings
 static PG_DELTA_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
+/// Database the stream manager connects to (`delta.database`)
+static PG_DELTA_DATABASE: pgrx::GucSetting<Option<CString>> =
+    pgrx::GucSetting::<Option<CString>>::new(None);
 static PG_DELTA_WORKER_LOG_LEVEL: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
 
@@ -92,6 +96,15 @@ fn register_gucs() {
         c"Enable the Delta Lake stream manager",
         c"When true, pg_delta starts the background worker to manage streams",
         &PG_DELTA_ENABLED,
+        pgrx::GucContext::Sighup,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        c"delta.database",
+        c"Database for the stream manager to connect to",
+        c"The database where pg_delta is installed. Defaults to 'postgres'.",
+        &PG_DELTA_DATABASE,
         pgrx::GucContext::Sighup,
         pgrx::GucFlags::default(),
     );
@@ -455,7 +468,14 @@ pub extern "C-unwind" fn pg_delta_worker_main(_arg: pg_sys::Datum) {
     }
 
     // Connect to SPI only after checking for shutdown
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    let database =
+        pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_DELTA_DATABASE).as_deref(), None);
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_delta", &database) {
+        return;
+    }
 
     log!("pg_delta: stream manager started, running main loop");
 
@@ -1346,5 +1366,30 @@ pub mod pg_test {
 
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         vec![]
+    }
+}
+
+/// The settings this extension's bottle ships (pgbrew.toml) are the code's
+/// defaults, so `pgx install --configure` writes nothing surprising
+/// (design/bgworker-config).
+#[cfg(test)]
+mod pgbrew_manifest_tests {
+    #[test]
+    fn declared_settings_match_code_defaults() {
+        let manifest: toml::Table = include_str!("../pgbrew.toml").parse().expect("pgbrew.toml");
+        let declared = manifest["postgresql"]
+            .get("settings")
+            .and_then(|s| s.as_table())
+            .expect("pgbrew.toml declares [postgresql.settings]");
+        let expected: Vec<(&str, String)> =
+            vec![("delta.database", pg_bgworker::DEFAULT_DATABASE.to_string())];
+        let mut keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(k, _)| *k).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "settings declared in pgbrew.toml");
+        for (key, default) in expected {
+            assert_eq!(declared[key].as_str(), Some(default.as_str()), "{key}");
+        }
     }
 }

@@ -1,0 +1,3 @@
+-- pg_xarray 0.4.0 -> 0.4.1
+-- No SQL changes: background workers read <prefix>.database and wait for
+-- CREATE EXTENSION instead of exiting (design/bgworker-config).

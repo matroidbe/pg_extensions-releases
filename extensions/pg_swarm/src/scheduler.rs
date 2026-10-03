@@ -21,10 +21,16 @@ use crate::{GUC_ENABLED, GUC_POLL_INTERVAL};
 /// restart mechanism (set_restart_time) handles reconnection.
 pub fn scheduler_main() {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+    let database = crate::worker_database();
+    BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     if !GUC_ENABLED.get() {
         log!("pg_swarm scheduler disabled via GUC, exiting");
+        return;
+    }
+
+    // Claim nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_swarm", &database) {
         return;
     }
 

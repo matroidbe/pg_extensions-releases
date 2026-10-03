@@ -44,6 +44,13 @@ static GUC_POLL_INTERVAL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1
 static GUC_MAX_RETRIES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(3);
 static GUC_NODE_NAME: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
+static GUC_DATABASE: pgrx::GucSetting<Option<CString>> =
+    pgrx::GucSetting::<Option<CString>>::new(None);
+
+/// The database both workers connect to (`pg_swarm.database`).
+fn worker_database() -> String {
+    pg_bgworker::resolve_database(pg_bgworker::guc_str(&GUC_DATABASE).as_deref(), None)
+}
 
 // ─── Schema Bootstrap ───────────────────────────────────────────────────────
 
@@ -306,6 +313,15 @@ pub extern "C-unwind" fn _PG_init() {
         &GUC_MAX_RETRIES,
         0,
         100,
+        pgrx::GucContext::Sighup,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_string_guc(
+        c"pg_swarm.database",
+        c"Database for the swarm workers to connect to",
+        c"The database where pg_swarm is installed. Defaults to 'postgres'.",
+        &GUC_DATABASE,
         pgrx::GucContext::Sighup,
         pgrx::GucFlags::default(),
     );
@@ -2503,5 +2519,32 @@ pub mod pg_test {
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         vec![]
+    }
+}
+
+/// The settings this extension's bottle ships (pgbrew.toml) are the code's
+/// defaults, so `pgx install --configure` writes nothing surprising
+/// (design/bgworker-config).
+#[cfg(test)]
+mod pgbrew_manifest_tests {
+    #[test]
+    fn declared_settings_match_code_defaults() {
+        let manifest: toml::Table = include_str!("../pgbrew.toml").parse().expect("pgbrew.toml");
+        let declared = manifest["postgresql"]
+            .get("settings")
+            .and_then(|s| s.as_table())
+            .expect("pgbrew.toml declares [postgresql.settings]");
+        let expected: Vec<(&str, String)> = vec![(
+            "pg_swarm.database",
+            pg_bgworker::DEFAULT_DATABASE.to_string(),
+        )];
+        let mut keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want: Vec<&str> = expected.iter().map(|(k, _)| *k).collect();
+        want.sort_unstable();
+        assert_eq!(keys, want, "settings declared in pgbrew.toml");
+        for (key, default) in expected {
+            assert_eq!(declared[key].as_str(), Some(default.as_str()), "{key}");
+        }
     }
 }

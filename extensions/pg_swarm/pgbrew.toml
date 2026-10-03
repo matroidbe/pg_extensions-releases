@@ -13,12 +13,17 @@
 # needs preloading on every PostgreSQL version.
 shared_preload_libraries = true
 
-# No [postgresql.settings] block on purpose. Every GUC below already has a
-# working default, and writing defaults into postgresql.conf only creates
-# drift when the extension later changes one. Add a settings block here for
-# values that genuinely must differ for a deployment.
-#
+# The settings a deployment is expected to choose, at the code's defaults:
+# which database the background workers connect to (it must hold the
+# extension), and where they listen. `pgx install --configure` writes
+# them to a conf.d drop-in; override at install time with
+#   pgx install --configure --set pg_swarm.database=<database> ...
+# A unit test keeps these equal to the code defaults (design/bgworker-config).
+[postgresql.settings]
+"pg_swarm.database" = "postgres"
+
 # Available settings:
+#   pg_swarm.database
 #   pg_swarm.enabled
 #   pg_swarm.workers
 #   pg_swarm.node_name

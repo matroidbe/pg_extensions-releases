@@ -33,7 +33,11 @@ pub static WMS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Default port chosen outside the test.sh 299xx range used by sister
 /// extensions so the pgrx-dev cluster can run pg_kafka + pg_mqtt + pg_xarray
 /// side-by-side without collisions.
-pub static WMS_PORT: GucSetting<i32> = GucSetting::<i32>::new(7800);
+/// Default WMS listener port and bind host
+pub const DEFAULT_WMS_PORT: i32 = 7800;
+pub const DEFAULT_WMS_BIND_HOST: &str = "127.0.0.1";
+
+pub static WMS_PORT: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_WMS_PORT);
 
 /// Bind host — falls back to `'127.0.0.1'` when unset (see `bind_host()`).
 /// Users opt into a public bind by setting this to `'0.0.0.0'`.
@@ -121,16 +125,12 @@ pub fn bind_host() -> String {
         .get()
         .and_then(|cs: CString| cs.to_str().ok().map(|s| s.to_string()))
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+        .unwrap_or_else(|| DEFAULT_WMS_BIND_HOST.to_string())
 }
 
 /// Database to connect to for catalog lookups. Owned `String`.
 pub fn database() -> String {
-    WMS_DATABASE
-        .get()
-        .and_then(|cs: CString| cs.to_str().ok().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "postgres".to_string())
+    pg_bgworker::resolve_database(pg_bgworker::guc_str(&WMS_DATABASE).as_deref(), None)
 }
 
 /// Worker poll interval when the WMS is disabled — wakes up to check

@@ -20,7 +20,10 @@ static SOLVER_WORKER_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>:
 /// Job polling interval in milliseconds
 static SOLVER_POLL_INTERVAL: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(1000);
 
-/// Database name for worker to connect to
+/// Database the worker connects to (`pg_ortools.database`)
+static DATABASE: pgrx::GucSetting<Option<CString>> = pgrx::GucSetting::<Option<CString>>::new(None);
+
+/// Deprecated alias of `pg_ortools.database`, still read when it is unset
 static SOLVER_DATABASE: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
 
@@ -33,8 +36,6 @@ static AUTO_THRESHOLD: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(500)
 /// Default algorithm for local search
 static DEFAULT_ALGORITHM: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
-
-const DEFAULT_DATABASE: &str = "postgres";
 
 /// Register solver worker GUC settings
 pub fn register_gucs() {
@@ -62,9 +63,18 @@ pub fn register_gucs() {
         );
 
         pgrx::GucRegistry::define_string_guc(
+            c"pg_ortools.database",
+            c"Database for the solver worker to connect to",
+            c"The database where pg_ortools is installed. Defaults to 'postgres'.",
+            &DATABASE,
+            pgrx::GucContext::Postmaster,
+            pgrx::GucFlags::default(),
+        );
+
+        pgrx::GucRegistry::define_string_guc(
             c"pg_ortools.solver_database",
-            c"Database for solver worker to connect to",
-            c"Database name the solver worker uses for SPI connections",
+            c"Deprecated: use pg_ortools.database",
+            c"Read only when pg_ortools.database is unset.",
             &SOLVER_DATABASE,
             pgrx::GucContext::Postmaster,
             pgrx::GucFlags::default(),
@@ -115,10 +125,10 @@ pub fn get_poll_interval() -> Duration {
 
 /// Get database name for worker connection
 pub fn get_database() -> String {
-    SOLVER_DATABASE
-        .get()
-        .and_then(|s| s.into_string().ok())
-        .unwrap_or_else(|| DEFAULT_DATABASE.to_string())
+    pg_bgworker::resolve_database(
+        pg_bgworker::guc_str(&DATABASE).as_deref(),
+        pg_bgworker::guc_str(&SOLVER_DATABASE).as_deref(),
+    )
 }
 
 /// Get solver time limit in seconds
@@ -375,6 +385,11 @@ pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
 
     if !is_worker_enabled() {
         pgrx::log!("pg_ortools_solver: disabled via pg_ortools.solver_worker_enabled=false");
+        return;
+    }
+
+    // Do nothing until the extension's schema exists in this database.
+    if !pg_bgworker::wait_for_extension("pg_ortools", &database) {
         return;
     }
 
