@@ -18,12 +18,12 @@ use tokio_postgres::NoTls;
 pub const PG_HOST: &str = "localhost";
 pub fn pg_port() -> u16 {
     // test.sh sets PG_PORT explicitly. The default here matches
-    // the 298xx range test.sh uses (29816 for PG 16) to avoid
+    // the 298xx range test.sh uses (29818 for PG 18) to avoid
     // shmem collisions with the canonical 288xx pgrx port.
     std::env::var("PG_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(29816)
+        .unwrap_or(29818)
 }
 pub fn pg_db() -> String {
     std::env::var("PG_DB").unwrap_or_else(|_| "pg_streaming_xarray".to_string())

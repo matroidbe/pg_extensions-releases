@@ -17,7 +17,7 @@ pub fn pg_port() -> u16 {
     std::env::var("PG_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(28816)
+        .unwrap_or(28818)
 }
 pub const PG_DB: &str = "pg_streaming";
 

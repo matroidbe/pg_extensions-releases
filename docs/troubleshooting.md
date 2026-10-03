@@ -159,11 +159,11 @@ FATAL: incompatible library: missing magic block
    ```
 2. Set pgrx to match:
    ```bash
-   cargo pgrx init --pg16 $(which pg_config)
+   cargo pgrx init --pg18 $(which pg_config)
    ```
 3. Rebuild extension:
    ```bash
-   cargo pgrx install --release --pg16
+   cargo pgrx install --release --pg18
    ```
 
 ---

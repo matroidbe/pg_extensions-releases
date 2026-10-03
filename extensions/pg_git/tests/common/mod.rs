@@ -25,6 +25,14 @@ macro_rules! skip_if_not_running {
 
 pub(crate) use skip_if_not_running;
 
+/// Port of the pgrx-managed PostgreSQL (`PG_PORT`, default pgrx's pg18 port).
+pub fn pg_port() -> u16 {
+    std::env::var("PG_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(28818)
+}
+
 /// Connect to the test database.
 pub async fn connect(port: u16) -> Client {
     let url = format!(

@@ -373,7 +373,8 @@ pub fn register_mesh_cell_impl(
     }
 }
 
-/// Upsert a chunk. Idempotent on (variable_id, uri, byte_offset, time_range).
+/// Upsert a chunk. Idempotent on (variable_id, uri, chunk_key, byte_offset,
+/// time_range).
 pub fn register_chunk_impl(
     dataset: &str,
     variable: &str,
@@ -421,10 +422,9 @@ pub fn register_chunk_impl(
                  $6, $7, $8, $9, $10, \
                  CASE WHEN $11::numeric IS NULL OR $12::numeric IS NULL \
                       THEN NULL ELSE numrange($11, $12, '[]') END) \
-         ON CONFLICT (variable_id, uri, byte_offset, time_range) DO UPDATE \
+         ON CONFLICT (variable_id, uri, chunk_key, byte_offset, time_range) DO UPDATE \
          SET bbox_envelope = COALESCE(EXCLUDED.bbox_envelope, pgx.chunks.bbox_envelope), \
              byte_length   = COALESCE(EXCLUDED.byte_length,   pgx.chunks.byte_length), \
-             chunk_key     = COALESCE(EXCLUDED.chunk_key,     pgx.chunks.chunk_key), \
              metadata      = COALESCE(EXCLUDED.metadata,      pgx.chunks.metadata), \
              level_range   = COALESCE(EXCLUDED.level_range,   pgx.chunks.level_range), \
              indexed_at    = now() \

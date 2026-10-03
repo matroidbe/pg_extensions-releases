@@ -6,16 +6,15 @@
 
 mod common;
 
-use common::{connect, poll_until, skip_if_not_running};
+use common::{connect, pg_port, poll_until, skip_if_not_running};
 use std::time::Duration;
 
-const PG_PORT: u16 = 28816;
 const GIT_HTTP_PORT: u16 = 5433;
 
 #[tokio::test]
 async fn test_sql_git_init_and_commit() {
-    skip_if_not_running!(PG_PORT);
-    let client = connect(PG_PORT).await;
+    skip_if_not_running!(pg_port());
+    let client = connect(pg_port()).await;
 
     // Clean up from previous runs
     let _ = client
@@ -81,8 +80,8 @@ async fn test_sql_git_init_and_commit() {
 
 #[tokio::test]
 async fn test_http_clone_and_push() {
-    skip_if_not_running!(PG_PORT);
-    let client = connect(PG_PORT).await;
+    skip_if_not_running!(pg_port());
+    let client = connect(pg_port()).await;
 
     // Clean up
     let _ = client
@@ -166,7 +165,7 @@ async fn test_http_clone_and_push() {
     );
 
     // Wait for sync worker to pick up the pushed commit
-    let client2 = connect(PG_PORT).await;
+    let client2 = connect(pg_port()).await;
     let found = poll_until(
         || async {
             let row = client2
@@ -207,8 +206,8 @@ async fn test_http_clone_and_push() {
 
 #[tokio::test]
 async fn test_sync_worker_detects_external_commits() {
-    skip_if_not_running!(PG_PORT);
-    let client = connect(PG_PORT).await;
+    skip_if_not_running!(pg_port());
+    let client = connect(pg_port()).await;
 
     // Clean up
     let _ = client
@@ -255,7 +254,7 @@ async fn test_sync_worker_detects_external_commits() {
         .output();
 
     // Wait for sync worker to detect the commit
-    let client2 = connect(PG_PORT).await;
+    let client2 = connect(pg_port()).await;
     let found = poll_until(
         || async {
             let row = client2

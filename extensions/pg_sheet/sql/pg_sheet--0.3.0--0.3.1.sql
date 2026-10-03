@@ -1,0 +1,2 @@
+-- pg_sheet 0.3.0 -> 0.3.1
+-- No SQL changes: create_sheet no longer fails on databases without an app_user role.

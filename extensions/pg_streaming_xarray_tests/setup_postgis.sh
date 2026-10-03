@@ -15,7 +15,7 @@
 #      brew geos + brew proj + system libxml2-dev. Slower (~5 min).
 #
 # Usage:
-#   ./setup_postgis.sh                  # auto, PG 16
+#   ./setup_postgis.sh                  # auto, PG 18
 #   PG_VERSION=17 ./setup_postgis.sh    # other PG major version
 #
 # Idempotent — re-running with PostGIS already present is a no-op.
@@ -33,8 +33,8 @@ warn()  { echo -e "${YELLOW}Warning:${NC} $1"; }
 error() { echo -e "${RED}Error:${NC} $1" >&2; }
 
 PGRX_HOME="${PGRX_HOME:-$HOME/.pgrx}"
-PG_VERSION="${PG_VERSION:-16}"
-PG_INSTALL="$(ls -d "$PGRX_HOME"/${PG_VERSION}.*/pgrx-install 2>/dev/null | head -1 || true)"
+PG_VERSION="${PG_VERSION:-18}"
+PG_INSTALL="$(ls -d "$PGRX_HOME"/${PG_VERSION}.*/pgrx-install 2>/dev/null | sort -V | tail -1 || true)"
 if [[ -z "$PG_INSTALL" ]]; then
     error "No pgrx PostgreSQL $PG_VERSION install found under $PGRX_HOME."
     error "Run: cargo pgrx init --pg${PG_VERSION} download"

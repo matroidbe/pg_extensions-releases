@@ -682,6 +682,30 @@ mod tests {
         Spi::run("DROP TABLE IF EXISTS test_schema.deals CASCADE").ok();
         Spi::run("DROP SCHEMA IF EXISTS test_schema CASCADE").ok();
     }
+
+    /// Deployments with an app_user role get the sheet's tables and view
+    /// granted to it; the test above covers databases without one.
+    #[pg_test]
+    fn test_create_sheet_grants_app_user() {
+        Spi::run("CREATE ROLE app_user").unwrap();
+        Spi::run("CREATE SCHEMA grant_schema").unwrap();
+        Spi::run("CREATE TABLE grant_schema.deals (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text)")
+            .unwrap();
+
+        let result = Spi::get_one::<bool>(
+            "SELECT pgsheet.create_sheet('grant_deals', 'grant_schema', 'deals')",
+        );
+        assert_eq!(result.unwrap(), Some(true));
+
+        let overlay = Spi::get_one::<bool>(
+            "SELECT has_table_privilege('app_user', 'pgsheet.\"_overlay_grant_deals\"', 'INSERT')",
+        );
+        assert_eq!(overlay.unwrap(), Some(true));
+        let view = Spi::get_one::<bool>(
+            "SELECT has_table_privilege('app_user', 'pgsheet.\"_view_grant_deals\"', 'SELECT')",
+        );
+        assert_eq!(view.unwrap(), Some(true));
+    }
 }
 
 /// Required by `cargo pgrx test`.

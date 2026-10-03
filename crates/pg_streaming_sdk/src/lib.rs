@@ -91,8 +91,8 @@
 //! pgrx = "0.16"
 //!
 //! [features]
-//! default = ["pg16"]
-//! pg16 = ["pgrx/pg16", "pg_streaming_sdk/pg16"]
+//! default = ["pg18"]
+//! pg18 = ["pgrx/pg18", "pg_streaming_sdk/pg18"]
 //! ```
 //!
 //! At runtime, your extension and `pg_streaming` must be loaded into

@@ -31,15 +31,24 @@ pub fn validate_for_topic(topic_name: &str, data: pgrx::JsonB, schema_type: &str
     validate_against_schema(&schema_def.0, &data.0)
 }
 
-/// Validate data against a schema definition
+/// Validate data against a schema definition; an invalid schema warns and
+/// fails validation.
 fn validate_against_schema(schema: &serde_json::Value, data: &serde_json::Value) -> bool {
-    match Validator::new(schema) {
-        Ok(validator) => validator.is_valid(data),
-        Err(e) => {
-            pgrx::warning!("Invalid schema: {}", e);
-            false
-        }
-    }
+    check_against_schema(schema, data).unwrap_or_else(|e| {
+        pgrx::warning!("{}", e);
+        false
+    })
+}
+
+/// Pure validation: `Err` when the schema itself is invalid. Kept free of
+/// pgrx calls so plain unit tests can exercise every branch.
+fn check_against_schema(
+    schema: &serde_json::Value,
+    data: &serde_json::Value,
+) -> Result<bool, String> {
+    Validator::new(schema)
+        .map(|validator| validator.is_valid(data))
+        .map_err(|e| format!("Invalid schema: {}", e))
 }
 
 /// Validate data and return detailed errors
@@ -77,7 +86,7 @@ mod tests {
         });
         let data = json!({"name": "Alice", "age": 30});
 
-        assert!(validate_against_schema(&schema, &data));
+        assert!(check_against_schema(&schema, &data).unwrap());
     }
 
     #[test]
@@ -91,7 +100,7 @@ mod tests {
         });
         let data = json!({"age": 30});
 
-        assert!(!validate_against_schema(&schema, &data));
+        assert!(!check_against_schema(&schema, &data).unwrap());
     }
 
     #[test]
@@ -104,7 +113,7 @@ mod tests {
         });
         let data = json!({"age": "thirty"});
 
-        assert!(!validate_against_schema(&schema, &data));
+        assert!(!check_against_schema(&schema, &data).unwrap());
     }
 
     #[test]
@@ -117,10 +126,10 @@ mod tests {
         });
 
         let valid_data = json!({"code": "ABC"});
-        assert!(validate_against_schema(&schema, &valid_data));
+        assert!(check_against_schema(&schema, &valid_data).unwrap());
 
         let invalid_data = json!({"code": "ABCDEF"});
-        assert!(!validate_against_schema(&schema, &invalid_data));
+        assert!(!check_against_schema(&schema, &invalid_data).unwrap());
     }
 
     #[test]
@@ -133,10 +142,10 @@ mod tests {
         });
 
         let with_string = json!({"name": "Alice"});
-        assert!(validate_against_schema(&schema, &with_string));
+        assert!(check_against_schema(&schema, &with_string).unwrap());
 
         let with_null = json!({"name": null});
-        assert!(validate_against_schema(&schema, &with_null));
+        assert!(check_against_schema(&schema, &with_null).unwrap());
     }
 
     #[test]
@@ -152,10 +161,10 @@ mod tests {
         });
 
         let valid_data = json!({"tags": ["a", "b", "c"]});
-        assert!(validate_against_schema(&schema, &valid_data));
+        assert!(check_against_schema(&schema, &valid_data).unwrap());
 
         let invalid_data = json!({"tags": ["a", 1, "c"]});
-        assert!(!validate_against_schema(&schema, &invalid_data));
+        assert!(!check_against_schema(&schema, &invalid_data).unwrap());
     }
 
     #[test]
@@ -168,7 +177,7 @@ mod tests {
         });
 
         let valid_data = json!({"id": "550e8400-e29b-41d4-a716-446655440000"});
-        assert!(validate_against_schema(&schema, &valid_data));
+        assert!(check_against_schema(&schema, &valid_data).unwrap());
 
         // Note: JSON Schema format validation is typically lax by default
         // The jsonschema crate may not enforce format validation strictly
@@ -184,7 +193,7 @@ mod tests {
         });
 
         let valid_data = json!({"created_at": "2024-01-15T10:30:00Z"});
-        assert!(validate_against_schema(&schema, &valid_data));
+        assert!(check_against_schema(&schema, &valid_data).unwrap());
     }
 
     #[test]
@@ -209,14 +218,14 @@ mod tests {
                 "email": "alice@example.com"
             }
         });
-        assert!(validate_against_schema(&schema, &valid_data));
+        assert!(check_against_schema(&schema, &valid_data).unwrap());
 
         let invalid_data = json!({
             "user": {
                 "email": "alice@example.com"
             }
         });
-        assert!(!validate_against_schema(&schema, &invalid_data));
+        assert!(!check_against_schema(&schema, &invalid_data).unwrap());
     }
 
     #[test]
@@ -243,10 +252,8 @@ mod tests {
         });
         let data = json!({"name": "test"});
 
-        // Should handle gracefully
-        let result = validate_against_schema(&invalid_schema, &data);
-        // Behavior depends on jsonschema crate - it may still return true/false
-        // The important thing is it doesn't panic
-        let _ = result;
+        // An invalid schema is reported, not treated as a validation result.
+        let err = check_against_schema(&invalid_schema, &data).unwrap_err();
+        assert!(err.starts_with("Invalid schema:"), "{err}");
     }
 }

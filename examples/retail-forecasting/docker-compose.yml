@@ -19,7 +19,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        PG_VERSION: "16"
+        PG_VERSION: "18"
     image: retail-forecasting:latest
     container_name: retail-forecasting
     ports:
@@ -29,7 +29,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql  # postgres:18 images keep PGDATA under /var/lib/postgresql/18/docker
       # Mount schema.yaml for reference
       - ./schema.yaml:/docker-entrypoint-initdb.d/schema.yaml:ro
     healthcheck:

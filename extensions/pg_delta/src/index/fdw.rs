@@ -143,6 +143,7 @@ unsafe fn make_foreignscan_path(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     }
 }

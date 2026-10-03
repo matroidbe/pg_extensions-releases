@@ -4,6 +4,37 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.4.0 — 2026-10-02
+
+**PostgreSQL 18 is the default target.** Every crate's default feature is now
+`pg18`, CI builds and tests against PostgreSQL 18, and so do `test.sh` and
+`scripts/check-upgrade-path.sh`. Other majors still build with
+`--no-default-features --features pgNN` plus the crate's other default
+features.
+
+**Prebuilt bottles.** Each release attaches a bottle of every extension except
+pg_ml (PostgreSQL 18, linux-amd64, glibc 2.36+) and a `SHA256SUMS` to the
+public GitHub release, installable with `pgx install --bottle <url>`
+(design/bottles). v0.4.0 is the first release with bottles. The pg_solid
+bottle needs OpenCASCADE 7.6 on the host (Debian 12, Ubuntu 24.04).
+
+Extension versions: **pg_delta 0.3.1, pg_sheet 0.3.1, pg_xarray 0.4.0**; all
+others unchanged at 0.3.0. Upgrade with `ALTER EXTENSION <ext> UPDATE`.
+
+### Fixed
+- pg_delta: the index-mode FDW did not compile against PostgreSQL 18.
+- pg_sheet: `create_sheet` failed on databases without an `app_user` role; the
+  grants to it are now made only when the role exists.
+- pg_xarray: chunks that differ only in their `chunk_key` (Zarr levels and
+  spatial tiles of one time step) collapsed into one catalog row. The dedupe
+  key now includes `chunk_key`; re-register affected Zarr variables after
+  `ALTER EXTENSION pg_xarray UPDATE`.
+- CI: pg_image and pg_solid are linted and upgrade-checked again (only pg_ml
+  is still skipped), and a reused CI workspace registers the PostgreSQL major
+  the crates target.
+- Tests: a pg_registry unit test no longer calls into pgrx off the main
+  thread, and eidos_oauth's JWKS cache tests no longer race each other.
+
 ## v0.3.0 — 2026-10-01
 
 **Upgrade baseline.** v0.3.0 is the last release that replaces extensions in

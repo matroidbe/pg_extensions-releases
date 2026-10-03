@@ -137,6 +137,19 @@ pub fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The key cache is process-global and the test harness runs tests on
+    /// parallel threads, so one test's `clear_cache()` could empty the cache
+    /// between another's update and its assertions. Every test holds this
+    /// lock for its whole body.
+    static CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn exclusive_cache() -> MutexGuard<'static, ()> {
+        let guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_cache();
+        guard
+    }
 
     const TEST_JWKS_RSA: &str = r#"{
         "keys": [
@@ -167,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_parse_jwks_rsa() {
-        clear_cache();
+        let _cache = exclusive_cache();
         update_cache_from_json(TEST_JWKS_RSA).unwrap();
 
         assert_eq!(key_count(), 1);
@@ -178,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_parse_jwks_ec() {
-        clear_cache();
+        let _cache = exclusive_cache();
         update_cache_from_json(TEST_JWKS_EC).unwrap();
 
         assert_eq!(key_count(), 1);
@@ -189,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_cache_miss_returns_error() {
-        clear_cache();
+        let _cache = exclusive_cache();
         update_cache_from_json(TEST_JWKS_RSA).unwrap();
 
         let result = resolve_key("nonexistent-kid");
@@ -200,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_empty_cache_returns_error() {
-        clear_cache();
+        let _cache = exclusive_cache();
 
         let result = resolve_key("any-kid");
         assert!(result.is_err());
@@ -208,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_cache_status_empty() {
-        clear_cache();
+        let _cache = exclusive_cache();
         let (count, age, _) = cache_status();
         assert_eq!(count, 0);
         assert!(age.is_none());
@@ -216,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_cache_status_populated() {
-        clear_cache();
+        let _cache = exclusive_cache();
         update_cache_from_json(TEST_JWKS_RSA).unwrap();
 
         let (count, age, _) = cache_status();

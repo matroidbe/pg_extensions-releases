@@ -15,7 +15,7 @@ name = "pgrx_embed_pg_s3"
 path = "src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg16"]
+default = ["pg18"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "pg_spi/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "pg_spi/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "pg_spi/pg16"]

@@ -912,12 +912,14 @@ CREATE INDEX chunks_bbox_gist    ON pgx.chunks USING GIST (bbox_envelope);
 CREATE INDEX chunks_node_gist    ON pgx.chunks USING GIST (node_range);
 CREATE INDEX chunks_member       ON pgx.chunks (member_id) WHERE member_id IS NOT NULL;
 
--- Idempotency for register_chunk: same (variable, time, uri, byte_offset)
--- represents the same chunk. Used by the xarray_index sink's upsert.
+-- Idempotency for register_chunk: same (variable, uri, chunk_key,
+-- byte_offset, time) represents the same chunk. Used by the xarray_index
+-- sink's upsert. chunk_key is what tells Zarr chunks apart: they share the
+-- store URI and have no byte_offset.
 -- NULLS NOT DISTINCT (PG15+) so chunks without a byte_offset / time_range
 -- (e.g. SELAFIN time-stepped chunks) still dedupe instead of multiplying.
 CREATE UNIQUE INDEX chunks_dedupe_idx
-    ON pgx.chunks (variable_id, uri, byte_offset, time_range) NULLS NOT DISTINCT;
+    ON pgx.chunks (variable_id, uri, chunk_key, byte_offset, time_range) NULLS NOT DISTINCT;
 "#,
     name = "bootstrap_catalog",
     bootstrap
@@ -1125,6 +1127,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cnt, 1, "duplicate register_chunk should not insert twice");
+    }
+
+    /// Zarr chunks share the store URI and carry no byte offset; only their
+    /// chunk_key (`0.1.0.0`, …) tells them apart. Levels or spatial tiles of
+    /// one time step must not collapse into a single catalog row.
+    #[pg_test]
+    fn test_register_chunk_distinct_chunk_keys_are_distinct_chunks() {
+        Spi::run("SELECT pgx.register_dataset('d3k', 'memory')").unwrap();
+        Spi::run("SELECT pgx.register_variable('d3k', 'v')").unwrap();
+        for key in ["0.0.0.0", "0.1.0.0", "0.1.0.0"] {
+            Spi::run(&format!(
+                "SELECT pgx.register_chunk('d3k', 'v', 'fs:///store.zarr', \
+                  '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', NULL, \
+                  NULL, NULL, '{key}', NULL, NULL)"
+            ))
+            .unwrap();
+        }
+        let cnt = Spi::get_one::<i64>("SELECT pgx.chunk_count('d3k')")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cnt, 2, "two distinct chunk keys, one re-registered");
     }
 
     #[pg_test]

@@ -14,7 +14,7 @@ Delta Lake streaming integration for PostgreSQL. Stream data bidirectionally bet
 ```bash
 # Install pgrx if not already installed
 cargo install cargo-pgrx
-cargo pgrx init --pg16 $(which pg_config)
+cargo pgrx init --pg18 $(which pg_config)
 
 # Build and install
 cd extensions/pg_delta

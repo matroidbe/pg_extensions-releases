@@ -150,14 +150,10 @@ pub fn create_sheet_impl(
     );
     Spi::run(&lock_sql).map_err(|e| e.to_string())?;
 
-    // Grant permissions on per-sheet tables to app_user
-    // (finalize GRANT ALL TABLES only covers tables existing at install time)
+    // Grant the per-sheet tables to app_user, the application role of
+    // deployments that have one.
     for tbl in &[&overlay_table, &audit_table, &snap_table, &lock_table] {
-        Spi::run(&format!(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON {} TO app_user",
-            tbl
-        ))
-        .ok();
+        grant_to_app_user("SELECT, INSERT, UPDATE, DELETE", tbl)?;
     }
 
     // Build and create the merged view
@@ -306,9 +302,26 @@ pub fn rebuild_merged_view(
     Spi::run(&view_sql).map_err(|e| format!("Failed to create merged view: {}", e))?;
 
     // Re-grant SELECT to app_user after view recreation
-    let grant_sql = format!("GRANT SELECT ON {} TO app_user", view_name);
-    Spi::run(&grant_sql).ok();
+    grant_to_app_user("SELECT", &view_name)?;
 
+    Ok(())
+}
+
+/// GRANT `privileges` ON `object` TO app_user, if that role exists.
+///
+/// A failing GRANT raises an ERROR that aborts the calling transaction —
+/// discarding the `Result` does not survive it — so a database without an
+/// app_user role must skip the statement rather than attempt it.
+fn grant_to_app_user(privileges: &str, object: &str) -> Result<(), String> {
+    let has_role = Spi::get_one::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'app_user')",
+    )
+    .map_err(|e| e.to_string())?
+    .unwrap_or(false);
+    if has_role {
+        Spi::run(&format!("GRANT {} ON {} TO app_user", privileges, object))
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

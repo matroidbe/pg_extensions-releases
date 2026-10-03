@@ -948,13 +948,13 @@ fn test_produce_json_columns() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Query the database to verify text/json columns
-    // Note: This requires psql to be available and pgrx running on port 28816
+    // Note: This requires psql to be available and pgrx running on PG_PORT
     let output = Command::new("psql")
         .args([
             "-h",
             "localhost",
             "-p",
-            "28816",
+            &common::pg_port().to_string(),
             "-U",
             "postgres",
             "-d",

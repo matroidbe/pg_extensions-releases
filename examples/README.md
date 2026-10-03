@@ -52,7 +52,7 @@ docker compose down -v
 
 If running without Docker, you need:
 
-1. **PostgreSQL 16+**
+1. **PostgreSQL 18**
 2. **Rust toolchain** (for pgrx extensions)
 3. **pgbrew** (pgx) for extension installation:
    ```bash

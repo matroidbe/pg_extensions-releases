@@ -520,7 +520,7 @@ mod tests {
 
     // =========================================================================
     // End-to-end object detection tests (require ONNX Runtime + model file)
-    // Run with: cargo pgrx test pg16 -- --ignored
+    // Run with: cargo pgrx test pg18 -- --ignored
     // =========================================================================
 
     /// Helper: read bus.jpg fixture and return as Postgres bytea hex literal.

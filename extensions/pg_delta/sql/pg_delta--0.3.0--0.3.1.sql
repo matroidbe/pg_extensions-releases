@@ -1,0 +1,2 @@
+-- pg_delta 0.3.0 -> 0.3.1
+-- No SQL changes: builds against PostgreSQL 18 (index-mode FDW path fix).

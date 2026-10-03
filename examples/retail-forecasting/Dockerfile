@@ -13,7 +13,7 @@
 #
 # =============================================================================
 
-FROM postgres:16-bookworm
+FROM postgres:18-bookworm
 
 # Install build dependencies (Rust, Go, Python, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
     libpython3-dev \
-    postgresql-server-dev-16 \
+    postgresql-server-dev-18 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
@@ -51,13 +51,13 @@ ENV PATH="${PATH}:/root/.local/bin"
 RUN go install github.com/matroidbe/pgbrew/cmd/pgx@latest
 
 # Set PG_CONFIG for pgx
-ENV PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+ENV PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
 # Install cargo-pgrx (required for pgrx extension detection)
 RUN cargo install cargo-pgrx --version 0.16.1 --locked
 
 # Initialize pgrx for the target PostgreSQL
-RUN cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
+RUN cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
 
 # Verify pgx installation
 RUN pgx doctor

@@ -63,11 +63,35 @@ Self-contained tools — no dependencies on other pg_extensions, useful in any c
 
 ### Prerequisites
 
-- PostgreSQL 14, 15, 16, or 17
+- PostgreSQL 18 (the default target). For 14–17, build with
+  `--no-default-features --features pgNN` plus the crate's other default
+  features (pg_ortools: `--features "pgNN cpsat"`), or let `pgx install` do it
 - Rust toolchain ([rustup](https://rustup.rs/))
 - [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx)
 
 ### Installation
+
+#### Prebuilt bottles (no compiler)
+
+Every release attaches a prebuilt bottle of each extension (except pg_ml) for
+PostgreSQL 18 on linux-amd64 (glibc 2.36+: Debian 12+, Ubuntu 24.04+, the
+official `postgres:18` images) to the
+[public release](https://github.com/matroidbe/pg_extensions-releases/releases).
+Install one with [pgbrew](https://github.com/matroidbe/pgbrew)'s `pgx`; the
+file name carries the extension's own version:
+
+```bash
+pgx install --configure --bottle \
+  https://github.com/matroidbe/pg_extensions-releases/releases/download/vX.Y.Z/pg_kafka-<version>-pg18-linux-amd64.tar.gz
+```
+
+`--configure` writes the server settings the extension needs (e.g.
+`shared_preload_libraries`) to a conf.d drop-in. Each release's `SHA256SUMS`
+covers its bottles. Runtime libraries are not bundled: pg_solid needs
+OpenCASCADE 7.6 (Debian 12 / Ubuntu 24.04; build from source against 7.8),
+pg_xarray needs PostGIS, and pg_image's ONNX functions need ONNX Runtime.
+
+#### From source
 
 ```bash
 cargo install cargo-pgrx
