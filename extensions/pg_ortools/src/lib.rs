@@ -37,6 +37,7 @@ fn extension_docs() -> &'static str {
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     worker::register_gucs();
+    worker::SUPERVISOR.init();
 
     if worker::is_worker_enabled() {
         worker::register_background_worker();

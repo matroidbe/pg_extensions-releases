@@ -31,20 +31,24 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const IDLE_LATCH: Duration = Duration::from_millis(500);
 
-/// Bind the listener and run the accept loop. Returns when SIGTERM
-/// arrives. Called on the bgworker's main thread.
-pub fn run(host: &str, port: u16, cache_seconds: u32) {
-    let listener = match TcpListener::bind((host, port)) {
-        Ok(l) => l,
-        Err(e) => {
-            pgrx::warning!("pg_xarray WMS: failed to bind {}:{} — {}", host, port, e);
-            return;
-        }
-    };
-    if let Err(e) = listener.set_nonblocking(true) {
-        pgrx::warning!("pg_xarray WMS: set_nonblocking: {}", e);
-        return;
-    }
+/// Why the accept loop returned
+pub enum RunEnd {
+    /// SIGTERM or postmaster death: the worker exits
+    Stopped,
+    /// A reload disabled the server or changed its address or cache
+    /// setting: the worker re-reads its settings
+    Reconfigure,
+}
+
+/// Bind the listener and run the accept loop. Called on the bgworker's
+/// main thread. `Err` when the listener cannot be set up (e.g. the port is
+/// taken): a failure for the supervisor.
+pub fn run(host: &str, port: u16, cache_seconds: u32) -> Result<RunEnd, String> {
+    let listener = TcpListener::bind((host, port))
+        .map_err(|e| format!("failed to bind {host}:{port}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {e}"))?;
     pgrx::log!("pg_xarray WMS: listening on {}:{}", host, port);
 
     loop {
@@ -55,8 +59,18 @@ pub fn run(host: &str, port: u16, cache_seconds: u32) {
 
         if pgrx::bgworkers::BackgroundWorker::sigterm_received() {
             pgrx::log!("pg_xarray WMS: SIGTERM received, shutting down");
-            return;
+            return Ok(RunEnd::Stopped);
         }
+        if pg_bgworker::reload_config_if_signalled()
+            && (!super::WMS_ENABLED.get()
+                || super::bind_host() != host
+                || super::WMS_PORT.get() as u16 != port
+                || super::WMS_CACHE_SECONDS.get().max(0) as u32 != cache_seconds)
+        {
+            pgrx::log!("pg_xarray WMS: settings changed, restarting the listener");
+            return Ok(RunEnd::Reconfigure);
+        }
+        super::worker::SUPERVISOR.tick(super::worker::WMS_SLOT);
         match listener.accept() {
             Ok((stream, _addr)) => {
                 serve_connection(stream, cache_seconds);
@@ -67,13 +81,13 @@ pub fn run(host: &str, port: u16, cache_seconds: u32) {
                 // exiting on false is what keeps a dead postmaster's
                 // worker from spinning on instantly-returning WaitLatch.
                 if !pgrx::bgworkers::BackgroundWorker::wait_latch(Some(IDLE_LATCH)) {
-                    return;
+                    return Ok(RunEnd::Stopped);
                 }
             }
             Err(e) => {
                 pgrx::warning!("pg_xarray WMS: accept error: {}", e);
                 if !pgrx::bgworkers::BackgroundWorker::wait_latch(Some(IDLE_LATCH)) {
-                    return;
+                    return Ok(RunEnd::Stopped);
                 }
             }
         }

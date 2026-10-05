@@ -21,7 +21,7 @@ pub mod worker;
 use std::ffi::CString;
 use std::time::Duration;
 
-use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder};
+use pgrx::bgworkers::BackgroundWorkerBuilder;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 pub use worker::pg_xarray_wms_worker_main;
@@ -58,6 +58,7 @@ pub static WMS_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CStri
 
 /// Register GUCs + the background worker. Called from `_PG_init`.
 pub fn init() {
+    worker::SUPERVISOR.init();
     GucRegistry::define_bool_guc(
         c"pg_xarray.wms_enabled",
         c"Enable the pg_xarray WMS HTTP server bgworker.",
@@ -115,6 +116,9 @@ pub fn init() {
         .set_library("pg_xarray")
         .set_argument(None)
         .enable_spi_access()
+        // Without a restart time (pgrx's default is BGW_NEVER_RESTART) any
+        // exit, even a terminate, would stop the WMS until a server restart
+        .set_restart_time(Some(Duration::from_secs(5)))
         .load();
 }
 
@@ -131,27 +135,4 @@ pub fn bind_host() -> String {
 /// Database to connect to for catalog lookups. Owned `String`.
 pub fn database() -> String {
     pg_bgworker::resolve_database(pg_bgworker::guc_str(&WMS_DATABASE).as_deref(), None)
-}
-
-/// Worker poll interval when the WMS is disabled — wakes up to check
-/// whether the GUC has been flipped on via `pg_reload_conf()`.
-pub const DISABLED_POLL_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Wait the bgworker's latch for the given duration. Returns true if
-/// the worker must exit: SIGTERM arrived or the postmaster died.
-///
-/// Two hard-won details live here:
-/// - check_for_interrupts!() services ProcSignalBarrier (sent by
-///   DROP DATABASE). pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS,
-///   so without this the barrier is never absorbed and DROP DATABASE
-///   hangs forever.
-/// - wait_latch's return value must NOT be ignored: it is false on
-///   SIGTERM *or postmaster death*. After the postmaster dies, WaitLatch
-///   returns immediately on every call — ignoring that turns each idle
-///   wait into a zero-delay spin, leaving an orphaned worker burning a
-///   full core indefinitely (observed: 16 days at 89% CPU).
-pub fn wait(d: Duration) -> bool {
-    pgrx::check_for_interrupts!();
-    let keep_running = BackgroundWorker::wait_latch(Some(d));
-    !keep_running || BackgroundWorker::sigterm_received()
 }

@@ -202,6 +202,7 @@ extension_sql!(
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     config::register_gucs();
+    worker::SUPERVISOR.init();
 
     // Register background workers unconditionally
     // (they check pg_git.enabled inside worker_main)

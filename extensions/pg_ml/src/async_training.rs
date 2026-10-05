@@ -317,7 +317,7 @@ pub fn update_job_progress(
     let sql = format!(
         "UPDATE pgml.training_jobs
          SET state = {}, progress = {}, current_step = {}
-         WHERE id = {}",
+         WHERE id = {} AND state IN ('setup', 'training')",
         quote_literal(state),
         progress,
         current_step_sql,
@@ -367,7 +367,7 @@ pub fn complete_job(job_id: i64, model_id: i64) -> Result<(), PgMlError> {
     let sql = format!(
         "UPDATE pgml.training_jobs
          SET state = 'completed', progress = 1.0, model_id = {}, completed_at = NOW()
-         WHERE id = {}",
+         WHERE id = {} AND state IN ('setup', 'training')",
         model_id, job_id
     );
 
@@ -379,7 +379,7 @@ pub fn fail_job(job_id: i64, error: &str) -> Result<(), PgMlError> {
     let sql = format!(
         "UPDATE pgml.training_jobs
          SET state = 'failed', error_message = {}, completed_at = NOW()
-         WHERE id = {}",
+         WHERE id = {} AND state IN ('setup', 'training')",
         quote_literal(error),
         job_id
     );
@@ -401,6 +401,35 @@ pub fn cancel_job(job_id: i64) -> Result<bool, PgMlError> {
         .map_err(|e| PgMlError::SpiError(format!("Failed to cancel job: {}", e)))?;
 
     Ok(cancelled.is_some())
+}
+
+/// Fail jobs left in `setup`/`training` by a training worker that died (there
+/// is one training worker, so at its start no job can still be running).
+/// Returns how many.
+pub fn fail_orphaned_jobs() -> Result<i64, PgMlError> {
+    Spi::get_one::<i64>(
+        "WITH failed AS (
+             UPDATE pgml.training_jobs
+             SET state = 'failed', completed_at = NOW(),
+                 error_message = 'the training worker stopped during this job'
+             WHERE state IN ('setup', 'training')
+             RETURNING id)
+         SELECT count(*) FROM failed",
+    )
+    .map(|n| n.unwrap_or(0))
+    .map_err(|e| PgMlError::SpiError(format!("Failed to fail orphaned jobs: {}", e)))
+}
+
+/// Lock the job row and report whether it was cancelled. Called in the
+/// transaction that stores the model, so a concurrent cancel either commits
+/// first (and wins) or waits for the model to be stored.
+fn lock_job_cancelled(job_id: i64) -> Result<bool, PgMlError> {
+    Spi::get_one::<bool>(&format!(
+        "SELECT state = 'cancelled' FROM pgml.training_jobs WHERE id = {} FOR UPDATE",
+        job_id
+    ))
+    .map_err(|e| PgMlError::SpiError(format!("Failed to lock job: {}", e)))?
+    .ok_or_else(|| PgMlError::SpiError(format!("Job {} not found", job_id)))
 }
 
 /// Check if a job was cancelled
@@ -531,7 +560,16 @@ fn parse_table_ref(source_table: &str) -> Result<(String, String), PgMlError> {
     }
 }
 
-/// Process a single training job
+/// Run `f` in a transaction of its own (the training worker's loop runs
+/// outside any)
+fn txn<R>(f: impl FnOnce() -> R) -> R {
+    BackgroundWorker::transaction(std::panic::AssertUnwindSafe(f))
+}
+
+/// Process a single training job. Runs outside any transaction: every step
+/// commits on its own, so `training_status()` shows progress as it happens
+/// and `cancel_training()` never waits for the training (the claim's row
+/// lock is long released).
 fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
     let start_time = std::time::Instant::now();
 
@@ -545,10 +583,10 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
     let (schema, table) = parse_table_ref(&job.source_table)?;
 
     // Update state to 'setup'
-    update_job_progress(job.id, "setup", 0.0, Some("Initializing experiment"))?;
+    txn(|| update_job_progress(job.id, "setup", 0.0, Some("Initializing experiment")))?;
 
     // Check for cancellation
-    if is_job_cancelled(job.id)? {
+    if txn(|| is_job_cancelled(job.id))? {
         pgrx::log!("pg_ml_training: job {} cancelled during setup", job.id);
         return Ok(());
     }
@@ -563,21 +601,23 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
 
         let setup_opts = job.config.setup_options.clone();
 
-        crate::pycaret::run_setup_timeseries(
-            &schema,
-            &table,
-            &job.target_column,
-            index_column,
-            fh,
-            Some(3),
-            job.config.fold_strategy.as_deref(),
-            setup_opts.as_ref(),
-        )?;
+        txn(|| {
+            crate::pycaret::run_setup_timeseries(
+                &schema,
+                &table,
+                &job.target_column,
+                index_column,
+                fh,
+                Some(3),
+                job.config.fold_strategy.as_deref(),
+                setup_opts.as_ref(),
+            )
+        })?;
 
         // Update state to 'training'
-        update_job_progress(job.id, "training", 0.1, Some("Starting TS training"))?;
+        txn(|| update_job_progress(job.id, "training", 0.1, Some("Starting TS training")))?;
 
-        if is_job_cancelled(job.id)? {
+        if txn(|| is_job_cancelled(job.id))? {
             pgrx::log!("pg_ml_training: job {} cancelled before training", job.id);
             return Ok(());
         }
@@ -587,29 +627,37 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
                 let algorithm = job.algorithm.as_deref().ok_or_else(|| {
                     PgMlError::InvalidParameter("algorithm required for single mode".into())
                 })?;
-                update_job_progress(
-                    job.id,
-                    "training",
-                    0.2,
-                    Some(&format!("Training {}", algorithm)),
-                )?;
-                crate::pycaret::run_create_ts_model(algorithm, job.config.hyperparams.as_ref())?
+                txn(|| {
+                    update_job_progress(
+                        job.id,
+                        "training",
+                        0.2,
+                        Some(&format!("Training {}", algorithm)),
+                    )
+                })?;
+                txn(|| {
+                    crate::pycaret::run_create_ts_model(algorithm, job.config.hyperparams.as_ref())
+                })?
             }
             "automl" => {
-                update_job_progress(
-                    job.id,
-                    "training",
-                    0.2,
-                    Some("Running TS AutoML comparison"),
-                )?;
+                txn(|| {
+                    update_job_progress(
+                        job.id,
+                        "training",
+                        0.2,
+                        Some("Running TS AutoML comparison"),
+                    )
+                })?;
                 let sort = job.config.metric.as_deref();
-                crate::pycaret::run_compare_ts_models(
-                    Some(1),
-                    sort,
-                    None,
-                    None,
-                    job.config.budget_time,
-                )?
+                txn(|| {
+                    crate::pycaret::run_compare_ts_models(
+                        Some(1),
+                        sort,
+                        None,
+                        None,
+                        job.config.budget_time,
+                    )
+                })?
             }
             _ => {
                 return Err(PgMlError::InvalidParameter(format!(
@@ -639,21 +687,23 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
         }
 
         // Run setup
-        let _setup_result = crate::pycaret::run_setup(
-            &schema,
-            &table,
-            &job.target_column,
-            Some(&job.task),
-            job.config.exclude_columns.as_deref(),
-            Some(&setup_opts),
-            None, // id_column - not used for async training yet
-        )?;
+        let _setup_result = txn(|| {
+            crate::pycaret::run_setup(
+                &schema,
+                &table,
+                &job.target_column,
+                Some(&job.task),
+                job.config.exclude_columns.as_deref(),
+                Some(&setup_opts),
+                None, // id_column - not used for async training yet
+            )
+        })?;
 
         // Update state to 'training'
-        update_job_progress(job.id, "training", 0.1, Some("Starting training"))?;
+        txn(|| update_job_progress(job.id, "training", 0.1, Some("Starting training")))?;
 
         // Check for cancellation
-        if is_job_cancelled(job.id)? {
+        if txn(|| is_job_cancelled(job.id))? {
             pgrx::log!("pg_ml_training: job {} cancelled before training", job.id);
             return Ok(());
         }
@@ -665,37 +715,47 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
                     PgMlError::InvalidParameter("algorithm required for single mode".into())
                 })?;
 
-                update_job_progress(
-                    job.id,
-                    "training",
-                    0.2,
-                    Some(&format!("Training {}", algorithm)),
-                )?;
+                txn(|| {
+                    update_job_progress(
+                        job.id,
+                        "training",
+                        0.2,
+                        Some(&format!("Training {}", algorithm)),
+                    )
+                })?;
 
                 if job.config.conformal {
-                    crate::pycaret::run_create_model_conformal(
-                        algorithm,
-                        job.config.hyperparams.as_ref(),
-                        &job.config.conformal_method,
-                        5, // conformal_cv
-                    )?
+                    txn(|| {
+                        crate::pycaret::run_create_model_conformal(
+                            algorithm,
+                            job.config.hyperparams.as_ref(),
+                            &job.config.conformal_method,
+                            5, // conformal_cv
+                        )
+                    })?
                 } else {
-                    crate::pycaret::run_create_model(algorithm, job.config.hyperparams.as_ref())?
+                    txn(|| {
+                        crate::pycaret::run_create_model(algorithm, job.config.hyperparams.as_ref())
+                    })?
                 }
             }
             "automl" => {
-                update_job_progress(job.id, "training", 0.2, Some("Running AutoML comparison"))?;
+                txn(|| {
+                    update_job_progress(job.id, "training", 0.2, Some("Running AutoML comparison"))
+                })?;
 
                 // Convert metric to sort parameter
                 let sort = job.config.metric.as_deref();
 
-                crate::pycaret::run_compare_models(
-                    Some(1), // Select best model
-                    sort,
-                    None, // include
-                    None, // exclude
-                    job.config.budget_time,
-                )?
+                txn(|| {
+                    crate::pycaret::run_compare_models(
+                        Some(1), // Select best model
+                        sort,
+                        None, // include
+                        None, // exclude
+                        job.config.budget_time,
+                    )
+                })?
             }
             _ => {
                 return Err(PgMlError::InvalidParameter(format!(
@@ -708,47 +768,49 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
 
     let training_time = start_time.elapsed().as_secs_f64();
 
-    // Check for cancellation before storing
-    if is_job_cancelled(job.id)? {
+    // Store the model, complete the job and notify in one transaction that
+    // locks the job row first: a cancel that committed meanwhile wins.
+    let stored = txn(|| -> Result<Option<i64>, PgMlError> {
+        if lock_job_cancelled(job.id)? {
+            return Ok(None);
+        }
+        update_job_progress(job.id, "training", 0.9, Some("Storing model"))?;
+
+        let project_id = crate::models::ensure_project(
+            &job.project_name,
+            &train_result.task,
+            &train_result.target_column,
+            &train_result.feature_columns,
+        )?;
+
+        let model_id = crate::models::store_model(
+            project_id,
+            &train_result.algorithm,
+            job.config.hyperparams.as_ref(),
+            train_result.metrics.clone(),
+            &train_result.model_bytes,
+            train_result.label_classes.as_deref(),
+            training_time,
+            true, // deploy
+            job.config.conformal,
+            if job.config.conformal {
+                Some(&job.config.conformal_method)
+            } else {
+                None
+            },
+        )?;
+
+        complete_job(job.id, model_id)?;
+        notify_completion(job.id, "completed", Some(model_id), &job.project_name, None)?;
+        Ok(Some(model_id))
+    })?;
+    let Some(model_id) = stored else {
         pgrx::log!(
             "pg_ml_training: job {} cancelled after training, not storing model",
             job.id
         );
         return Ok(());
-    }
-
-    update_job_progress(job.id, "training", 0.9, Some("Storing model"))?;
-
-    // Ensure project exists and store model
-    let project_id = crate::models::ensure_project(
-        &job.project_name,
-        &train_result.task,
-        &train_result.target_column,
-        &train_result.feature_columns,
-    )?;
-
-    let model_id = crate::models::store_model(
-        project_id,
-        &train_result.algorithm,
-        job.config.hyperparams.as_ref(),
-        train_result.metrics.clone(),
-        &train_result.model_bytes,
-        train_result.label_classes.as_deref(),
-        training_time,
-        true, // deploy
-        job.config.conformal,
-        if job.config.conformal {
-            Some(&job.config.conformal_method)
-        } else {
-            None
-        },
-    )?;
-
-    // Complete job
-    complete_job(job.id, model_id)?;
-
-    // Send notification
-    notify_completion(job.id, "completed", Some(model_id), &job.project_name, None)?;
+    };
 
     pgrx::log!(
         "pg_ml_training: job {} completed, model_id={}, training_time={:.2}s",
@@ -764,8 +826,15 @@ fn process_training_job(job: TrainingJob) -> Result<(), PgMlError> {
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
+    use crate::{SUPERVISOR, TRAINING_SLOT as SLOT};
+
     // Set up signal handlers
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SLOT, "pg_ml_training") {
+        SUPERVISOR.exit_clean(SLOT);
+    }
 
     // Connect to database for SPI access
     let database = get_database();
@@ -777,21 +846,23 @@ pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
         database
     );
 
-    // Check if enabled
+    // While disabled, wait (the setting follows reloads); do nothing (not
+    // even start Python) until the extension exists here.
     if !is_worker_enabled() {
-        pgrx::log!("pg_ml_training: disabled via pg_ml.training_worker_enabled=false");
-        return;
+        pgrx::log!("pg_ml_training: disabled via pg_ml.training_worker_enabled=false; waiting");
     }
-
-    // Do nothing (not even start Python) until the extension exists here.
-    if !pg_bgworker::wait_for_extension("pg_ml", &database) {
-        return;
+    if !pg_bgworker::wait_until(is_worker_enabled)
+        || !pg_bgworker::wait_for_extension("pg_ml", &database)
+    {
+        SUPERVISOR.exit_clean(SLOT);
     }
 
     // Initialize Python once for worker lifetime
     if let Err(e) = crate::ensure_python() {
-        pgrx::log!("pg_ml_training: failed to initialize Python: {}", e);
-        return;
+        SUPERVISOR.exit_failed(
+            SLOT,
+            &format!("pg_ml_training: failed to initialize Python: {e}"),
+        );
     }
 
     pgrx::log!("pg_ml_training: Python initialized successfully");
@@ -802,77 +873,83 @@ pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
         Ok(())
     });
     if let Err(e) = schema_result {
-        pgrx::log!("pg_ml_training: failed to ensure schema: {}", e);
-        return;
+        SUPERVISOR.exit_failed(
+            SLOT,
+            &format!("pg_ml_training: failed to ensure schema: {e}"),
+        );
     }
 
     pgrx::log!("pg_ml_training: schema ready");
 
-    let poll_interval = get_poll_interval();
+    match BackgroundWorker::transaction(fail_orphaned_jobs) {
+        Ok(0) => {}
+        Ok(n) => pgrx::log!(
+            "pg_ml_training: failed {} job(s) left running by a previous worker",
+            n
+        ),
+        Err(e) => pgrx::log!("pg_ml_training: could not fail orphaned jobs: {}", e),
+    }
 
-    // Main loop
-    while BackgroundWorker::wait_latch(Some(poll_interval)) {
+    // Main loop. The poll interval is read every round, so a reload applies.
+    while BackgroundWorker::wait_latch(Some(get_poll_interval())) {
         // Check for SIGTERM
         if BackgroundWorker::sigterm_received() {
             pgrx::log!("pg_ml_training: received SIGTERM, shutting down");
             break;
         }
 
-        // Handle SIGHUP for config reload
-        if BackgroundWorker::sighup_received() {
-            pgrx::log!("pg_ml_training: received SIGHUP");
+        // pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS: without this the
+        // ProcSignalBarrier of DROP DATABASE is never acknowledged
+        pgrx::check_for_interrupts!();
+        if pg_bgworker::reload_config_if_signalled() {
+            pgrx::log!("pg_ml_training: configuration reloaded");
+        }
+        SUPERVISOR.tick(SLOT);
+        if !is_worker_enabled() {
+            continue;
         }
 
-        // Try to claim and process one job within a transaction
-        let result: Result<(), PgMlError> = BackgroundWorker::transaction(|| {
-            match claim_next_job() {
-                Ok(Some(job)) => {
-                    let job_id = job.id;
-                    let project = job.project_name.clone();
+        // Claim in its own committed transaction: the job shows as 'setup' at
+        // once and the claim's row lock is released before the training
+        let claimed = BackgroundWorker::transaction(claim_next_job);
 
-                    if let Err(e) = process_training_job(job) {
-                        pgrx::log!("pg_ml_training: job {} failed: {}", job_id, e);
+        match claimed {
+            Ok(Some(job)) => {
+                let job_id = job.id;
+                let project = job.project_name.clone();
 
-                        // Mark job as failed
-                        if let Err(fail_err) = fail_job(job_id, &e.to_string()) {
-                            pgrx::log!(
-                                "pg_ml_training: failed to mark job {} as failed: {}",
-                                job_id,
-                                fail_err
-                            );
-                        }
-
-                        // Send failure notification
-                        if let Err(notify_err) = notify_completion(
+                if let Err(e) = process_training_job(job) {
+                    let msg = e.to_string();
+                    pgrx::log!("pg_ml_training: job {} failed: {}", job_id, msg);
+                    if let Err(fail_err) = BackgroundWorker::transaction(|| fail_job(job_id, &msg))
+                    {
+                        pgrx::log!(
+                            "pg_ml_training: failed to mark job {} as failed: {}",
                             job_id,
-                            "failed",
-                            None,
-                            &project,
-                            Some(&e.to_string()),
-                        ) {
-                            pgrx::log!(
-                                "pg_ml_training: failed to send failure notification: {}",
-                                notify_err
-                            );
-                        }
+                            fail_err
+                        );
+                    }
+                    if let Err(notify_err) = BackgroundWorker::transaction(|| {
+                        notify_completion(job_id, "failed", None, &project, Some(&msg))
+                    }) {
+                        pgrx::log!(
+                            "pg_ml_training: failed to send failure notification: {}",
+                            notify_err
+                        );
                     }
                 }
-                Ok(None) => {
-                    // No jobs to process
-                }
-                Err(e) => {
-                    pgrx::log!("pg_ml_training: error claiming job: {}", e);
-                }
             }
-            Ok(())
-        });
-
-        if let Err(e) = result {
-            pgrx::log!("pg_ml_training: transaction error: {}", e);
+            Ok(None) => {
+                // No jobs to process
+            }
+            Err(e) => {
+                pgrx::log!("pg_ml_training: error claiming job: {}", e);
+            }
         }
     }
 
     pgrx::log!("pg_ml_training: worker stopped");
+    SUPERVISOR.exit_clean(SLOT);
 }
 
 // =============================================================================

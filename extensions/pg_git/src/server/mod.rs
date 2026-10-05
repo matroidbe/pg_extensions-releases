@@ -42,20 +42,47 @@ pub fn run_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error
 
     let host_owned = host.to_string();
     let bridge_clone = bridge.clone();
-    let _server_handle = runtime.spawn(async move {
-        if let Err(e) = run_http_server(&host_owned, port, bridge_clone).await {
-            pgrx::log!("pg_git: HTTP server error: {}", e);
-        }
+    // No pgrx calls on tokio threads: the error is returned to this thread
+    let server_handle = runtime.spawn(async move {
+        run_http_server(&host_owned, port, bridge_clone)
+            .await
+            .map_err(|e| e.to_string())
     });
 
     pgrx::log!("pg_git: HTTP server listening on {}:{}", host, port);
 
     // Main SPI polling loop
     loop {
+        // Service pending interrupts, in particular the ProcSignalBarrier of
+        // DROP DATABASE: pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS, so
+        // without this the drop hangs.
+        pgrx::check_for_interrupts!();
+
         if BackgroundWorker::sigterm_received() {
             request_shutdown();
             break;
         }
+
+        // The listener task ends only on shutdown. If it ended anyway (e.g. the
+        // port could not be bound), fail so the supervisor restarts the worker.
+        if server_handle.is_finished() {
+            let reason = match runtime.block_on(server_handle) {
+                Ok(Err(e)) => e,
+                Ok(Ok(())) => "the listener stopped".to_string(),
+                Err(e) => format!("the listener task failed: {e}"),
+            };
+            request_shutdown();
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            return Err(format!("HTTP listener on {host}:{port}: {reason}").into());
+        }
+
+        // Apply pg_reload_conf(); stop serving when disabled
+        if pg_bgworker::reload_config_if_signalled() && !crate::config::PG_GIT_ENABLED.get() {
+            pgrx::log!("pg_git HTTP worker: disabled via pg_git.enabled=false, stopping");
+            request_shutdown();
+            break;
+        }
+        crate::worker::SUPERVISOR.tick(crate::worker::HTTP_SLOT);
 
         let mut processed = 0;
         while let Some(request) = receiver.try_recv() {
@@ -66,12 +93,10 @@ pub fn run_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error
             }
         }
 
-        // Idle wait. Must use wait_latch (not thread::sleep) so the bgworker
-        // processes Postgres interrupts — in particular ProcSignalBarrier
-        // (SIGUSR1), which is how DROP DATABASE asks every backend to release
-        // its connection. thread::sleep stays inside libc and never runs the
-        // CFI that handles the barrier, so DROP DATABASE hangs indefinitely.
-        // wait_latch also gives this backend a real wait_event in
+        // Idle wait. wait_latch (not thread::sleep) so the latch wakes us
+        // promptly when a procsignal (e.g. a barrier) arrives; the interrupt
+        // itself is processed by check_for_interrupts!() at the top of the
+        // loop. wait_latch also gives this backend a real wait_event in
         // pg_stat_activity (PG_WAIT_EXTENSION). Returns false on SIGTERM or
         // postmaster death — break in either case.
         if processed == 0 && !BackgroundWorker::wait_latch(Some(Duration::from_millis(1))) {

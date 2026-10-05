@@ -22,6 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
+use super::listener::{advertised_address, current, SharedAdvertised};
 use crate::protocol::{frame_message, handle_request, parse_request_header, write_response_header};
 use crate::storage::{execute_spi_request, SpiBridge, SpiStorageClient};
 use pg_observability::{
@@ -87,10 +88,14 @@ pub struct MetricsConfig {
 ///
 /// If `metrics_config` is provided and enabled, worker 0 will start a Prometheus
 /// metrics endpoint on the specified port.
+///
+/// `on_reload` runs on this (main) thread after each configuration reload. It
+/// refreshes `advertised` and returns whether to keep serving.
 pub fn run_server(
     host: &str,
     port: u16,
-    advertised_host: &str,
+    advertised: SharedAdvertised,
+    on_reload: &dyn Fn() -> bool,
     worker_id: i32,
     metrics_config: Option<MetricsConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -115,14 +120,13 @@ pub fn run_server(
 
     // Spawn the server task
     let host_owned = host.to_string();
-    let advertised_host_owned = advertised_host.to_string();
     let bridge_clone = bridge.clone();
 
-    let _server_handle = runtime.spawn(async move {
+    let server_handle = runtime.spawn(async move {
         if let Err(e) = run_server_async(
             &host_owned,
             port,
-            &advertised_host_owned,
+            advertised,
             bridge_clone,
             worker_id,
             metrics_config,
@@ -131,7 +135,9 @@ pub fn run_server(
         {
             // NOTE: Cannot use pgrx::warning! here as this runs on tokio threads
             error!(worker_id, error = %e, "Server error");
+            return Err(e.to_string());
         }
+        Ok(())
     });
 
     // Main polling loop - runs on bgworker thread where SPI is valid
@@ -153,6 +159,33 @@ pub fn run_server(
         if BackgroundWorker::sigterm_received() {
             pgrx::log!(
                 "pg_kafka worker {}: received SIGTERM, initiating shutdown",
+                worker_id
+            );
+            request_shutdown();
+            break;
+        }
+
+        // The listener task ends only on shutdown. If it ended anyway (e.g. the
+        // port could not be bound), stop so the worker exits and the postmaster
+        // retries after its restart interval, instead of idling without serving.
+        if server_handle.is_finished() {
+            let reason = match runtime.block_on(server_handle) {
+                Ok(Err(e)) => e,
+                Ok(Ok(())) => "the listener stopped".to_string(),
+                Err(e) => format!("the listener task failed: {e}"),
+            };
+            request_shutdown();
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            return Err(format!("Kafka listener on {host}:{port}: {reason}").into());
+        }
+
+        // Marks the run healthy once it has served for a while
+        crate::worker::SUPERVISOR.tick(worker_id as usize);
+
+        // Apply pg_reload_conf(): new advertised address, or stop if disabled
+        if pg_bgworker::reload_config_if_signalled() && !on_reload() {
+            pgrx::log!(
+                "pg_kafka worker {}: disabled via pg_kafka.enabled=false, stopping",
                 worker_id
             );
             request_shutdown();
@@ -206,7 +239,7 @@ pub fn run_server(
 async fn run_server_async(
     host: &str,
     port: u16,
-    advertised_host: &str,
+    advertised: SharedAdvertised,
     bridge: Arc<SpiBridge>,
     worker_id: i32,
     metrics_config: Option<MetricsConfig>,
@@ -260,14 +293,13 @@ async fn run_server_async(
                     Ok((socket, addr)) => {
                         info!(worker_id, %addr, "New connection accepted");
                         let storage_clone = storage.clone();
-                        let advertised_host_clone = advertised_host.to_string();
-                        let port_i32 = port as i32;
+                        let advertised_clone = advertised.clone();
                         let shutdown_notify_clone = shutdown_notify.clone();
                         let wid = worker_id;
 
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_connection(socket, storage_clone, &advertised_host_clone, port_i32, shutdown_notify_clone, wid)
+                                handle_connection(socket, storage_clone, advertised_clone, port, shutdown_notify_clone, wid)
                                     .await
                             {
                                 // Don't log errors during shutdown
@@ -306,8 +338,8 @@ async fn run_server_async(
 async fn handle_connection(
     mut socket: TcpStream,
     storage: Arc<SpiStorageClient>,
-    broker_host: &str,
-    broker_port: i32,
+    advertised: SharedAdvertised,
+    bind_port: u16,
     shutdown_notify: Arc<Notify>,
     worker_id: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -321,6 +353,9 @@ async fn handle_connection(
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
+
+    // The address this client reached: advertised when no host is configured
+    let local_addr = socket.local_addr().ok();
 
     loop {
         // Check for shutdown
@@ -366,8 +401,12 @@ async fn handle_connection(
 
                             match parse_request_header(&mut cursor) {
                                 Ok(header) => {
+                                    // Read per request so a reload reaches open connections
+                                    let (broker_host, broker_port) =
+                                        advertised_address(&current(&advertised), bind_port, local_addr);
+
                                     // Handle the request
-                                    match handle_request(&header, &mut cursor, broker_host, broker_port, &peer_host, &storage)
+                                    match handle_request(&header, &mut cursor, &broker_host, broker_port, &peer_host, &storage)
                                         .await
                                     {
                                         Ok(response_body) => {

@@ -1,13 +1,13 @@
 //! Background worker entry point.
 //!
 //! Idle-loop pattern:
-//!   * When `pg_xarray.wms_enabled = false` (default), sit in
-//!     `BackgroundWorker::wait_latch` for short intervals — this is
-//!     the [feedback-bgworker-wait-latch] memory's load-bearing
-//!     constraint: tokio-driven workers that use `std::thread::sleep`
-//!     hang DROP DATABASE for the full sleep interval.
-//!   * When enabled, hand control over to `tcp::run` which builds its
-//!     own tokio runtime; `tcp::run` returns when SIGTERM arrives.
+//!   * When `pg_xarray.wms_enabled = false` (default), wait on the latch
+//!     (`pg_bgworker::wait_until`, which also services interrupts so
+//!     DROP DATABASE does not hang, and applies `pg_reload_conf()`).
+//!   * When enabled, hand control to `tcp::run` (std::net accept loop on
+//!     this thread). It returns on SIGTERM (exit), on a reload that
+//!     disables the server or changes its settings (loop again), or with
+//!     an error such as a bind failure (a supervised failure).
 //!
 //! The worker entry symbol is re-exported via `pub use` from `lib.rs`
 //! so it ends up in the .so's dynamic symbol table — without that
@@ -15,45 +15,47 @@
 
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 
-use super::{
-    bind_host, database, tcp, wait, DISABLED_POLL_INTERVAL, WMS_CACHE_SECONDS, WMS_ENABLED,
-    WMS_PORT,
+use super::{bind_host, database, tcp, WMS_CACHE_SECONDS, WMS_ENABLED, WMS_PORT};
+
+/// Restarts, backoff and the failed state of the WMS worker
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(
+        c"pg_xarray_supervision",
+        c"pg_xarray.max_worker_failures",
+    )
 };
+
+pg_bgworker::supervision_sql!(crate::server::worker::SUPERVISOR);
+
+pub const WMS_SLOT: usize = 0;
 
 #[pgrx::pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn pg_xarray_wms_worker_main(_arg: pgrx::pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(WMS_SLOT, "pg_xarray WMS") {
+        SUPERVISOR.exit_clean(WMS_SLOT);
+    }
+
     let db = database();
     BackgroundWorker::connect_worker_to_spi(Some(db.as_str()), None);
 
     pgrx::log!("pg_xarray WMS bgworker started (db='{}')", db);
 
     loop {
-        if BackgroundWorker::sigterm_received() {
-            pgrx::log!("pg_xarray WMS bgworker: SIGTERM, exiting");
-            return;
+        // Disabled: wait until a reload turns pg_xarray.wms_enabled on.
+        // Then serve nothing until the extension's catalog exists in this
+        // database.
+        if !pg_bgworker::wait_until(|| WMS_ENABLED.get())
+            || !pg_bgworker::wait_for_extension("pg_xarray", &db)
+        {
+            SUPERVISOR.exit_clean(WMS_SLOT);
         }
 
-        if !WMS_ENABLED.get() {
-            // Disabled — sleep on the latch for a short interval so a
-            // SIGHUP that flips the GUC on can wake us promptly. Using
-            // wait_latch (not thread::sleep) keeps the worker
-            // responsive to ProcSignalBarrier — DROP DATABASE won't hang.
-            if wait(DISABLED_POLL_INTERVAL) {
-                return;
-            }
-            continue;
-        }
-
-        // Enabled — serve nothing until the extension's catalog exists in
-        // this database.
-        if !pg_bgworker::wait_for_extension("pg_xarray", &db) {
-            return;
-        }
-
-        // Run the TCP accept loop. This blocks until SIGTERM breaks the
-        // loop inside tcp::run, then returns here.
+        // Run the accept loop until SIGTERM, a settings change, or failure
         let host = bind_host();
         let port = WMS_PORT.get() as u16;
         let cache = WMS_CACHE_SECONDS.get().max(0) as u32;
@@ -63,17 +65,10 @@ pub extern "C-unwind" fn pg_xarray_wms_worker_main(_arg: pgrx::pg_sys::Datum) {
             port,
             cache
         );
-        tcp::run(&host, port, cache);
-
-        // tcp::run returned — most likely SIGTERM. Loop top will exit.
-        if BackgroundWorker::sigterm_received() {
-            return;
-        }
-        // If we got here without SIGTERM, the listener failed to bind
-        // or the runtime crashed; back off briefly before retrying so
-        // we don't busy-loop on bind errors.
-        if wait(DISABLED_POLL_INTERVAL) {
-            return;
+        match tcp::run(&host, port, cache) {
+            Ok(tcp::RunEnd::Stopped) => SUPERVISOR.exit_clean(WMS_SLOT),
+            Ok(tcp::RunEnd::Reconfigure) => continue,
+            Err(e) => SUPERVISOR.exit_failed(WMS_SLOT, &format!("pg_xarray WMS: {e}")),
         }
     }
 }

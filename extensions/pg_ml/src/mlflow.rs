@@ -152,8 +152,15 @@ pub fn register_background_worker() {
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
+    use crate::{MLFLOW_SLOT as SLOT, SUPERVISOR};
+
     // Set up signal handlers
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SLOT, "pg_ml_mlflow") {
+        SUPERVISOR.exit_clean(SLOT);
+    }
 
     let port = get_port();
     let host = get_host();
@@ -172,19 +179,23 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
 
     // Create mlruns directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&mlruns_path) {
-        pgrx::log!("pg_ml_mlflow: failed to create mlruns directory: {}", e);
-        return;
+        SUPERVISOR.exit_failed(
+            SLOT,
+            &format!("pg_ml_mlflow: failed to create mlruns directory: {e}"),
+        );
     }
 
     // Check if mlflow binary exists in venv
     let mlflow_bin = venv_path.join("bin/mlflow");
     if !mlflow_bin.exists() {
-        pgrx::log!(
-            "pg_ml_mlflow: mlflow binary not found at {:?}. \
-             Ensure pycaret[full] is installed in the venv.",
-            mlflow_bin
+        SUPERVISOR.exit_failed(
+            SLOT,
+            &format!(
+                "pg_ml_mlflow: mlflow binary not found at {:?}. \
+                 Ensure pycaret[full] is installed in the venv.",
+                mlflow_bin
+            ),
         );
-        return;
     }
 
     // Spawn MLflow UI server as subprocess
@@ -209,12 +220,17 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
             c
         }
         Err(e) => {
-            pgrx::log!("pg_ml_mlflow: failed to start MLflow UI server: {}", e);
-            return;
+            SUPERVISOR.exit_failed(
+                SLOT,
+                &format!("pg_ml_mlflow: failed to start MLflow UI server: {e}"),
+            );
         }
     };
 
-    // Main loop - wait for shutdown signal
+    // Main loop - wait for shutdown signal. `failure` is set when the MLflow
+    // process dies: the supervisor then restarts the worker (and with it
+    // MLflow), backing off and eventually giving up.
+    let mut failure: Option<String> = None;
     loop {
         // Check for SIGTERM
         if BackgroundWorker::sigterm_received() {
@@ -226,18 +242,16 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Process exited
-                pgrx::log!(
-                    "pg_ml_mlflow: MLflow UI server exited with status: {}",
-                    status
-                );
-                // Could restart here, but for now just exit
+                failure = Some(format!(
+                    "pg_ml_mlflow: MLflow UI server exited with status: {status}"
+                ));
                 break;
             }
             Ok(None) => {
                 // Still running, continue
             }
             Err(e) => {
-                pgrx::log!("pg_ml_mlflow: error checking MLflow process: {}", e);
+                failure = Some(format!("pg_ml_mlflow: error checking MLflow process: {e}"));
                 break;
             }
         }
@@ -255,10 +269,10 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
             break;
         }
 
-        // Handle SIGHUP for config reload (currently no-op)
-        if BackgroundWorker::sighup_received() {
-            pgrx::log!("pg_ml_mlflow: received SIGHUP");
-        }
+        // Settings only matter at startup (host, port, paths), but apply the
+        // reload so this process does not keep a stale configuration
+        pg_bgworker::reload_config_if_signalled();
+        SUPERVISOR.tick(SLOT);
     }
 
     // Clean shutdown: kill the MLflow subprocess
@@ -271,6 +285,10 @@ pub extern "C-unwind" fn pg_ml_mlflow_worker_main(_arg: pg_sys::Datum) {
     }
 
     pgrx::log!("pg_ml_mlflow: worker stopped");
+    match failure {
+        Some(reason) => SUPERVISOR.exit_failed(SLOT, &reason),
+        None => SUPERVISOR.exit_clean(SLOT),
+    }
 }
 
 // =============================================================================

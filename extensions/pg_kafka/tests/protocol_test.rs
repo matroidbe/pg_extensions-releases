@@ -116,6 +116,102 @@ fn test_metadata() {
     println!("Metadata: {} broker(s)", broker_count);
 }
 
+/// Read a Kafka (i16-length) string at `pos`, returning it and the next position
+fn read_string_at(response: &[u8], pos: usize) -> (String, usize) {
+    let len = i16::from_be_bytes([response[pos], response[pos + 1]]) as usize;
+    let s = String::from_utf8(response[pos + 2..pos + 2 + len].to_vec()).unwrap();
+    (s, pos + 2 + len)
+}
+
+fn read_i32_at(response: &[u8], pos: usize) -> i32 {
+    i32::from_be_bytes(response[pos..pos + 4].try_into().unwrap())
+}
+
+/// The broker `(host, port)` advertised in a Metadata v0 response
+fn metadata_broker(stream: &mut TcpStream) -> (String, i32) {
+    let mut body = BytesMut::new();
+    body.put_i32(-1);
+    let response = send_request(stream, &build_request(3, 0, 20, "test-client", &body));
+    // correlation_id, broker count, node_id, host, port
+    assert_eq!(read_i32_at(&response, 4), 1, "expected one broker");
+    let (host, pos) = read_string_at(&response, 12);
+    (host, read_i32_at(&response, pos))
+}
+
+/// The coordinator `(host, port)` from a FindCoordinator v0 response
+fn coordinator(stream: &mut TcpStream) -> (String, i32) {
+    let mut body = BytesMut::new();
+    let group = "advertised-test-group";
+    body.put_i16(group.len() as i16);
+    body.put_slice(group.as_bytes());
+    let response = send_request(stream, &build_request(10, 0, 21, "test-client", &body));
+    // correlation_id, error_code, node_id, host, port
+    assert_eq!(i16::from_be_bytes([response[4], response[5]]), 0);
+    let (host, pos) = read_string_at(&response, 10);
+    (host, read_i32_at(&response, pos))
+}
+
+/// Resets the advertised listener settings, even when an assertion fails,
+/// so later tests (and real clients) are not sent to a fake address
+struct ResetAdvertised;
+
+impl Drop for ResetAdvertised {
+    fn drop(&mut self) {
+        let _ = common::execute_sql("ALTER SYSTEM RESET pg_kafka.advertised_host");
+        let _ = common::execute_sql("ALTER SYSTEM RESET pg_kafka.advertised_port");
+        let _ = common::run_sql("SELECT pg_reload_conf()");
+    }
+}
+
+/// Poll `probe` until it returns `want` (a reload reaches the workers
+/// asynchronously), then return the last value seen
+fn wait_for<T: PartialEq + Clone>(want: &T, mut probe: impl FnMut() -> T) -> T {
+    let mut seen = probe();
+    for _ in 0..50 {
+        if &seen == want {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        seen = probe();
+    }
+    seen
+}
+
+/// Regression for #125 and eidos#392: the advertised address defaults to the
+/// address the client reached (never 0.0.0.0), honours
+/// pg_kafka.advertised_port, and follows pg_reload_conf() on an open
+/// connection.
+#[test]
+fn test_advertised_listener_follows_reload() {
+    skip_if_no_server!(common::kafka_addr());
+    let _reset = ResetAdvertised;
+    drop(ResetAdvertised); // start from the defaults
+
+    let mut stream = TcpStream::connect(common::kafka_addr()).expect("Failed to connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let port = i32::from(common::kafka_port());
+    let default = (common::KAFKA_HOST.to_string(), port);
+    assert_eq!(wait_for(&default, || metadata_broker(&mut stream)), default);
+    assert_eq!(coordinator(&mut stream), default);
+
+    common::execute_sql("ALTER SYSTEM SET pg_kafka.advertised_host = 'kafka.example.test'")
+        .unwrap();
+    common::execute_sql("ALTER SYSTEM SET pg_kafka.advertised_port = 5591").unwrap();
+    common::run_sql("SELECT pg_reload_conf()").unwrap();
+
+    let remapped = ("kafka.example.test".to_string(), 5591);
+    assert_eq!(
+        wait_for(&remapped, || metadata_broker(&mut stream)),
+        remapped
+    );
+    assert_eq!(coordinator(&mut stream), remapped);
+
+    drop(ResetAdvertised);
+    assert_eq!(wait_for(&default, || metadata_broker(&mut stream)), default);
+}
+
 /// Test Metadata request for specific topic (unknown)
 #[test]
 fn test_metadata_unknown_topic() {

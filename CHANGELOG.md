@@ -4,6 +4,61 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.5.0 — 2026-10-05
+
+**Supervised background workers.** Every extension with background workers
+now supervises them (design/bgworker-supervision). After a failure a worker
+backs off (5s, doubling to 60s); after `<ext>.max_worker_failures`
+consecutive failures (default 10, `0` = never give up) it stays idle in a
+`failed` state until `SELECT <schema>.reset_workers()` (superuser) or a
+server restart. `<schema>.worker_status()` shows each worker's state, failure
+count, restarts and last failure reason. A worker stopped on purpose
+(SIGTERM, disabled) is not counted, and 60s of healthy running resets the
+count.
+
+**pg_kafka advertised listener.** New `pg_kafka.advertised_port` for clients
+that reach the broker through a remapped port (NAT, proxy, a container
+publishing 9092 elsewhere). An unset `pg_kafka.advertised_host` now means the
+address the client connected to, never `0.0.0.0`. Both follow
+`pg_reload_conf()`, including on open connections
+(design/pg_kafka/advertised-listener).
+
+**pg_ml installs a locked Python environment.** `make install` and
+`pgml.setup_venv()` install the hashed export of `uv.lock` embedded in the
+extension, so every venv has exactly the packages that were tested
+(design/pg_ml/python-environment).
+
+Extension versions: **pg_delta 0.3.3, pg_git 0.3.2, pg_kafka 0.3.2, pg_ml
+0.3.2, pg_mqtt 0.3.2, pg_ortools 0.3.2, pg_s3 0.3.2, pg_streaming 0.3.2,
+pg_swarm 0.3.2, pg_xarray 0.4.2**; all others unchanged. Upgrade with
+`ALTER EXTENSION <ext> UPDATE`. A server restart is needed for supervision:
+it uses shared memory that is set up when the library is preloaded.
+
+### Fixed
+- Background workers never applied `pg_reload_conf()`: pgrx only flags
+  SIGHUP and nothing reloaded the configuration. `pg_xarray.wms_enabled`,
+  documented as toggled by reload, needed a server restart.
+- A background worker stopped by `pg_terminate_backend()` or
+  `DROP DATABASE … WITH (FORCE)` exited with code 0 and was never started
+  again until a server restart. pg_xarray's WMS worker was never restarted
+  after any exit.
+- `DROP DATABASE` could hang on background workers that waited without
+  servicing interrupts (pg_delta, pg_git, pg_ml, pg_streaming, pg_swarm, and
+  shared waits in every extension).
+- pg_kafka, pg_mqtt, pg_s3, pg_git: a listener that could not bind its port
+  left the worker idling; it is now a reported failure that is retried.
+- pg_kafka (#125): the advertised host was read once at startup and
+  defaulted to `0.0.0.0`, so remote clients could not connect.
+- pg_ml: training jobs ran in one transaction, so `training_status()` showed
+  `queued` until a job finished and `cancel_training()` waited for the
+  training to end. Jobs left running by a worker that died are now failed.
+- pg_git: the HTTP worker logged from a tokio thread.
+- pg_swarm: the scheduler could take another node's id as its own.
+- Tests: integration suites skipped, and so passed, when their server was
+  down; `test.sh` now fails instead. pg_git's integration tests had never run.
+- CI: the pgrx test cluster has its own port, so other projects' CI on the
+  same runner host no longer collides with it.
+
 ## v0.4.1 — 2026-10-03
 
 **Background-worker configuration.** Every extension with background workers

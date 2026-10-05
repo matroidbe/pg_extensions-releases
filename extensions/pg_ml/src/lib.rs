@@ -52,10 +52,23 @@ fn extension_docs() -> &'static str {
 // Extension Initialization
 // =============================================================================
 
+/// Restarts, backoff and the failed state of the training and MLflow workers
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(c"pg_ml_supervision", c"pg_ml.max_worker_failures")
+};
+
+pg_bgworker::supervision_sql!(crate::SUPERVISOR);
+
+/// Supervision slots
+pub(crate) const TRAINING_SLOT: usize = 0;
+pub(crate) const MLFLOW_SLOT: usize = 1;
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     // Register GUC settings
     config::register_gucs();
+    SUPERVISOR.init();
 
     // Register embedding GUC settings
     embeddings::config::register_gucs();

@@ -284,13 +284,15 @@ pub fn run_stream_manager() -> Result<(), Box<dyn std::error::Error + Send + Syn
         manager.streams.len()
     );
 
-    // Main loop. wait_latch (not thread::sleep) so the bgworker processes
-    // Postgres interrupts — in particular ProcSignalBarrier (SIGUSR1), which
-    // is how DROP DATABASE asks every backend to release its connection.
-    // thread::sleep stays inside libc and never runs the CFI that handles the
-    // barrier, so DROP DATABASE hangs indefinitely. wait_latch also gives the
-    // backend a real wait_event in pg_stat_activity (PG_WAIT_EXTENSION).
+    // Main loop. wait_latch (not thread::sleep) so the latch wakes us
+    // promptly when a procsignal arrives, and check_for_interrupts!() to
+    // process it: pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS, so
+    // without it the ProcSignalBarrier of DROP DATABASE is never acknowledged
+    // and the drop hangs. wait_latch also gives the backend a real wait_event
+    // in pg_stat_activity (PG_WAIT_EXTENSION).
     loop {
+        pgrx::check_for_interrupts!();
+
         // Check for shutdown FIRST before doing any work
         if BackgroundWorker::sigterm_received() {
             log!("pg_delta: SIGTERM received, initiating shutdown");
@@ -304,13 +306,19 @@ pub fn run_stream_manager() -> Result<(), Box<dyn std::error::Error + Send + Syn
             break;
         }
 
-        // Check for config reload
-        if BackgroundWorker::sighup_received() {
-            log!("pg_delta: received SIGHUP, reloading configuration");
+        // Apply pg_reload_conf(): settings, then stream configs; stop when
+        // disabled
+        if pg_bgworker::reload_config_if_signalled() {
+            log!("pg_delta: configuration reloaded");
+            if !crate::PG_DELTA_ENABLED.get() {
+                log!("pg_delta: disabled via delta.enabled=false, stopping");
+                break;
+            }
             if let Err(e) = manager.reload_configs() {
                 log!("pg_delta: failed to reload configs: {}", e);
             }
         }
+        crate::SUPERVISOR.tick(crate::STREAM_MANAGER_SLOT);
 
         // Process streams (only if not shutting down)
         if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {

@@ -31,7 +31,7 @@ IS_SYSTEM_PG := $(shell echo $(SHAREDIR) | grep -qE '^/usr/(share/postgresql|pgs
 PG_USER ?= postgres
 PG_GROUP ?= postgres
 
-# Directory containing this Makefile (for finding pyproject.toml)
+# Directory containing this Makefile (for finding requirements.lock.txt)
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 .PHONY: all install clean clean-all info help check-uv create-venv
@@ -46,7 +46,7 @@ check-uv:
 		exit 1; \
 	}
 
-# Create fresh venv (always removes existing to ensure deps match pyproject.toml)
+# Create fresh venv (always removes existing to ensure deps match the lockfile)
 # UV_PYTHON_INSTALL_DIR is set to SHAREDIR so managed Python is accessible to all users
 create-venv: check-uv
 	@if [ -d "$(VENV_PATH)" ]; then \
@@ -56,8 +56,8 @@ create-venv: check-uv
 	@echo "==> Creating Python $(PYTHON_VERSION) virtual environment at $(VENV_PATH)..."
 	@$(NEED_SUDO) mkdir -p $(VENV_PATH)
 	@$(NEED_SUDO) UV_PYTHON_INSTALL_DIR=$(SHAREDIR)/.uv-python uv venv --python $(PYTHON_VERSION) --managed-python $(VENV_PATH)
-	@echo "==> Installing dependencies from pyproject.toml (this may take a few minutes)..."
-	@cd $(MAKEFILE_DIR) && $(NEED_SUDO) uv pip install --python $(VENV_PATH)/bin/python .
+	@echo "==> Installing locked dependencies from requirements.lock.txt (this may take a few minutes)..."
+	@$(NEED_SUDO) uv pip sync --require-hashes --python $(VENV_PATH)/bin/python $(MAKEFILE_DIR)requirements.lock.txt
 	@echo "==> Installing uv into venv (for runtime package installation)..."
 	@$(NEED_SUDO) uv pip install --python $(VENV_PATH)/bin/python uv
 	@echo "==> Virtual environment ready at $(VENV_PATH)"
@@ -126,4 +126,4 @@ help:
 	@echo "  PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make install"
 	@echo ""
 	@echo "The venv is always recreated on install to ensure dependencies"
-	@echo "match pyproject.toml. For system PostgreSQL, sudo is used automatically."
+	@echo "match requirements.lock.txt. For system PostgreSQL, sudo is used automatically."

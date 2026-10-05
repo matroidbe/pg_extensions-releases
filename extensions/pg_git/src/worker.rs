@@ -13,6 +13,18 @@ use std::time::Duration;
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 
+/// Supervision slots of the two workers
+pub const HTTP_SLOT: usize = 0;
+const SYNC_SLOT: usize = 1;
+
+/// Restarts, backoff and the failed state of the workers
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(c"pg_git_supervision", c"pg_git.max_worker_failures")
+};
+
+pg_bgworker::supervision_sql!(crate::worker::SUPERVISOR);
+
 /// Register the HTTP server background worker.
 pub fn register_http_worker() {
     BackgroundWorkerBuilder::new("pg_git HTTP server")
@@ -47,28 +59,37 @@ pub fn register_sync_worker() {
 pub extern "C-unwind" fn pg_git_http_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(HTTP_SLOT, "pg_git HTTP worker") {
+        SUPERVISOR.exit_clean(HTTP_SLOT);
+    }
+
     let database = config::get_database();
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     pgrx::log!("pg_git HTTP worker: started, pid={}", std::process::id());
 
+    // While disabled, wait (pg_git.enabled follows reloads); then do nothing
+    // until the extension's schema exists in this database.
     if !config::PG_GIT_ENABLED.get() {
-        pgrx::log!("pg_git HTTP worker: disabled via pg_git.enabled=false");
-        return;
+        pgrx::log!("pg_git HTTP worker: disabled via pg_git.enabled=false; waiting");
     }
-
-    // Do nothing until the extension's schema exists in this database.
-    if !pg_bgworker::wait_for_extension("pg_git", &database) {
-        return;
+    if !pg_bgworker::wait_until(|| config::PG_GIT_ENABLED.get())
+        || !pg_bgworker::wait_for_extension("pg_git", &database)
+    {
+        SUPERVISOR.exit_clean(HTTP_SLOT);
     }
 
     let port = config::PG_GIT_HTTP_PORT.get() as u16;
 
-    if let Err(e) = crate::server::run_server(DEFAULT_HOST, port) {
-        pgrx::log!("pg_git HTTP worker: server error: {}", e);
+    match crate::server::run_server(DEFAULT_HOST, port) {
+        // SIGTERM, or disabled by a reload
+        Ok(()) => {
+            pgrx::log!("pg_git HTTP worker: shutting down");
+            SUPERVISOR.exit_clean(HTTP_SLOT)
+        }
+        Err(e) => SUPERVISOR.exit_failed(HTTP_SLOT, &format!("pg_git HTTP worker: {e}")),
     }
-
-    pgrx::log!("pg_git HTTP worker: shutting down");
 }
 
 // ===========================================================================
@@ -81,31 +102,31 @@ pub extern "C-unwind" fn pg_git_http_worker_main(_arg: pg_sys::Datum) {
 pub extern "C-unwind" fn pg_git_sync_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SYNC_SLOT, "pg_git sync worker") {
+        SUPERVISOR.exit_clean(SYNC_SLOT);
+    }
+
     let database = config::get_database();
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
     pgrx::log!("pg_git sync worker: started, pid={}", std::process::id());
 
-    if !config::PG_GIT_ENABLED.get() {
-        pgrx::log!("pg_git sync worker: disabled via pg_git.enabled=false");
-        return;
-    }
-
     // Do nothing until the extension's schema exists in this database.
+    // (While disabled the loop below idles; pg_git.enabled follows reloads.)
     if !pg_bgworker::wait_for_extension("pg_git", &database) {
-        return;
+        SUPERVISOR.exit_clean(SYNC_SLOT);
     }
 
-    // Main sync loop
-    let interval_secs = config::PG_GIT_SYNC_INTERVAL.get() as u64;
-
-    while BackgroundWorker::wait_latch(Some(Duration::from_secs(interval_secs))) {
-        if BackgroundWorker::sighup_received() {
-            // Config could have changed
-        }
+    // Main sync loop. The interval is read every round, so a reload applies.
+    while BackgroundWorker::wait_latch(Some(Duration::from_secs(
+        config::PG_GIT_SYNC_INTERVAL.get() as u64,
+    ))) {
+        pg_bgworker::reload_config_if_signalled();
         if BackgroundWorker::sigterm_received() {
             break;
         }
+        SUPERVISOR.tick(SYNC_SLOT);
 
         if !config::PG_GIT_ENABLED.get() {
             continue;
@@ -115,6 +136,7 @@ pub extern "C-unwind" fn pg_git_sync_worker_main(_arg: pg_sys::Datum) {
     }
 
     pgrx::log!("pg_git sync worker: shutting down");
+    SUPERVISOR.exit_clean(SYNC_SLOT);
 }
 
 /// Sync all registered repos to the commits table.

@@ -131,9 +131,22 @@ extension_sql!(
     bootstrap
 );
 
+/// Restarts, backoff and the failed state of the workers
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(
+        c"pg_mqtt_supervision",
+        c"pg_mqtt.max_worker_failures",
+    )
+};
+
+pg_bgworker::supervision_sql!(crate::SUPERVISOR);
+
 /// Initialize the extension and register background workers
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    SUPERVISOR.init();
+
     // Register GUC settings
     pgrx::GucRegistry::define_bool_guc(
         c"pg_mqtt.enabled",
@@ -204,6 +217,12 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
     // Set up signal handlers for SIGHUP and SIGTERM
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // Back off after failures, or wait for reset_workers() once failed too often
+    let slot = worker_id as usize;
+    if !SUPERVISOR.start(slot, &format!("pg_mqtt worker {}", worker_id)) {
+        SUPERVISOR.exit_clean(slot);
+    }
+
     // Connect to the database for SPI access
     let database =
         pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_MQTT_DATABASE).as_deref(), None);
@@ -215,18 +234,18 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
         std::process::id()
     );
 
-    // Check if enabled — workers always get registered but exit early if disabled
+    // Workers are always registered; while disabled they wait (pg_mqtt.enabled
+    // follows reloads). Then do nothing until the extension's schema exists.
     if !PG_MQTT_ENABLED.get() {
         pgrx::log!(
-            "pg_mqtt worker {}: disabled via pg_mqtt.enabled=false",
+            "pg_mqtt worker {}: disabled via pg_mqtt.enabled=false; waiting",
             worker_id
         );
-        return;
     }
-
-    // Do nothing until the extension's schema exists in this database.
-    if !pg_bgworker::wait_for_extension("pg_mqtt", &database) {
-        return;
+    if !pg_bgworker::wait_until(|| PG_MQTT_ENABLED.get())
+        || !pg_bgworker::wait_for_extension("pg_mqtt", &database)
+    {
+        SUPERVISOR.exit_clean(slot);
     }
 
     // Get configuration
@@ -240,11 +259,14 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
     );
 
     // Run server with SPI bridge polling loop
-    if let Err(e) = crate::server::run_server(DEFAULT_HOST, port, worker_id) {
-        pgrx::log!("pg_mqtt worker {}: server error: {}", worker_id, e);
+    match crate::server::run_server(DEFAULT_HOST, port, worker_id) {
+        // SIGTERM, or disabled by a reload
+        Ok(()) => {
+            pgrx::log!("pg_mqtt worker {}: shutting down", worker_id);
+            SUPERVISOR.exit_clean(slot)
+        }
+        Err(e) => SUPERVISOR.exit_failed(slot, &format!("pg_mqtt worker {worker_id}: {e}")),
     }
-
-    pgrx::log!("pg_mqtt worker {}: shutting down", worker_id);
 }
 
 /// SQL function to check if the MQTT broker is running

@@ -8,8 +8,24 @@ use std::sync::OnceLock;
 use crate::config::{get_python_path, get_venv_path, AUTO_SETUP, UV_PATH};
 use crate::error::PgMlError;
 
-/// pyproject.toml content embedded at compile time
-const PYPROJECT_TOML: &str = include_str!("../pyproject.toml");
+/// Hashed export of uv.lock, embedded at compile time so a venv created at
+/// runtime gets exactly the packages this build was tested with
+/// (regenerate with ./check-python-lock.sh --fix)
+const LOCKED_REQUIREMENTS: &str = include_str!("../requirements.lock.txt");
+
+/// uv arguments that make the venv match the lockfile exactly, refusing any
+/// package whose hash differs from the one recorded at lock time
+fn install_requirements_args(
+    python: &std::path::Path,
+    requirements: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["pip", "sync", "--require-hashes", "--python"]
+        .map(Into::into)
+        .into();
+    args.push(python.into());
+    args.push(requirements.into());
+    args
+}
 
 /// Search for uv binary in bundled locations and system PATH
 /// This is the pure path search, separate from GUC access
@@ -93,30 +109,22 @@ pub fn ensure_venv() -> Result<(), PgMlError> {
         ));
     }
 
-    // Write pyproject.toml to a temp file for uv pip install
-    let pyproject_path = venv_path.join("pyproject.toml");
+    // Write the locked requirements to a temp file for uv pip sync
+    let requirements_path = venv_path.join("requirements.lock.txt");
     {
-        let mut file = std::fs::File::create(&pyproject_path)?;
-        file.write_all(PYPROJECT_TOML.as_bytes())?;
+        let mut file = std::fs::File::create(&requirements_path)?;
+        file.write_all(LOCKED_REQUIREMENTS.as_bytes())?;
     }
 
-    // Install dependencies from pyproject.toml
-    // This ensures we use the exact same dependencies as the Makefile
+    // Install the locked dependencies (the Makefile installs the same file)
     pgrx::info!("pg_ml: Installing PyCaret and dependencies (this may take a few minutes)...");
     let output = Command::new(&uv)
-        .args([
-            "pip",
-            "install",
-            "--python",
-            python_path.to_str().unwrap_or("python"),
-            ".",
-        ])
-        .current_dir(&venv_path)
+        .args(install_requirements_args(&python_path, &requirements_path))
         .output()?;
 
     if !output.status.success() {
-        // Clean up pyproject.toml on failure
-        std::fs::remove_file(&pyproject_path).ok();
+        // Clean up the requirements file on failure
+        std::fs::remove_file(&requirements_path).ok();
         return Err(PgMlError::PackageInstallFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
@@ -141,8 +149,8 @@ pub fn ensure_venv() -> Result<(), PgMlError> {
         // Not fatal, continue
     }
 
-    // Clean up pyproject.toml
-    std::fs::remove_file(&pyproject_path).ok();
+    // Clean up the requirements file
+    std::fs::remove_file(&requirements_path).ok();
 
     pgrx::info!("pg_ml: Virtual environment setup complete!");
     Ok(())
@@ -269,6 +277,67 @@ mod tests {
         assert_eq!(
             python,
             PathBuf::from("/var/lib/postgresql/pg_ml/bin/python")
+        );
+    }
+
+    /// Requirement lines (one per package) of the embedded lockfile export
+    fn locked_requirements() -> Vec<&'static str> {
+        LOCKED_REQUIREMENTS
+            .lines()
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_alphanumeric()))
+            .collect()
+    }
+
+    #[test]
+    fn test_locked_requirements_pin_every_package_with_hashes() {
+        let reqs = locked_requirements();
+        assert!(reqs.len() > 100, "expected the full PyCaret tree");
+        for req in &reqs {
+            assert!(req.contains("=="), "not pinned: {req}");
+            assert!(req.ends_with('\\'), "no hashes follow: {req}");
+        }
+        assert!(!LOCKED_REQUIREMENTS.contains("-e "), "editable entry");
+        assert!(!LOCKED_REQUIREMENTS.contains("git+"), "VCS entry");
+    }
+
+    #[test]
+    fn test_locked_requirements_keep_compatibility_pins() {
+        let version = |name: &str| {
+            locked_requirements()
+                .into_iter()
+                .find_map(|r| r.strip_prefix(&format!("{name}==")))
+                .and_then(|r| r.split([' ', ';']).next())
+                .unwrap_or_else(|| panic!("{name} missing from lockfile export"))
+        };
+        assert!(version("pycaret").starts_with("3.3."));
+        assert!(version("mlflow").starts_with("2.9."));
+        assert!(version("dask").starts_with("2024."));
+        let setuptools_major: u32 = version("setuptools")
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(setuptools_major < 81);
+    }
+
+    #[test]
+    fn test_install_args_sync_lockfile_with_hashes() {
+        let args = install_requirements_args(
+            std::path::Path::new("/venv/bin/python"),
+            std::path::Path::new("/venv/requirements.lock.txt"),
+        );
+        assert_eq!(
+            args,
+            [
+                "pip",
+                "sync",
+                "--require-hashes",
+                "--python",
+                "/venv/bin/python",
+                "/venv/requirements.lock.txt",
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 

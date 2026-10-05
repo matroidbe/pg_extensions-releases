@@ -85,9 +85,19 @@ ALTER TABLE pgs3.objects SET (
     bootstrap
 );
 
+/// Restarts, backoff and the failed state of the workers
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(c"pg_s3_supervision", c"pg_s3.max_worker_failures")
+};
+
+pg_bgworker::supervision_sql!(crate::SUPERVISOR);
+
 /// Extension initialization — register background workers and GUCs
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    SUPERVISOR.init();
+
     // Register GUC settings
     pgrx::GucRegistry::define_int_guc(
         c"pg_s3.port",
@@ -183,6 +193,12 @@ pub extern "C-unwind" fn pg_s3_worker_main(arg: pg_sys::Datum) {
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // Back off after failures, or wait for reset_workers() once failed too often
+    let slot = worker_id as usize;
+    if !SUPERVISOR.start(slot, &format!("pg_s3 worker {}", worker_id)) {
+        SUPERVISOR.exit_clean(slot);
+    }
+
     let database =
         pg_bgworker::resolve_database(pg_bgworker::guc_str(&PG_S3_DATABASE).as_deref(), None);
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
@@ -193,17 +209,18 @@ pub extern "C-unwind" fn pg_s3_worker_main(arg: pg_sys::Datum) {
         std::process::id()
     );
 
+    // While disabled, wait (pg_s3.enabled follows reloads); then do nothing
+    // until the extension's schema exists in this database.
     if !PG_S3_ENABLED.get() {
         log!(
-            "pg_s3 worker {}: disabled via pg_s3.enabled=false",
+            "pg_s3 worker {}: disabled via pg_s3.enabled=false; waiting",
             worker_id
         );
-        return;
     }
-
-    // Do nothing until the extension's schema exists in this database.
-    if !pg_bgworker::wait_for_extension("pg_s3", &database) {
-        return;
+    if !pg_bgworker::wait_until(|| PG_S3_ENABLED.get())
+        || !pg_bgworker::wait_for_extension("pg_s3", &database)
+    {
+        SUPERVISOR.exit_clean(slot);
     }
 
     let port = PG_S3_PORT.get() as u16;
@@ -226,11 +243,14 @@ pub extern "C-unwind" fn pg_s3_worker_main(arg: pg_sys::Datum) {
     );
     log!("pg_s3 worker {}: data directory: {}", worker_id, data_dir);
 
-    if let Err(e) = server::run_server(host, port, data_dir, worker_id) {
-        log!("pg_s3 worker {}: server error: {}", worker_id, e);
+    match server::run_server(host, port, data_dir, worker_id) {
+        // SIGTERM, or disabled by a reload
+        Ok(()) => {
+            log!("pg_s3 worker {}: shutting down", worker_id);
+            SUPERVISOR.exit_clean(slot)
+        }
+        Err(e) => SUPERVISOR.exit_failed(slot, &format!("pg_s3 worker {worker_id}: {e}")),
     }
-
-    log!("pg_s3 worker {}: shutting down", worker_id);
 }
 
 // ── SQL Functions ──────────────────────────────────────────────────

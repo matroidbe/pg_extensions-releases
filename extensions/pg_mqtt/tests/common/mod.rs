@@ -171,13 +171,26 @@ macro_rules! skip_if_no_server {
     ($addr:expr) => {
         if !$crate::common::is_server_running($addr) {
             eprintln!("SKIPPED: pg_mqtt server not running at {}", $addr);
+            $crate::common::require_server();
             return;
         }
         // Ensure broker is fully ready (not just TCP-accepting).
         // This is cached via std::sync::Once so only the first test pays the wait cost.
         if !$crate::common::ensure_broker_ready($addr) {
             eprintln!("SKIPPED: pg_mqtt broker not fully ready at {}", $addr);
+            $crate::common::require_server();
             return;
         }
     };
+}
+
+/// Under `test.sh` (`PG_TESTS_REQUIRE_SERVER=1`) a missing server fails the
+/// test instead of skipping it: a server that died must not turn the suite
+/// green.
+pub fn require_server() {
+    if std::env::var_os("PG_TESTS_REQUIRE_SERVER").is_some() {
+        panic!(
+            "server not running, but PG_TESTS_REQUIRE_SERVER is set (see the SKIPPED reason above)"
+        );
+    }
 }

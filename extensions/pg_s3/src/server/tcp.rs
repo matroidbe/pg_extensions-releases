@@ -84,12 +84,10 @@ pub fn run_server(
     let data_dir_owned = data_dir.to_string();
     let bridge_clone = bridge.clone();
 
-    let _server_handle = runtime.spawn(async move {
-        if let Err(e) =
-            run_server_async(&host_owned, port, &data_dir_owned, bridge_clone, worker_id).await
-        {
-            eprintln!("pg_s3 worker {}: server error: {}", worker_id, e);
-        }
+    let server_handle = runtime.spawn(async move {
+        run_server_async(&host_owned, port, &data_dir_owned, bridge_clone, worker_id)
+            .await
+            .map_err(|e| e.to_string())
     });
 
     // Main polling loop - runs on bgworker thread where SPI is valid
@@ -114,6 +112,30 @@ pub fn run_server(
             request_shutdown();
             break;
         }
+
+        // The listener task ends only on shutdown. If it ended anyway (e.g. the
+        // port could not be bound), fail so the supervisor restarts the worker.
+        if server_handle.is_finished() {
+            let reason = match runtime.block_on(server_handle) {
+                Ok(Err(e)) => e,
+                Ok(Ok(())) => "the listener stopped".to_string(),
+                Err(e) => format!("the listener task failed: {e}"),
+            };
+            request_shutdown();
+            runtime.shutdown_timeout(Duration::from_secs(5));
+            return Err(format!("S3 listener on {host}:{port}: {reason}").into());
+        }
+
+        // Apply pg_reload_conf(); stop serving when disabled
+        if pg_bgworker::reload_config_if_signalled() && !crate::PG_S3_ENABLED.get() {
+            pgrx::log!(
+                "pg_s3 worker {}: disabled via pg_s3.enabled=false, stopping",
+                worker_id
+            );
+            request_shutdown();
+            break;
+        }
+        crate::SUPERVISOR.tick(worker_id as usize);
 
         let mut processed = 0;
         while let Some(request) = receiver.try_recv() {

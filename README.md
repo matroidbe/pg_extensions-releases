@@ -92,6 +92,12 @@ workers the database they connect to (`<prefix>.database`, default
 `postgres`) and where they listen. `--set` overrides any of them; the
 workers wait until `CREATE EXTENSION` has run in that database.
 
+Background workers are supervised. A worker that keeps failing (a port
+already in use, for example) backs off between retries, and after
+`<prefix>.max_worker_failures` failures in a row (default 10) it stops in a
+`failed` state. `SELECT * FROM <schema>.worker_status()` shows why; fix the
+cause, then run `SELECT <schema>.reset_workers()` (design/bgworker-supervision).
+
 Each release's `SHA256SUMS` covers its bottles. Runtime libraries are not bundled: pg_solid needs
 OpenCASCADE 7.6 (Debian 12 / Ubuntu 24.04; build from source against 7.8),
 pg_xarray needs PostGIS, and pg_image's ONNX functions need ONNX Runtime.

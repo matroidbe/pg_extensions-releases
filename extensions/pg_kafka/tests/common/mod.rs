@@ -145,13 +145,25 @@ pub fn ensure_topic(topic_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Macro to skip test if server is not running
+/// Macro to skip test if server is not running (see [`require_server`])
 #[macro_export]
 macro_rules! skip_if_no_server {
     ($addr:expr) => {
         if !$crate::common::is_server_running($addr) {
             eprintln!("SKIPPED: pg_kafka server not running at {}", $addr);
+            $crate::common::require_server();
             return;
         }
     };
+}
+
+/// Under `test.sh` (`PG_TESTS_REQUIRE_SERVER=1`) a missing server fails the
+/// test instead of skipping it: a server that died must not turn the suite
+/// green.
+pub fn require_server() {
+    if std::env::var_os("PG_TESTS_REQUIRE_SERVER").is_some() {
+        panic!(
+            "server not running, but PG_TESTS_REQUIRE_SERVER is set (see the SKIPPED reason above)"
+        );
+    }
 }

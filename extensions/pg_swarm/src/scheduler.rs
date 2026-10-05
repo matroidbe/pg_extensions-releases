@@ -20,23 +20,37 @@ use crate::{GUC_ENABLED, GUC_POLL_INTERVAL};
 /// unreachable, we are no longer part of the swarm. The background worker
 /// restart mechanism (set_restart_time) handles reconnection.
 pub fn scheduler_main() {
+    use crate::{SCHEDULER_SLOT as SLOT, SUPERVISOR};
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SLOT, "pg_swarm scheduler") {
+        SUPERVISOR.exit_clean(SLOT);
+    }
+
     let database = crate::worker_database();
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
 
+    // While disabled, wait (pg_swarm.enabled follows reloads); then claim
+    // nothing until the extension's schema exists in this database.
     if !GUC_ENABLED.get() {
-        log!("pg_swarm scheduler disabled via GUC, exiting");
-        return;
+        log!("pg_swarm scheduler disabled via pg_swarm.enabled=false; waiting");
+    }
+    if !pg_bgworker::wait_until(|| GUC_ENABLED.get())
+        || !pg_bgworker::wait_for_extension("pg_swarm", &database)
+    {
+        SUPERVISOR.exit_clean(SLOT);
     }
 
-    // Claim nothing until the extension's schema exists in this database.
-    if !pg_bgworker::wait_for_extension("pg_swarm", &database) {
-        return;
-    }
-
-    // Wait for the node manager to register our node, then look up our node_id.
-    // The node manager runs in the same postgres instance, registered by PID.
-    let node_id = wait_for_node_id();
+    // Wait for this instance's node manager to register, then use its node_id
+    let node_id = match wait_for_node_id() {
+        NodeWait::Found(id) => id,
+        NodeWait::Stopped => SUPERVISOR.exit_clean(SLOT),
+        NodeWait::TimedOut => SUPERVISOR.exit_failed(
+            SLOT,
+            "pg_swarm scheduler: timed out waiting for the node manager to register this node",
+        ),
+    };
 
     log!("pg_swarm scheduler started for node_id={}", node_id);
 
@@ -52,37 +66,55 @@ pub fn scheduler_main() {
             log!("pg_swarm scheduler shutting down");
             break;
         }
+        // pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS: without this the
+        // ProcSignalBarrier of DROP DATABASE is never acknowledged
+        pgrx::check_for_interrupts!();
+        pg_bgworker::reload_config_if_signalled();
+        SUPERVISOR.tick(SLOT);
+        if !GUC_ENABLED.get() {
+            continue;
+        }
 
         BackgroundWorker::transaction(|| {
             claim_and_execute_task(node_id);
         });
     }
+    SUPERVISOR.exit_clean(SLOT);
 }
 
-/// Wait for the node manager to register this node, then return the node_id.
-/// Retries every second for up to 30 seconds.
-fn wait_for_node_id() -> i64 {
+enum NodeWait {
+    Found(i64),
+    /// SIGTERM or postmaster death
+    Stopped,
+    TimedOut,
+}
+
+/// Wait for the node manager of this instance to register its node (matched
+/// by node name; the newest registration wins over stale rows of earlier
+/// runs), then return its id. Retries every second for up to 30 seconds.
+fn wait_for_node_id() -> NodeWait {
+    let node_name = crate::node::get_node_name();
     for _ in 0..30 {
         let result = BackgroundWorker::transaction(|| {
-            Spi::get_one::<i64>(
-                "SELECT id FROM pgswarm.nodes WHERE status = 'active' ORDER BY registered_at DESC LIMIT 1",
+            Spi::get_one_with_args::<i64>(
+                "SELECT id FROM pgswarm.nodes WHERE status = 'active' AND node_name = $1
+                 ORDER BY registered_at DESC LIMIT 1",
+                &[node_name.as_str().into()],
             )
         });
 
         if let Ok(Some(id)) = result {
-            return id;
+            return NodeWait::Found(id);
         }
 
-        if BackgroundWorker::sigterm_received() {
-            pgrx::error!("pg_swarm scheduler: shutting down before node registered");
-        }
-
-        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(1))) {
-            pgrx::error!("pg_swarm scheduler: postmaster died waiting for node registration");
+        if !BackgroundWorker::wait_latch(Some(Duration::from_secs(1)))
+            || BackgroundWorker::sigterm_received()
+        {
+            return NodeWait::Stopped;
         }
     }
 
-    pgrx::error!("pg_swarm scheduler: timed out waiting for node registration");
+    NodeWait::TimedOut
 }
 
 /// Attempt to claim one pending task and execute it.

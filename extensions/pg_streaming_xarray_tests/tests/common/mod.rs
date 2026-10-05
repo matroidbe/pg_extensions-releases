@@ -794,7 +794,19 @@ macro_rules! skip_if_not_running {
                 $crate::common::PG_HOST,
                 $crate::common::pg_port()
             );
+            $crate::common::require_server();
             return;
         }
     };
+}
+
+/// Under `test.sh` (`PG_TESTS_REQUIRE_SERVER=1`) a missing server fails the
+/// test instead of skipping it: a server that died must not turn the suite
+/// green.
+pub fn require_server() {
+    if std::env::var_os("PG_TESTS_REQUIRE_SERVER").is_some() {
+        panic!(
+            "server not running, but PG_TESTS_REQUIRE_SERVER is set (see the SKIPPED reason above)"
+        );
+    }
 }

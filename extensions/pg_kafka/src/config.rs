@@ -16,6 +16,9 @@ pub static PG_KAFKA_HOST: pgrx::GucSetting<Option<CString>> =
 pub static PG_KAFKA_ADVERTISED_HOST: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
 
+/// GUC setting for the advertised port for clients (0 = pg_kafka.port)
+pub static PG_KAFKA_ADVERTISED_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(0);
+
 /// GUC setting to enable/disable the Kafka server
 pub static PG_KAFKA_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 

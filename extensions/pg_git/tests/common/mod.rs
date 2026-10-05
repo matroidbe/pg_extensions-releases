@@ -6,10 +6,7 @@ use tokio_postgres::{Client, NoTls};
 /// Skip test if pg_git integration test database is not running.
 macro_rules! skip_if_not_running {
     ($port:expr) => {{
-        let url = format!(
-            "host=localhost port={} user=postgres dbname=pg_git_test",
-            $port
-        );
+        let url = format!("host=localhost port={} dbname=pg_git_test", $port);
         match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
             Ok(_) => {}
             Err(_) => {
@@ -17,6 +14,7 @@ macro_rules! skip_if_not_running {
                     "Skipping: pg_git test database not running on port {}",
                     $port
                 );
+                $crate::common::require_server();
                 return;
             }
         }
@@ -35,10 +33,7 @@ pub fn pg_port() -> u16 {
 
 /// Connect to the test database.
 pub async fn connect(port: u16) -> Client {
-    let url = format!(
-        "host=localhost port={} user=postgres dbname=pg_git_test",
-        port
-    );
+    let url = format!("host=localhost port={} dbname=pg_git_test", port);
     let (client, connection) = tokio_postgres::connect(&url, NoTls)
         .await
         .expect("Failed to connect to test database");
@@ -67,5 +62,16 @@ where
             return false;
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Under `test.sh` (`PG_TESTS_REQUIRE_SERVER=1`) a missing server fails the
+/// test instead of skipping it: a server that died must not turn the suite
+/// green.
+pub fn require_server() {
+    if std::env::var_os("PG_TESTS_REQUIRE_SERVER").is_some() {
+        panic!(
+            "server not running, but PG_TESTS_REQUIRE_SERVER is set (see the SKIPPED reason above)"
+        );
     }
 }

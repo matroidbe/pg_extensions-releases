@@ -238,9 +238,26 @@ ORDER BY e.consecutive_failures DESC;
 
 // ─── Extension Init ─────────────────────────────────────────────────────────
 
+/// Restarts, backoff and the failed state of the workers
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(
+        c"pg_swarm_supervision",
+        c"pg_swarm.max_worker_failures",
+    )
+};
+
+pg_bgworker::supervision_sql!(crate::SUPERVISOR);
+
+/// Supervision slots
+pub(crate) const NODE_MANAGER_SLOT: usize = 0;
+pub(crate) const SCHEDULER_SLOT: usize = 1;
+
 /// Extension initialization - register GUCs and background workers.
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    SUPERVISOR.init();
+
     // Register GUC settings
     pgrx::GucRegistry::define_bool_guc(
         c"pg_swarm.enabled",

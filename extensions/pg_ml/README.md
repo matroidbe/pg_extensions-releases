@@ -57,6 +57,15 @@ See [pg_ml Manual](../../docs/pg_ml.md) for training workflow details.
 
 Create Python virtual environment with PyCaret (one-time setup).
 
+The venv gets exactly the packages in `uv.lock`, through the hashed
+`requirements.lock.txt` embedded in the extension. `make install` and
+`./test.sh` install the same set. After changing `pyproject.toml`, run
+`./check-python-lock.sh --fix`. To take newer packages, run
+`uv lock --upgrade && ./check-python-lock.sh --fix` and rerun the tests
+(see `design/pg_ml/python-environment.md`). `./e2e.sh` checks the whole path
+on a throwaway cluster: `setup_venv()` from scratch, then sync and async
+training.
+
 ```sql
 SELECT pgml.setup_venv();
 ```

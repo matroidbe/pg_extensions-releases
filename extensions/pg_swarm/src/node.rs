@@ -21,7 +21,13 @@ use crate::{GUC_HEARTBEAT_INTERVAL, GUC_NODE_NAME, GUC_NODE_TIMEOUT};
 /// it re-registers as a new node. There is no offline mode, no local state,
 /// no split-brain. Disconnected = stopped.
 pub fn node_manager_main() {
+    use crate::{NODE_MANAGER_SLOT as SLOT, SUPERVISOR};
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SLOT, "pg_swarm node manager") {
+        SUPERVISOR.exit_clean(SLOT);
+    }
 
     log!("pg_swarm node manager started");
 
@@ -30,7 +36,7 @@ pub fn node_manager_main() {
 
     // Register nothing until the extension's schema exists in this database.
     if !pg_bgworker::wait_for_extension("pg_swarm", &database) {
-        return;
+        SUPERVISOR.exit_clean(SLOT);
     }
 
     // Register this node
@@ -53,6 +59,11 @@ pub fn node_manager_main() {
             BackgroundWorker::transaction(|| deregister_node(node_id));
             break;
         }
+        // pgrx's wait_latch never runs CHECK_FOR_INTERRUPTS: without this the
+        // ProcSignalBarrier of DROP DATABASE is never acknowledged
+        pgrx::check_for_interrupts!();
+        pg_bgworker::reload_config_if_signalled();
+        SUPERVISOR.tick(SLOT);
 
         BackgroundWorker::transaction(|| {
             // Send heartbeat
@@ -68,6 +79,7 @@ pub fn node_manager_main() {
             process_watches(node_id);
         });
     }
+    SUPERVISOR.exit_clean(SLOT);
 }
 
 /// Maximum number of nodes in the swarm.
@@ -435,7 +447,7 @@ fn process_single_watch(
 }
 
 /// Get the node name from GUC or fallback to hostname.
-fn get_node_name() -> String {
+pub(crate) fn get_node_name() -> String {
     let guc_name = GUC_NODE_NAME.get();
     if let Some(cstring) = guc_name {
         if let Ok(name) = cstring.into_string() {

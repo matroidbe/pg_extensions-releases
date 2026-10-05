@@ -368,11 +368,29 @@ fn run_cpsat_job(job_id: i64, problem: &str, time_limit_secs: i32) -> Result<(),
 // Background Worker Main
 // =============================================================================
 
+/// Restarts, backoff and the failed state of the solver worker
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(
+        c"pg_ortools_supervision",
+        c"pg_ortools.max_worker_failures",
+    )
+};
+
+pg_bgworker::supervision_sql!(crate::worker::SUPERVISOR);
+
+const SOLVER_SLOT: usize = 0;
+
 /// Background worker main function - processes solve jobs
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Back off after failures, or wait for reset_workers() once failed too often
+    if !SUPERVISOR.start(SOLVER_SLOT, "pg_ortools_solver") {
+        SUPERVISOR.exit_clean(SOLVER_SLOT);
+    }
 
     let database = get_database();
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
@@ -383,26 +401,32 @@ pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
         database
     );
 
+    // While disabled, wait (the setting follows reloads); then do nothing
+    // until the extension's schema exists in this database.
     if !is_worker_enabled() {
-        pgrx::log!("pg_ortools_solver: disabled via pg_ortools.solver_worker_enabled=false");
-        return;
+        pgrx::log!(
+            "pg_ortools_solver: disabled via pg_ortools.solver_worker_enabled=false; waiting"
+        );
+    }
+    if !pg_bgworker::wait_until(is_worker_enabled)
+        || !pg_bgworker::wait_for_extension("pg_ortools", &database)
+    {
+        SUPERVISOR.exit_clean(SOLVER_SLOT);
     }
 
-    // Do nothing until the extension's schema exists in this database.
-    if !pg_bgworker::wait_for_extension("pg_ortools", &database) {
-        return;
-    }
-
-    let poll_interval = get_poll_interval();
-
-    while BackgroundWorker::wait_latch(Some(poll_interval)) {
+    // The poll interval is read every round, so a reload applies
+    while BackgroundWorker::wait_latch(Some(get_poll_interval())) {
         if BackgroundWorker::sigterm_received() {
             pgrx::log!("pg_ortools_solver: received SIGTERM, shutting down");
             break;
         }
 
-        if BackgroundWorker::sighup_received() {
-            pgrx::log!("pg_ortools_solver: received SIGHUP");
+        if pg_bgworker::reload_config_if_signalled() {
+            pgrx::log!("pg_ortools_solver: configuration reloaded");
+        }
+        SUPERVISOR.tick(SOLVER_SLOT);
+        if !is_worker_enabled() {
+            continue;
         }
 
         // Claim in its own committed transaction. This makes state='solving'
@@ -435,4 +459,5 @@ pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
     }
 
     pgrx::log!("pg_ortools_solver: worker stopped");
+    SUPERVISOR.exit_clean(SOLVER_SLOT);
 }

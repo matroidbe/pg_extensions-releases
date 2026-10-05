@@ -77,6 +77,7 @@ static PG_DELTA_GCS_USE_DEFAULT_CREDENTIALS: pgrx::GucSetting<bool> =
 pub extern "C-unwind" fn _PG_init() {
     // Register GUCs
     register_gucs();
+    SUPERVISOR.init();
 
     // Register background worker
     BackgroundWorkerBuilder::new("pg_delta stream manager")
@@ -448,23 +449,36 @@ CREATE TRIGGER export_tables_updated_at
 // Background Worker
 // =============================================================================
 
+/// Restarts, backoff and the failed state of the stream manager
+/// (design/bgworker-supervision)
+pub static SUPERVISOR: pg_bgworker::supervision::Supervisor = unsafe {
+    pg_bgworker::supervision::Supervisor::new(c"pg_delta_supervision", c"delta.max_worker_failures")
+};
+
+pg_bgworker::supervision_sql!(crate::SUPERVISOR);
+
+pub(crate) const STREAM_MANAGER_SLOT: usize = 0;
+
 #[pg_guard]
 #[no_mangle]
 pub extern "C-unwind" fn pg_delta_worker_main(_arg: pg_sys::Datum) {
     // Attach signal handlers FIRST - this is critical for clean shutdown
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    log!("pg_delta: stream manager starting");
-
-    // Check for immediate shutdown request
-    if BackgroundWorker::sigterm_received() {
-        log!("pg_delta: received SIGTERM during startup, exiting immediately");
-        return;
+    // Back off after failures, or wait for reset_workers() once failed too often
+    let slot = STREAM_MANAGER_SLOT;
+    if !SUPERVISOR.start(slot, "pg_delta stream manager") {
+        SUPERVISOR.exit_clean(slot);
     }
 
+    log!("pg_delta: stream manager starting");
+
+    // While disabled, wait (delta.enabled follows reloads)
     if !PG_DELTA_ENABLED.get() {
-        log!("pg_delta: disabled via GUC, exiting");
-        return;
+        log!("pg_delta: disabled via delta.enabled=false; waiting");
+    }
+    if !pg_bgworker::wait_until(|| PG_DELTA_ENABLED.get()) {
+        SUPERVISOR.exit_clean(slot);
     }
 
     // Connect to SPI only after checking for shutdown
@@ -474,18 +488,19 @@ pub extern "C-unwind" fn pg_delta_worker_main(_arg: pg_sys::Datum) {
 
     // Do nothing until the extension's schema exists in this database.
     if !pg_bgworker::wait_for_extension("pg_delta", &database) {
-        return;
+        SUPERVISOR.exit_clean(slot);
     }
 
     log!("pg_delta: stream manager started, running main loop");
 
-    // Run the stream manager with proper error handling
     match streams::run_stream_manager() {
-        Ok(()) => log!("pg_delta: stream manager exited cleanly"),
-        Err(e) => log!("pg_delta: stream manager error: {}", e),
+        // SIGTERM, or disabled by a reload
+        Ok(()) => {
+            log!("pg_delta: stream manager shutdown complete");
+            SUPERVISOR.exit_clean(slot)
+        }
+        Err(e) => SUPERVISOR.exit_failed(slot, &format!("pg_delta stream manager: {e}")),
     }
-
-    log!("pg_delta: stream manager shutdown complete");
 }
 
 // =============================================================================

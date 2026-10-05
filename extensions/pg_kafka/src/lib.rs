@@ -207,6 +207,16 @@ mod tests {
         assert!(status.0.is_object());
     }
 
+    /// #125: an unset advertised host is reported as null (each client is
+    /// told the address it reached), never as the 0.0.0.0 bind address, and
+    /// the advertised port defaults to the bind port.
+    #[pg_test]
+    fn test_status_reports_advertised_defaults() {
+        let status = crate::status().0;
+        assert!(status["advertised_host"].is_null(), "{status}");
+        assert_eq!(status["advertised_port"], status["port"], "{status}");
+    }
+
     /// Regression (#120): pg_spi binds parameters; a value that is itself a
     /// `$N` token or SQL fragment is stored literally, never re-substituted.
     #[pg_test]

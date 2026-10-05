@@ -196,19 +196,31 @@ SELECT pgkafka.produce(
 
 ## Configuration
 
+These are server settings: put them in `postgresql.conf`, or use
+`ALTER SYSTEM` followed by `SELECT pg_reload_conf()`. `SET` in a session does
+not work for them.
+
+| Setting | Default | Applies |
+|---------|---------|---------|
+| `pg_kafka.enabled` | `true` | on reload |
+| `pg_kafka.host` | `0.0.0.0` | on restart (bind address) |
+| `pg_kafka.port` | `9092` | on restart (bind port) |
+| `pg_kafka.advertised_host` | unset: the address the client reached | on reload |
+| `pg_kafka.advertised_port` | `0`: `pg_kafka.port` | on reload |
+
+Clients bootstrap, then reconnect to the **advertised** address from the
+Metadata response. Set it whenever clients reach the broker through a
+different name or port, such as behind a proxy or NAT, or from a container
+whose 9092 is published on another host port:
+
 ```sql
--- Enable/disable server
-SET pg_kafka.enabled = true;
-
--- Server port (default: 9092)
-SET pg_kafka.port = 9092;
-
--- Bind address
-SET pg_kafka.host = '0.0.0.0';
-
--- Advertised host for clients
-SET pg_kafka.advertised_host = 'kafka.example.com';
+ALTER SYSTEM SET pg_kafka.advertised_host = 'kafka.example.com';
+ALTER SYSTEM SET pg_kafka.advertised_port = 5591;
+SELECT pg_reload_conf();
 ```
+
+A reload also reaches connections that are already open.
+`SELECT pgkafka.status()` shows the advertised address in effect.
 
 ## Architecture
 

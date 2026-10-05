@@ -434,6 +434,8 @@ use std::time::Duration;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    worker::SUPERVISOR.init();
+
     // Built-in xarray connectors (only when `--features xarray`). These
     // would normally live in a separate pgrx extension but two pgrx
     // cdylibs can't statically link each other (Pg_magic_func / _PG_init

@@ -30,6 +30,7 @@ shared_preload_libraries = true
 #   pg_kafka.host
 #   pg_kafka.port
 #   pg_kafka.advertised_host
+#   pg_kafka.advertised_port
 #   pg_kafka.worker_count
 #   pg_kafka.metrics_enabled
 #   pg_kafka.metrics_port
