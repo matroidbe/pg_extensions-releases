@@ -166,6 +166,7 @@ pub fn is_valid_constraint_type(ctype: &str) -> bool {
             | "minimize_field"
             | "minimize_cost"
             | "pin_current"
+            | "assignment"
     )
 }
 

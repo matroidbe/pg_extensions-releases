@@ -9,7 +9,14 @@ mod common;
 use common::{connect, pg_port, poll_until, skip_if_not_running};
 use std::time::Duration;
 
-const GIT_HTTP_PORT: u16 = 5433;
+/// The git HTTP port, from `PG_GIT_PORT` — the same variable `test.sh` wrote
+/// into postgresql.conf — else the extension's default.
+fn git_http_port() -> u16 {
+    std::env::var("PG_GIT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5433)
+}
 
 #[tokio::test]
 async fn test_sql_git_init_and_commit() {
@@ -122,7 +129,7 @@ async fn test_http_clone_and_push() {
     let clone_output = std::process::Command::new("git")
         .args([
             "clone",
-            &format!("http://localhost:{}/httptest", GIT_HTTP_PORT),
+            &format!("http://localhost:{}/httptest", git_http_port()),
             "/tmp/pg_git_httptest_clone",
         ])
         .output()

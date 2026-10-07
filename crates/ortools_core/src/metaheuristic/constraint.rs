@@ -96,6 +96,18 @@ fn evaluate_hard(
             violations
         }
 
+        HardConstraint::SlotConflicts { conflicts } => {
+            let mut violations = 0i64;
+            for (slot, pairs) in conflicts.iter().enumerate() {
+                for &(a, b) in pairs {
+                    if assignment.get(a) == Some(&slot) && assignment.get(b) == Some(&slot) {
+                        violations -= 1;
+                    }
+                }
+            }
+            violations
+        }
+
         HardConstraint::SkillMatch { feasible } => {
             let mut violations = 0i64;
             for (item, &slot) in assignment.iter().enumerate() {
@@ -193,6 +205,18 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn test_evaluate_slot_conflicts() {
+        // Items 0 and 1 may not share slot 2.
+        let problem =
+            make_simple_problem(vec![TypedConstraint::Hard(HardConstraint::SlotConflicts {
+                conflicts: vec![vec![], vec![], vec![(0, 1)]],
+            })]);
+        assert_eq!(evaluate(&problem, &vec![2, 2, 0]).hard, -1);
+        assert_eq!(evaluate(&problem, &vec![2, 1, 2]).hard, 0);
+        assert_eq!(evaluate(&problem, &vec![0, 0, 0]).hard, 0);
     }
 
     #[test]

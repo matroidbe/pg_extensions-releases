@@ -1,0 +1,6 @@
+-- pg_ortools 0.3.2 -> 0.3.3
+-- Rust-only: local search honours a typed constraint `assignment`
+-- ({"each": "slot"} — every slot gets exactly one item) and refuses a typed
+-- constraint whose config does not parse instead of skipping it
+-- (design/pg_ortools/metaheuristic.md, "Assignment orientation").
+-- No SQL changes.

@@ -4,6 +4,26 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.5.1 — 2026-10-07
+
+**pg_ortools local search solves rosters.** Local search assigns each item
+exactly one slot; a roster is the other way round — every shift gets exactly
+one employee, and an employee takes many shifts. A new typed constraint
+`assignment` with `{"each": "slot"}` declares that shape: the loader hands the
+engine the transposed problem and maps the solution back, with constraint
+configs staying in the caller's terms (`no_overlap` becomes a slot-conflict
+rule, `skill_match` is transposed, costs move sides, `pin_current` is per
+slot; `group_balance` is refused). A typed constraint whose config does not
+parse now fails the solve instead of being skipped. The design doc's
+typed-constraint tables, which documented field-name configs the parser never
+read, now give the real shapes (design/pg_ortools/metaheuristic.md).
+
+pg_git's integration test serves git-HTTP on a free port instead of a fixed
+5433, which collided with a PostgreSQL on the same host.
+
+Extension versions: pg_ortools 0.3.3 (ortools_core 0.3.1). Every other
+extension is unchanged from v0.5.0.
+
 ## v0.5.0 — 2026-10-05
 
 **Supervised background workers.** Every extension with background workers

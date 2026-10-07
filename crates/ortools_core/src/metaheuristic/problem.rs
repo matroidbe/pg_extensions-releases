@@ -59,6 +59,9 @@ pub enum HardConstraint {
     },
     /// Pre-computed feasibility matrix: `feasible[item][slot]` = true if allowed.
     SkillMatch { feasible: Vec<Vec<bool>> },
+    /// `conflicts[slot]` = pairs of items that may not both take that slot —
+    /// a caller's `no_overlap` under `each: slot` (see `orientation`).
+    SlotConflicts { conflicts: Vec<Vec<(usize, usize)>> },
 }
 
 /// Soft constraints are penalized in the objective (lower penalty = better).

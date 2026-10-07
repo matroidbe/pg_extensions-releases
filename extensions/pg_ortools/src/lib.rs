@@ -1005,6 +1005,73 @@ mod tests {
         cleanup_problem("sl_vals");
     }
 
+    /// `assignment: {"each": "slot"}` — every slot (shift) gets exactly one
+    /// item (employee), the way a roster is stated. Without it local search
+    /// solved the transposed problem: each employee one shift, shifts empty.
+    /// e0 {cook,bar}, e1 {bar}; s0 09-17 cook, s1 13-21 bar, s2 22-23 bar.
+    #[pg_test]
+    fn test_solve_local_each_slot_rostering() {
+        Spi::run("SELECT pgortools.create_problem('roster_es')").unwrap();
+        for i in 0..2 {
+            for j in 0..3 {
+                Spi::run(&format!(
+                    "SELECT pgortools.add_bool_var('roster_es', 'x_{}_{}')",
+                    i, j
+                ))
+                .unwrap();
+            }
+        }
+        for (t, c) in [
+            ("assignment", r#"{"each": "slot"}"#),
+            ("capacity", r#"{"limit": 2}"#),
+            (
+                "skill_match",
+                r#"{"feasible": [[true, true, true], [false, true, true]]}"#,
+            ),
+            ("no_overlap", r#"{"overlap_pairs": [[[0, 1]], [[0, 1]]]}"#),
+            ("minimize_field", r#"{"costs": [20, 30], "weight": 1}"#),
+        ] {
+            Spi::run(&format!(
+                "SELECT pgortools.add_typed_constraint('roster_es', '{}', '{}'::jsonb)",
+                t, c
+            ))
+            .unwrap();
+        }
+        let solution = Spi::get_one::<pgrx::JsonB>(
+            "SELECT pgortools.solve_local('roster_es', 'tabu_search', 1)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(solution.0["status"], "FEASIBLE", "{}", solution.0);
+        let v = |i: usize, j: usize| solution.0["values"][format!("x_{}_{}", i, j)].as_i64();
+        for j in 0..3 {
+            let held: i64 = (0..2).map(|i| v(i, j).unwrap()).sum();
+            assert_eq!(
+                held, 1,
+                "shift {} has exactly one employee: {}",
+                j, solution.0
+            );
+        }
+        assert_eq!(v(0, 0), Some(1), "only e0 can cook: {}", solution.0);
+        assert_eq!(v(1, 1), Some(1), "s1 overlaps e0's s0: {}", solution.0);
+        cleanup_problem("roster_es");
+    }
+
+    /// A typed constraint whose config does not parse fails the solve; it was
+    /// skipped, so the plan ignored the rule and reported success.
+    #[pg_test]
+    #[should_panic(expected = "does not parse")]
+    fn test_solve_local_refuses_an_unparseable_config() {
+        setup_local_problem("sl_bad");
+        Spi::run(
+            "SELECT pgortools.add_typed_constraint('sl_bad', 'no_overlap', '{\"time_field\": \"starts_at\"}'::jsonb)",
+        )
+        .unwrap();
+        let _ = Spi::get_one::<pgrx::JsonB>(
+            "SELECT pgortools.solve_local('sl_bad', 'hill_climbing', 1)",
+        );
+    }
+
     #[pg_test]
     fn test_solve_auto_small_uses_mip() {
         // Create a small MIP problem (< auto_threshold)
