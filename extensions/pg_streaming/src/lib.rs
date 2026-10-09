@@ -69,6 +69,14 @@ fn restart(name: &str) {
     pipeline::lifecycle::restart_pipeline_impl(name);
 }
 
+/// Rewind a stopped pipeline's source: re-read everything (`after => NULL`) or
+/// everything after a path (`after => 'source/arrival_date=2026-10-01'`).
+/// Start the pipeline afterwards to run the replay.
+#[pg_extern]
+fn replay(name: &str, after: default!(Option<&str>, "NULL")) {
+    pipeline::lifecycle::replay_pipeline_impl(name, after);
+}
+
 // =============================================================================
 // SQL Functions — Secrets management
 // =============================================================================
@@ -969,6 +977,52 @@ mod tests {
         let existed =
             Spi::get_one::<bool>("SELECT pgstreams.drop_secret('nonexistent_xyz')").unwrap();
         assert_eq!(existed, Some(false));
+    }
+
+    fn replay_fixture() {
+        Spi::run(
+            "SELECT pgstreams.create_pipeline('rz', '{\"input\": {\"opendal\": \
+             {\"service\": \"fs\", \"path\": \"x/*.parquet\", \"parse_as\": \"parquet\", \
+              \"order\": \"lexicographic\"}}, \"pipeline\": {\"processors\": []}, \
+             \"output\": {\"drop\": {}}}'::jsonb)",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO pgstreams.connector_state (pipeline, connector_role, cursor) \
+             VALUES ('rz', 'input', '{\"after\": \"x/2026-10-08/09.parquet\"}'::jsonb)",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn test_replay_from_path_rewinds_the_cursor() {
+        replay_fixture();
+        Spi::run("SELECT pgstreams.replay('rz', 'x/2026-10-01')").unwrap();
+        let cursor = Spi::get_one::<pgrx::JsonB>(
+            "SELECT cursor FROM pgstreams.connector_state WHERE pipeline = 'rz'",
+        )
+        .unwrap();
+        assert_eq!(
+            cursor.unwrap().0,
+            serde_json::json!({"after": "x/2026-10-01"})
+        );
+    }
+
+    #[pg_test]
+    fn test_replay_without_path_forgets_the_cursor() {
+        replay_fixture();
+        Spi::run("SELECT pgstreams.replay('rz')").unwrap();
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgstreams.connector_state WHERE pipeline = 'rz'",
+        );
+        assert_eq!(n, Ok(Some(0)));
+    }
+
+    #[pg_test(error = "Pipeline 'rz' is running; stop it first: SELECT pgstreams.stop('rz')")]
+    fn test_replay_refuses_a_running_pipeline() {
+        replay_fixture();
+        Spi::run("UPDATE pgstreams.pipelines SET state = 'running' WHERE name = 'rz'").unwrap();
+        Spi::run("SELECT pgstreams.replay('rz')").unwrap();
     }
 
     #[pg_test]

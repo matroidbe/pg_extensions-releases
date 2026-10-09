@@ -36,6 +36,7 @@ deltalake-gcp = "0.6"
 arrow = { version = "53", default-features = false, features = ["prettyprint"] }
 arrow-array = "53"
 arrow-schema = "53"
+arrow-json = "53"
 parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd"] }
 object_store = { version = "0.11", features = ["aws", "azure", "gcp"] }
 tokio-util = { version = "0.7", features = ["compat"] }

@@ -15,11 +15,13 @@ pub mod codec;
 pub mod csv_parser;
 pub mod json_parser;
 pub mod ndjson_parser;
+pub mod parquet_parser;
 
 pub use bytes_pass::BytesParser;
 pub use csv_parser::CsvParser;
 pub use json_parser::JsonParser;
 pub use ndjson_parser::NdjsonParser;
+pub use parquet_parser::ParquetParser;
 
 /// Build a `Parser` by name. `config` is the optional `parser_config`
 /// JSON blob from the DSL (may be `Value::Null` if absent).
@@ -28,9 +30,10 @@ pub fn parser_from_config(name: &str, config: &Value) -> Result<Box<dyn Parser>,
         "csv" => Ok(Box::new(CsvParser::from_config(config)?)),
         "json" => Ok(Box::new(JsonParser::new())),
         "ndjson" => Ok(Box::new(NdjsonParser::new())),
+        "parquet" => Ok(Box::new(ParquetParser::from_config(config)?)),
         "bytes" => Ok(Box::new(BytesParser::new())),
         other => Err(format!(
-            "Unknown parser '{}'. Supported: csv, json, ndjson, bytes",
+            "Unknown parser '{}'. Supported: csv, json, ndjson, parquet, bytes",
             other
         )),
     }
@@ -57,6 +60,7 @@ mod tests {
         assert!(parser_from_config("csv", &Value::Null).is_ok());
         assert!(parser_from_config("json", &Value::Null).is_ok());
         assert!(parser_from_config("ndjson", &Value::Null).is_ok());
+        assert!(parser_from_config("parquet", &Value::Null).is_ok());
         assert!(parser_from_config("bytes", &Value::Null).is_ok());
     }
 

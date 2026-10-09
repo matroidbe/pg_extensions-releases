@@ -2,7 +2,9 @@
 //!
 //! Records flow through the pipeline as JSONB values. For regular Kafka topics,
 //! the standard fields are: key_text, key_json, value_text, value_json,
-//! headers, offset_id, created_at, source_topic. For source-backed typed topics,
+//! headers, offset_id, created_at, source_topic, source_file, source_row (the
+//! last two are set by file sources — the raw zone — and NULL otherwise). For
+//! source-backed typed topics,
 //! the fields are the actual table columns (e.g., id, customer_id, amount).
 
 /// A single record flowing through the pipeline (JSON object)
@@ -99,7 +101,9 @@ const MESSAGES_CTE: &str = "WITH _batch AS (\
          (r->'headers') AS headers, \
          (r->>'offset_id')::bigint AS offset_id, \
          (r->>'created_at')::timestamptz AS created_at, \
-         r->>'source_topic' AS source_topic \
+         r->>'source_topic' AS source_topic, \
+         r->>'source_file' AS source_file, \
+         (r->>'source_row')::bigint AS source_row \
        FROM jsonb_array_elements($1) AS r\
      ) ";
 
@@ -158,6 +162,8 @@ mod tests {
         assert!(cte.contains("offset_id"));
         assert!(cte.contains("created_at"));
         assert!(cte.contains("source_topic"));
+        assert!(cte.contains("r->>'source_file' AS source_file"));
+        assert!(cte.contains("(r->>'source_row')::bigint AS source_row"));
         assert!(cte.contains("_original"));
         assert!(cte.contains("jsonb_array_elements"));
     }

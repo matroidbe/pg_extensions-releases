@@ -244,6 +244,34 @@ pub fn ifc_map_conversion(
     TableIterator::new(rows)
 }
 
+/// Return the model's `IfcGeometricRepresentationContext.TrueNorth` (zero or
+/// one row): the direction of true north in local coordinates, and the local
+/// axes' rotation in degrees, in the same convention as
+/// `ifc_map_conversion.rotation_deg` (local +X, counter-clockwise from east).
+/// IFC2x3 files carry no `IfcMapConversion`, so this is their orientation.
+#[pg_extern(immutable, strict)]
+pub fn ifc_true_north(
+    filepath: &str,
+) -> TableIterator<
+    'static,
+    (
+        name!(north_x, f64),
+        name!(north_y, f64),
+        name!(rotation_deg, f64),
+    ),
+> {
+    let data =
+        std::fs::read(filepath).unwrap_or_else(|e| pgrx::error!("ifc_true_north: read file: {e}"));
+    let parse_result =
+        ifc::parser::parse(&data).unwrap_or_else(|e| pgrx::error!("ifc_true_north: parse: {e}"));
+    let store = ifc::entity::EntityStore::new(parse_result.entities);
+    let rows: Vec<_> = ifc::georef::extract_true_north(&store)
+        .into_iter()
+        .map(|tn| (tn.north_x, tn.north_y, tn.rotation_deg()))
+        .collect();
+    TableIterator::new(rows)
+}
+
 /// Georeference an IFC solid into `target_srid`.
 ///
 ///   - **4326** (default): geographic. Anchors at `IfcSite.RefLatitude` /

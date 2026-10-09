@@ -536,7 +536,9 @@ pub fn build_validation_sql(expr: &str, shape: &crate::record::TopicShape) -> St
                  null::jsonb AS headers, \
                  null::bigint AS offset_id, \
                  null::timestamptz AS created_at, \
-                 null::text AS source_topic\
+                 null::text AS source_topic, \
+                 null::text AS source_file, \
+                 null::bigint AS source_row\
                  ) AS _r",
                 expr
             )

@@ -4,6 +4,35 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.6.0 — 2026-10-09
+
+**pg_streaming reads a raw zone (0.3.3).** The opendal source can now serve
+as the reader for an engine-neutral raw zone: immutable Parquet and Zarr on
+S3 that several engines ingest and replay from.
+
+- `parse_as: parquet` emits one record per row. GeoParquet WKB comes out as hex.
+- `order: lexicographic` keeps a constant-size cursor that resumes mid-file.
+  An unreadable file stops the stream, so later files cannot overtake it.
+- `parse_as: listing` emits one record per new file, for N-D arrays that
+  pg_xarray indexes in place.
+- Every file record carries `source_file` / `source_row`, so a target can
+  drop duplicates when a stream is replayed.
+- `pgstreams.replay(name, after)` rewinds a stopped pipeline. S3 support is
+  now built in by default.
+- Private S3 for the arrays lane is not supported yet (design/pg_streaming/connectors.md).
+
+**pg_solid reads an IFC model's true north (0.4.0).** A new
+`ifc_true_north(path)` returns a model's
+`IfcGeometricRepresentationContext.TrueNorth` direction and the local axes'
+rotation, in the same convention as `ifc_map_conversion.rotation_deg`. IFC2x3
+has no `IfcMapConversion`, so this is the only orientation such a file carries.
+`solid_georeference` to 4326 / 4978 now applies it when a file has no map
+conversion; before, those models came out with local Y taken as north
+(matroidbe/eidos#719).
+
+Extension versions: pg_solid 0.4.0, pg_streaming 0.3.3. Every other extension
+is unchanged from v0.5.1.
+
 ## v0.5.1 — 2026-10-07
 
 **pg_ortools local search solves rosters.** Local search assigns each item

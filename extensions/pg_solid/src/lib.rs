@@ -1558,6 +1558,24 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_ifc_true_north_reports_the_rotation() {
+        set_search_path();
+        let path = format!(
+            "{}/test_data/rotated_north_building.ifc",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let row = Spi::get_three::<f64, f64, f64>(&format!(
+            "SELECT north_x, north_y, rotation_deg FROM ifc_true_north('{path}')"
+        ))
+        .expect("SPI failed");
+        assert_eq!(row.0, Some(-0.5));
+        assert!(
+            (row.2.expect("NULL rotation") + 30.0).abs() < 1e-9,
+            "{row:?}"
+        );
+    }
+
+    #[pg_test]
     fn test_ifc_map_conversion_eastings_northings() {
         set_search_path();
         let path = ifc_georef_file();

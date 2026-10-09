@@ -61,6 +61,26 @@ impl IfcMapConversionData {
     }
 }
 
+/// `IfcGeometricRepresentationContext.TrueNorth`: the direction of true north
+/// in the model's local XY plane. IFC2x3 has no `IfcMapConversion`, so this is
+/// the only orientation such a model carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfcTrueNorth {
+    pub north_x: f64,
+    pub north_y: f64,
+}
+
+impl IfcTrueNorth {
+    /// The local axes' rotation, in the convention of
+    /// [`IfcMapConversionData::rotation_deg`]: the angle of local +X,
+    /// counter-clockwise from east. North sits at `(north_x, north_y)` in local
+    /// coordinates, so the local axes turn by the negation of north's angle
+    /// from local +Y, which is `atan2(north_x, north_y)`.
+    pub fn rotation_deg(&self) -> f64 {
+        self.north_x.atan2(self.north_y).to_degrees()
+    }
+}
+
 /// Convert an `IfcCompoundPlaneAngleMeasure` (list of 3 or 4 integers
 /// `[deg, min, sec, millionths_of_arc_second]`) to decimal degrees.
 ///
@@ -204,6 +224,30 @@ pub fn extract_map_conversion(store: &EntityStore) -> Option<IfcMapConversionDat
     })
 }
 
+/// The model context's `TrueNorth`, if it states one. A file can hold several
+/// contexts (Model, Plan, sub-contexts); the `Model` one wins, else the first
+/// that carries a direction. A zero-length direction says nothing and is
+/// ignored.
+pub fn extract_true_north(store: &EntityStore) -> Option<IfcTrueNorth> {
+    let mut contexts = store.by_type("IfcGeometricRepresentationContext");
+    // attrs: 0 ContextIdentifier, 1 ContextType, 2 CoordinateSpaceDimension,
+    //        3 Precision, 4 WorldCoordinateSystem, 5 TrueNorth
+    contexts.sort_by_key(|c| {
+        c.attributes
+            .get(1)
+            .and_then(|v| v.as_str())
+            .map(|t| !t.eq_ignore_ascii_case("Model"))
+            .unwrap_or(true)
+    });
+    contexts.into_iter().find_map(|ctx| {
+        let dir = store.get(ctx.attributes.get(5)?.as_ref()?)?;
+        let ratios = dir.attributes.first()?.as_list()?;
+        let north_x = ratios.first()?.as_f64()?;
+        let north_y = ratios.get(1)?.as_f64()?;
+        (north_x != 0.0 || north_y != 0.0).then_some(IfcTrueNorth { north_x, north_y })
+    })
+}
+
 /// Parse `filepath`, route on `target_srid`, and return the 4×3 row-major
 /// affine that maps IFC local coordinates to `target_srid`.
 ///
@@ -249,9 +293,14 @@ where
             let lat = site.lat.unwrap();
             let lon = site.lon.unwrap();
             let elev = site.elevation.unwrap_or(0.0);
+            // No IfcMapConversion (always so in IFC2x3): the model's TrueNorth
+            // still orients it; without either, local X/Y are east/north.
             let (rotation_deg, scale) = match mc.as_ref() {
                 Some(m) => (m.rotation_deg(), m.scale),
-                None => (0.0, 1.0),
+                None => (
+                    extract_true_north(&store).map_or(0.0, |tn| tn.rotation_deg()),
+                    1.0,
+                ),
             };
             if target_srid == 4326 {
                 tangent_plane_affine(lat, lon, elev, rotation_deg, scale)
@@ -387,6 +436,27 @@ mod tests {
         assert_eq!(mc.target_crs_name.as_deref(), Some("EPSG:32631"));
         assert!(mc.source_crs_name.is_none());
         assert!((mc.rotation_deg()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_true_north_rotation_matches_map_conversion_convention() {
+        // North straight up local +Y: the local axes are east / north.
+        let store = parse_fixture("test_data/minimal_building.ifc");
+        let tn = extract_true_north(&store).expect("true north present");
+        assert!((tn.rotation_deg()).abs() < 1e-9);
+        // North turned 30 deg toward local -X: local +X points 30 deg south of
+        // east, i.e. the local axes turn by the negation (#719 in eidos).
+        let store = parse_fixture("test_data/rotated_north_building.ifc");
+        let tn = extract_true_north(&store).expect("true north present");
+        assert!(
+            (tn.north_x + 0.5).abs() < 1e-12
+                && (tn.north_y - 0.866_025_403_784_438_6).abs() < 1e-12
+        );
+        assert!(
+            (tn.rotation_deg() + 30.0).abs() < 1e-9,
+            "{}",
+            tn.rotation_deg()
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "pg_streaming"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,7 +15,9 @@ name = "pgrx_embed_pg_streaming"
 path = "src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg18"]
+# opendal-s3 is on by default: the raw zone every Eidos engine ingests from is
+# S3-compatible object storage (see sovereign-data-platform.md, Pillar 1).
+default = ["pg18", "opendal-s3"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14", "pg_spi/pg14", "pg_observability/pg14", "pg_bgworker/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15", "pg_spi/pg15", "pg_observability/pg15", "pg_bgworker/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16", "pg_spi/pg16", "pg_observability/pg16", "pg_bgworker/pg16"]
@@ -53,6 +55,10 @@ csv = "1.3"
 flate2 = "1"
 opendal = { version = "0.50", default-features = false, features = ["services-fs", "services-memory", "services-http"] }
 glob = "0.3"
+# Parquet reader for the `parquet` parser (raw-zone files). No async/object_store:
+# the opendal source already fetched the bytes.
+parquet.workspace = true
+arrow-json.workspace = true
 uuid = { version = "1", features = ["v7"] }
 chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
@@ -69,6 +75,9 @@ pg_observability = { git = "https://github.com/matroidbe/pg_extensions", default
 pgx_zarr_walker = { path = "../../crates/pgx_zarr_walker" }
 
 [dev-dependencies]
+# Build Parquet fixtures in parser tests.
+arrow-array.workspace = true
+arrow-schema.workspace = true
 toml.workspace = true
 pgrx-tests = "0.16"
 tokio = { workspace = true, features = ["rt", "macros"] }
