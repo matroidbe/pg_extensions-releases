@@ -25,12 +25,24 @@ pub struct ClientSession {
 pub struct MqttBrokerState {
     /// Connected clients: client_id -> sender for outgoing messages
     pub clients: RwLock<HashMap<String, broadcast::Sender<BytesMut>>>,
+    /// This worker's id, recorded as the origin of the messages it enqueues
+    pub worker_id: i32,
+    /// Whether other workers exist that need this worker's publishes
+    pub has_peers: bool,
 }
 
 impl MqttBrokerState {
+    /// State of a single worker with no peers
     pub fn new() -> Self {
+        Self::for_worker(0, 1)
+    }
+
+    /// State of worker `worker_id` out of `worker_count`
+    pub fn for_worker(worker_id: i32, worker_count: i32) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
+            worker_id,
+            has_peers: worker_count > 1,
         }
     }
 
@@ -206,6 +218,16 @@ pub async fn handle_publish(
         }
     }
 
+    // Subscribers on other workers get the message via the outbox
+    if state.has_peers {
+        if let Err(e) = storage
+            .enqueue_outbox(&packet.topic, &packet.payload, state.worker_id)
+            .await
+        {
+            eprintln!("pg_mqtt: failed to enqueue '{}': {}", packet.topic, e);
+        }
+    }
+
     // Find matching subscriptions and forward the message (regardless of storage path)
     match storage.get_matching_subscriptions(&packet.topic).await {
         Ok(subscriptions) => {
@@ -310,4 +332,39 @@ pub async fn handle_disconnect(
 
     // Unregister from broker state
     state.unregister_client(client_id).await;
+}
+
+/// Deliver outbox rows to the subscribers connected to this worker
+/// (design/pg_mqtt/fanout.md). Each client gets a message once, however many
+/// of its filters match.
+pub async fn deliver_outbox_rows(
+    rows: &[crate::server::fanout::OutboxRow],
+    storage: &MqttStorageClient,
+    state: &MqttBrokerState,
+) -> Result<(), crate::storage::SpiError> {
+    if rows.is_empty() || state.clients.read().await.is_empty() {
+        return Ok(());
+    }
+    let subscriptions = storage.get_all_subscriptions().await?;
+    for row in rows {
+        let packet = PublishPacket {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: row.topic.clone(),
+            packet_id: None,
+            properties: PublishProperties::default(),
+            payload: row.payload.clone(),
+        };
+        let encoded = encode_publish(&packet);
+        let mut sent = std::collections::HashSet::new();
+        for sub in &subscriptions {
+            if crate::storage::spi_client::topic_matches(&sub.topic_filter, &row.topic)
+                && sent.insert(sub.client_id.as_str())
+            {
+                state.send_to_client(&sub.client_id, encoded.clone()).await;
+            }
+        }
+    }
+    Ok(())
 }

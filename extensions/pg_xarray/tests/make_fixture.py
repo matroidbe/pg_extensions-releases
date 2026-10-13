@@ -249,8 +249,10 @@ def write_selafin(path):
     out += rec(b"pg_xarray e2e SELAFIN fixture".ljust(80, b" "))
     # 2) NBV1, NBV2 — 2 big-endian int32
     out += rec(struct.pack(">ii", 2, 0))
-    # 3) Variable names + units — 2 * 32 bytes
-    out += rec(s32("WATER DEPTH     M") + s32("VELOCITY U      M/S"))
+    # 3) Variable names + units — one 32-byte record per variable
+    #    (16 name + 16 unit), as TELEMAC writes them
+    out += rec(s32("WATER DEPTH     M"))
+    out += rec(s32("VELOCITY U      M/S"))
     # 4) IPARAM (10 i32). IPARAM[10]=1 → DATE record follows. (1-indexed
     #    in TELEMAC docs == [9] zero-indexed.)
     iparam = [0] * 10

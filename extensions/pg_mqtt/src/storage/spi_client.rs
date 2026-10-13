@@ -7,6 +7,7 @@
 //! - Topic wildcard matching
 
 use super::spi_bridge::{ColumnType, SpiBridge, SpiError, SpiParam};
+use crate::server::fanout;
 
 /// MQTT storage client for database operations
 #[derive(Clone)]
@@ -108,7 +109,7 @@ impl MqttStorageClient {
 
     /// Get all subscriptions that match a topic
     ///
-    /// This uses PostgreSQL's pattern matching to handle MQTT wildcards:
+    /// MQTT wildcards are matched in Rust (`topic_matches`):
     /// - `+` matches exactly one topic level
     /// - `#` matches zero or more topic levels (must be last)
     pub async fn get_matching_subscriptions(
@@ -117,6 +118,13 @@ impl MqttStorageClient {
     ) -> Result<Vec<Subscription>, SpiError> {
         // For simplicity in MVP, we fetch all subscriptions and filter in Rust
         // This is not optimal for large subscription counts, but works for MVP
+        let mut subs = self.get_all_subscriptions().await?;
+        subs.retain(|s| topic_matches(&s.topic_filter, topic));
+        Ok(subs)
+    }
+
+    /// Get every subscription of every client
+    pub async fn get_all_subscriptions(&self) -> Result<Vec<Subscription>, SpiError> {
         let sql = "SELECT client_id, topic_filter, qos FROM pgmqtt.subscriptions";
 
         let result = self
@@ -128,22 +136,70 @@ impl MqttStorageClient {
             )
             .await?;
 
-        let mut matches = Vec::new();
-        for row in &result.rows {
-            let client_id = row.get_string(0).unwrap_or_default();
-            let topic_filter = row.get_string(1).unwrap_or_default();
-            let qos = row.get_i32(2).unwrap_or(0) as i16;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| Subscription {
+                client_id: row.get_string(0).unwrap_or_default(),
+                topic_filter: row.get_string(1).unwrap_or_default(),
+                qos: row.get_i32(2).unwrap_or(0) as i16,
+            })
+            .collect())
+    }
 
-            if topic_matches(&topic_filter, topic) {
-                matches.push(Subscription {
-                    client_id,
-                    topic_filter,
-                    qos,
-                });
-            }
-        }
+    /// Enqueue a message for the other workers (design/pg_mqtt/fanout.md)
+    pub async fn enqueue_outbox(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        origin_worker: i32,
+    ) -> Result<(), SpiError> {
+        self.bridge
+            .execute(
+                fanout::ENQUEUE_SQL,
+                vec![
+                    SpiParam::Text(Some(topic.to_string())),
+                    SpiParam::Bytea(Some(payload.to_vec())),
+                    SpiParam::Int4(Some(origin_worker)),
+                ],
+            )
+            .await
+    }
 
-        Ok(matches)
+    /// Read outbox rows of transactions that finished since `cursor`, skipping
+    /// this worker's own. Returns the new horizon and the rows.
+    pub async fn poll_outbox(
+        &self,
+        cursor: Option<u64>,
+        worker_id: i32,
+    ) -> Result<(u64, Vec<fanout::OutboxRow>), SpiError> {
+        let result = self
+            .bridge
+            .query(
+                fanout::POLL_SQL,
+                vec![
+                    SpiParam::Text(cursor.map(|c| c.to_string())),
+                    SpiParam::Int4(Some(worker_id)),
+                ],
+                vec![ColumnType::Text, ColumnType::Text, ColumnType::Bytea],
+            )
+            .await?;
+        let rows = result
+            .rows
+            .iter()
+            .map(|r| (r.get_string(0), r.get_string(1), r.get_bytes(2)))
+            .collect();
+        fanout::parse_poll(rows).map_err(SpiError::TypeConversion)
+    }
+
+    /// Delete outbox rows below a horizon every worker has passed
+    pub async fn cleanup_outbox(&self, bound: u64) -> Result<(), SpiError> {
+        self.bridge
+            .execute(
+                fanout::CLEANUP_SQL,
+                vec![SpiParam::Text(Some(bound.to_string()))],
+            )
+            .await
     }
 
     /// Get all subscriptions for a specific client

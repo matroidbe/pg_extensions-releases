@@ -102,6 +102,10 @@ impl HttpResponse {
             format!("HTTP/1.1 {} {}\r\n", self.status, self.status_text).as_bytes(),
         );
         out.extend_from_slice(b"Server: pg_xarray\r\n");
+        // Maps and capabilities are public. Without this a browser still
+        // shows the image, but a page cannot read its pixels (canvas
+        // export, client-side styling, value at a point).
+        out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
         for (k, v) in &self.headers {
             out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
         }
@@ -271,6 +275,8 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Server: pg_xarray\r\n"));
         assert!(s.contains("Content-Type: text/plain"));
+        // maps are public: browsers may read the pixels (canvas, value picking)
+        assert!(s.contains("Access-Control-Allow-Origin: *\r\n"));
         assert!(s.ends_with("hi"));
     }
 }

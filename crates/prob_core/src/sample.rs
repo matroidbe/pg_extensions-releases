@@ -99,20 +99,14 @@ pub fn sample_dist(dist: &Dist, rng: &mut dyn RngCore) -> f64 {
             if min == max {
                 *min
             } else {
-                // PERT uses beta distribution with calculated alpha/beta
+                // PERT is Beta(alpha, beta) on [min, max] with
+                //   alpha = 1 + lambda (mode - min) / (max - min)
+                //   beta  = 1 + lambda (max - mode) / (max - min)
+                // (mean (min + lambda mode + max) / (lambda + 2)). The form derived
+                // from the mean divides 0 by 0 when the mode is the midpoint.
                 let range = max - min;
-                let mu = (min + max + lambda * mode) / (lambda + 2.0);
-                let alpha = if range > 0.0 {
-                    ((mu - min) * (2.0 * mode - min - max)) / ((mode - mu) * (max - min))
-                } else {
-                    1.0
-                };
-                let beta_param = alpha * (max - mu) / (mu - min);
-
-                // Handle edge cases
-                let alpha = alpha.max(0.001);
-                let beta_param = beta_param.max(0.001);
-
+                let alpha = 1.0 + lambda * (mode - min) / range;
+                let beta_param = 1.0 + lambda * (max - mode) / range;
                 let b =
                     Beta::new(alpha, beta_param).unwrap_or_else(|_| Beta::new(1.0, 1.0).unwrap());
                 let sample = b.sample(rng);
@@ -504,6 +498,45 @@ pub fn correlation(
 mod tests {
     use super::*;
     use crate::constructors::{literal, normal, uniform};
+
+    /// Mean and standard deviation of n seeded samples.
+    fn moments(d: &Dist, n: usize) -> (f64, f64, Vec<f64>) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let xs: Vec<f64> = (0..n).map(|_| sample_dist(d, &mut rng)).collect();
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        (mean, var.sqrt(), xs)
+    }
+
+    #[test]
+    fn test_pert_symmetric_is_beta_3_3() {
+        // PERT(20, 30, 40), lambda 4: Beta(3, 3) on [20, 40], mean 30,
+        // sd 20 * sqrt(9 / (36 * 7)) = 3.78, bell-shaped (no mass at the ends)
+        let d = crate::constructors::pert(20.0, 30.0, 40.0, 4.0).unwrap();
+        let (mean, sd, xs) = moments(&d, 20_000);
+        assert!((mean - 30.0).abs() < 0.1, "mean {mean}");
+        assert!((sd - 3.780).abs() < 0.05, "sd {sd}");
+        let tails = xs.iter().filter(|x| **x < 21.0 || **x > 39.0).count();
+        assert!(tails < 20_000 / 100, "{tails} samples within 1 of the ends");
+    }
+
+    #[test]
+    fn test_pert_skewed_matches_the_standard_parameters() {
+        // PERT(0, 2, 10): alpha = 1 + 4 * 0.2 = 1.8, beta = 1 + 4 * 0.8 = 4.2,
+        // mean (0 + 4 * 2 + 10) / 6 = 3, sd 10 * sqrt(1.8 * 4.2 / (36 * 7)) = 1.732
+        let d = crate::constructors::pert(0.0, 2.0, 10.0, 4.0).unwrap();
+        let (mean, sd, _) = moments(&d, 20_000);
+        assert!((mean - 3.0).abs() < 0.05, "mean {mean}");
+        assert!((sd - 1.732).abs() < 0.03, "sd {sd}");
+    }
+
+    #[test]
+    fn test_pert_mode_at_an_end() {
+        // PERT(0, 0, 1): Beta(1, 5), mean 1/6
+        let d = crate::constructors::pert(0.0, 0.0, 1.0, 4.0).unwrap();
+        let (mean, _, _) = moments(&d, 20_000);
+        assert!((mean - 1.0 / 6.0).abs() < 0.01, "mean {mean}");
+    }
 
     #[test]
     fn test_sample_dist_literal() {

@@ -128,7 +128,7 @@ fn read_nodes_chunk(uri: &str, filter: &CoordFilter) -> Result<Vec<Cell>, String
         ));
     }
     let mut cells = Vec::with_capacity(ids.len());
-    for (node_id, value) in ids.into_iter().zip(values.into_iter()) {
+    for (node_id, value) in ids.into_iter().zip(values) {
         cells.push(Cell {
             lat: None,
             lon: None,

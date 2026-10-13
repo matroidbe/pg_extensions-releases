@@ -66,7 +66,7 @@ pub(crate) fn cholesky(matrix: &[f64], n: usize) -> Result<Vec<f64>, &'static st
 /// Generate n correlated sample pairs from two distributions using a Gaussian copula.
 ///
 /// Returns a table of (val1, val2) rows where the rank correlation approximates rho.
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn correlated_pair(
     dist1: Dist,
     dist2: Dist,
@@ -127,7 +127,7 @@ pub fn correlated_pair(
 /// - dists: array of distributions
 /// - correlations: flat NxN correlation matrix (row-major)
 /// - Returns table of (sample_idx, values[]) rows
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn correlated_sample(
     dists: Vec<Dist>,
     correlations: Vec<f64>,

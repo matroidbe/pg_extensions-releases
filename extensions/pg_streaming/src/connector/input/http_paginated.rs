@@ -252,7 +252,7 @@ impl AsyncSource for HttpPaginatedSource {
                 let body: Value = match serde_json::from_str(&body_text) {
                     Ok(v) => v,
                     Err(e) => {
-                        yield Err(format!("response not valid JSON: {} (body: {}...)", e, &body_text.chars().take(200).collect::<String>()));
+                        yield Err(format!("response not valid JSON: {} (body: {}...)", e, body_text.chars().take(200).collect::<String>()));
                         return;
                     }
                 };
@@ -489,10 +489,7 @@ pub fn extract_path(value: &Value, path: &str) -> Option<Value> {
     let mut current = value;
     for segment in path.split('.') {
         match current {
-            Value::Object(map) => match map.get(segment) {
-                Some(v) => current = v,
-                None => return None,
-            },
+            Value::Object(map) => current = map.get(segment)?,
             _ => return None,
         }
     }

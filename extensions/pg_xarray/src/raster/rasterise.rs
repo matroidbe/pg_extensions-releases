@@ -50,18 +50,68 @@ impl RasterBuffer {
     }
 }
 
+/// What to draw for a value outside `[vmin, vmax]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfRange {
+    /// The colormap's end colour (the default).
+    Extend,
+    /// Nothing: the pixel keeps the background. Below the minimum, this is
+    /// how a flood map leaves dry ground (depth ~0) showing the base map.
+    Transparent,
+}
+
+impl OutOfRange {
+    /// `extend` or `transparent`, any case (the ncWMS `BELOWMINCOLOR` /
+    /// `ABOVEMAXCOLOR` values pg_xarray supports).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "extend" => Some(Self::Extend),
+            "transparent" => Some(Self::Transparent),
+            _ => None,
+        }
+    }
+}
+
+/// The value range the colormap spans, and what happens outside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorScale {
+    pub vmin: f64,
+    pub vmax: f64,
+    pub below: OutOfRange,
+    pub above: OutOfRange,
+}
+
+impl ColorScale {
+    pub fn new(vmin: f64, vmax: f64) -> Self {
+        Self {
+            vmin,
+            vmax,
+            below: OutOfRange::Extend,
+            above: OutOfRange::Extend,
+        }
+    }
+
+    /// Whether `value` is drawn at all.
+    #[inline]
+    fn draws(&self, value: f64) -> bool {
+        !(value < self.vmin && self.below == OutOfRange::Transparent
+            || value > self.vmax && self.above == OutOfRange::Transparent)
+    }
+}
+
 /// Render a triangulated mesh at one timestep into a raster buffer.
 ///
 /// `keyframe.color` carries the per-vertex scalar (NaN = skip). Colour
-/// values are normalised by `(vmin, vmax)` and looked up in the LUT.
+/// values are normalised by the scale's `(vmin, vmax)` and looked up in
+/// the LUT; the interpolated value of each pixel decides whether it is
+/// out of range, so a transparent cut follows the contour smoothly.
 pub fn rasterise_keyframe(
     triangles: &[u32],
     base_xy: &[f32],
     keyframe: &Keyframe,
     viewport: &Viewport,
     lut: &colormap::Lut,
-    vmin: f64,
-    vmax: f64,
+    scale: &ColorScale,
     background: [u8; 4],
 ) -> RasterBuffer {
     let mut buf = RasterBuffer::new(viewport.width, viewport.height, background);
@@ -100,7 +150,7 @@ pub fn rasterise_keyframe(
         let v1 = keyframe.color[i1];
         let v2 = keyframe.color[i2];
 
-        rasterise_triangle(&mut buf, p0, p1, p2, v0, v1, v2, lut, vmin, vmax);
+        rasterise_triangle(&mut buf, p0, p1, p2, v0, v1, v2, lut, scale);
     }
 
     buf
@@ -117,8 +167,7 @@ fn rasterise_triangle(
     v1: f64,
     v2: f64,
     lut: &colormap::Lut,
-    vmin: f64,
-    vmax: f64,
+    scale: &ColorScale,
 ) {
     // Triangle pixel bbox, clipped to the raster.
     let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
@@ -168,7 +217,10 @@ fn rasterise_triangle(
                 continue;
             }
             let value = w0 * v0 + w1 * v1 + w2 * v2;
-            let t = colormap::normalize(value, vmin, vmax);
+            if !scale.draws(value) {
+                continue;
+            }
+            let t = colormap::normalize(value, scale.vmin, scale.vmax);
             let rgb = colormap::sample(lut, t);
             buf.put(px, py, [rgb[0], rgb[1], rgb[2], 255]);
         }
@@ -225,8 +277,7 @@ mod tests {
             &keyframe,
             &vp,
             &VIRIDIS,
-            0.0,
-            1.0,
+            &ColorScale::new(0.0, 1.0),
             [0, 0, 0, 0],
         );
 
@@ -259,8 +310,7 @@ mod tests {
             &keyframe,
             &vp,
             &VIRIDIS,
-            0.0,
-            1.0,
+            &ColorScale::new(0.0, 1.0),
             [10, 20, 30, 40],
         );
         // Every pixel should still be the background.
@@ -286,12 +336,98 @@ mod tests {
             &keyframe,
             &vp,
             &VIRIDIS,
-            0.0,
-            1.0,
+            &ColorScale::new(0.0, 1.0),
             [0, 0, 0, 0],
         );
         // All-1.0 should pick VIRIDIS[255] (yellow). Sample a centre pixel.
         let idx = ((5 * buf.width + 5) * 4) as usize;
         assert_eq!(&buf.pixels[idx..idx + 3], &VIRIDIS[255][..]);
+    }
+
+    /// Two triangles side by side: values 0 on the left edge, 2 on the right.
+    fn ramp() -> (Vec<u32>, Vec<f32>, Keyframe) {
+        let triangles = vec![0u32, 1, 2, 0, 2, 3];
+        let base_xy: Vec<f32> = vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0];
+        let keyframe = Keyframe {
+            time_seconds: 0.0,
+            z: vec![0.0; 4],
+            color: vec![0.0, 2.0, 2.0, 0.0],
+            flow_uv: None,
+        };
+        (triangles, base_xy, keyframe)
+    }
+
+    #[test]
+    fn out_of_range_values_extend_by_default() {
+        let (t, xy, k) = ramp();
+        let buf = rasterise_keyframe(
+            &t,
+            &xy,
+            &k,
+            &make_viewport(),
+            &VIRIDIS,
+            &ColorScale::new(0.5, 1.5),
+            [0, 0, 0, 0],
+        );
+        assert_eq!(
+            alpha_at(&buf, 0, 5),
+            255,
+            "below vmin is drawn in the first colour"
+        );
+        assert_eq!(
+            alpha_at(&buf, 9, 5),
+            255,
+            "above vmax is drawn in the last colour"
+        );
+    }
+
+    #[test]
+    fn below_min_transparent_leaves_dry_cells_empty() {
+        // the flood-map case: depth under the threshold is dry ground
+        let (t, xy, k) = ramp();
+        let scale = ColorScale {
+            below: OutOfRange::Transparent,
+            ..ColorScale::new(0.5, 1.5)
+        };
+        let buf = rasterise_keyframe(
+            &t,
+            &xy,
+            &k,
+            &make_viewport(),
+            &VIRIDIS,
+            &scale,
+            [0, 0, 0, 0],
+        );
+        assert_eq!(
+            alpha_at(&buf, 0, 5),
+            0,
+            "value ~0.1 < 0.5 is left transparent"
+        );
+        assert_eq!(alpha_at(&buf, 5, 5), 255, "value ~1.1 is drawn");
+        assert_eq!(alpha_at(&buf, 9, 5), 255, "above vmax still extends");
+    }
+
+    #[test]
+    fn above_max_transparent() {
+        let (t, xy, k) = ramp();
+        let scale = ColorScale {
+            above: OutOfRange::Transparent,
+            ..ColorScale::new(0.5, 1.5)
+        };
+        let buf = rasterise_keyframe(
+            &t,
+            &xy,
+            &k,
+            &make_viewport(),
+            &VIRIDIS,
+            &scale,
+            [0, 0, 0, 0],
+        );
+        assert_eq!(alpha_at(&buf, 0, 5), 255);
+        assert_eq!(
+            alpha_at(&buf, 9, 5),
+            0,
+            "value ~1.9 > 1.5 is left transparent"
+        );
     }
 }

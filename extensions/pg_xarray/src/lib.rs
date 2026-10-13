@@ -246,6 +246,11 @@ fn register_chunk(
 /// yet, create them with the given `format` + `srid`. The "register
 /// a Zarr store" UX is therefore a single SQL call.
 ///
+/// `transform` (SELAFIN only): a 2D affine `[a, b, d, e, xoff, yoff]`,
+/// `X = a*x + b*y + xoff`, `Y = d*x + e*y + yoff` (`ST_Affine` order), that
+/// maps the file's coordinates into `srid`. For models built in a local
+/// frame. Registering again with another transform moves the mesh.
+///
 /// Returns the number of chunk rows registered.
 #[pg_extern]
 fn register_file(
@@ -261,6 +266,7 @@ fn register_file(
     x_axis: default!(Option<&str>, "NULL"),
     y_axis: default!(Option<&str>, "NULL"),
     auto_create: default!(bool, true),
+    transform: default!(Option<Vec<f64>>, "NULL"),
 ) -> i64 {
     // x_axis wins over lon_axis (both mean "horizontal axis 1"); same
     // for y over lat. Keeping both spellings live lets a Cartesian
@@ -280,6 +286,7 @@ fn register_file(
         z_axis,
         srid,
         auto_create,
+        transform.as_deref(),
     )
 }
 
@@ -591,8 +598,12 @@ fn xarray_to_glb(
 /// directly (`\copy ... TO file`) or via the WMS bgworker (`?REQUEST=GetMap`).
 ///
 /// Coordinates are emitted in the dataset's native CRS — no reprojection.
-/// `options` jsonb knobs: `vmin`/`vmax` (colormap range), `background_color`
-/// (`#RRGGBB` or `#RRGGBBAA`, default transparent), `max_cells`.
+/// `options` jsonb knobs: `vmin`/`vmax` (colormap range), `below_min` /
+/// `above_max` (`'extend'`, the default, draws out-of-range values in the
+/// end colour; `'transparent'` leaves them out, e.g. dry cells of a water
+/// depth with `{"vmin": 0.01, "below_min": "transparent"}`),
+/// `background_color` (`#RRGGBB` or `#RRGGBBAA`, default transparent),
+/// `max_cells`.
 #[pg_extern]
 fn xarray_to_png(
     dataset: &str,
@@ -1434,20 +1445,23 @@ mod tests {
     // xarray_to_png — 2D raster export end-to-end against memory-backed ugrid.
     // =========================================================================
 
-    #[pg_test]
-    fn test_xarray_to_png_ugrid_triangle() {
-        Spi::run("SELECT pgx.register_dataset('png-tri', 'memory', default_srid := 0)").unwrap();
-        Spi::run("SELECT pgx.register_variable('png-tri', 'depth')").unwrap();
-        Spi::run(
-            "SELECT pgx.register_mesh('png-tri', 'ugrid_triangle', 'fixed', 0, \
-             'POLYGON((0 0, 1 0, 0 1, 0 0))', 3, 1)",
-        )
+    /// One triangle, depth 10 / 20 / 30 at its corners, as dataset `name`.
+    fn png_triangle(name: &str) {
+        Spi::run(&format!(
+            "SELECT pgx.register_dataset('{name}', 'memory', default_srid := 0)"
+        ))
         .unwrap();
-        let mv = Spi::get_one::<i64>(
-            "SELECT pgx.register_mesh_version('png-tri', \
+        Spi::run(&format!("SELECT pgx.register_variable('{name}', 'depth')")).unwrap();
+        Spi::run(&format!(
+            "SELECT pgx.register_mesh('{name}', 'ugrid_triangle', 'fixed', 0, \
+             'POLYGON((0 0, 1 0, 0 1, 0 0))', 3, 1)"
+        ))
+        .unwrap();
+        let mv = Spi::get_one::<i64>(&format!(
+            "SELECT pgx.register_mesh_version('{name}', \
              '2024-01-01'::timestamptz, '2024-12-31'::timestamptz, \
-             'POLYGON((0 0, 1 0, 0 1, 0 0))')",
-        )
+             'POLYGON((0 0, 1 0, 0 1, 0 0))')"
+        ))
         .unwrap()
         .unwrap();
         for (id, pt) in [(1, "POINT(0 0)"), (2, "POINT(1 0)"), (3, "POINT(0 1)")] {
@@ -1463,13 +1477,20 @@ mod tests {
         )
         .unwrap();
         Spi::run_with_args(
-            "SELECT pgx.register_chunk(\
-                 'png-tri', 'depth', 'memory://nodes?ids=1,2,3&values=10,20,30', \
+            &format!(
+                "SELECT pgx.register_chunk(\
+                 '{name}', 'depth', 'memory://nodes?ids=1,2,3&values=10,20,30', \
                  NULL, NULL, NULL, NULL, NULL, NULL, $1, NULL\
-             )",
+             )"
+            ),
             &[mv.into()],
         )
         .unwrap();
+    }
+
+    #[pg_test]
+    fn test_xarray_to_png_ugrid_triangle() {
+        png_triangle("png-tri");
 
         let bytes = Spi::get_one_with_args::<Vec<u8>>(
             "SELECT pgx.xarray_to_png('png-tri', 'depth', NULL, NULL, $1, $2)",
@@ -1492,6 +1513,48 @@ mod tests {
         let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
         assert_eq!(w, 64);
         assert_eq!(h, 64);
+    }
+
+    /// Opaque pixels of a PNG returned by `sql` (one bytea row).
+    fn opaque_pixels(sql: &str) -> usize {
+        let bytes = Spi::get_one::<Vec<u8>>(sql).unwrap().unwrap();
+        let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        img.pixels().filter(|p| p.0[3] > 0).count()
+    }
+
+    #[pg_test]
+    fn test_xarray_to_png_below_min_transparent() {
+        png_triangle("png-cut");
+        let all = opaque_pixels("SELECT pgx.xarray_to_png('png-cut', 'depth', NULL, NULL, 64, 64)");
+        // the default extends: the range changes the colours, not the coverage
+        let extended = opaque_pixels(
+            "SELECT pgx.xarray_to_png('png-cut', 'depth', NULL, NULL, 64, 64, 'viridis', \
+             '{\"vmin\": 20, \"vmax\": 30}')",
+        );
+        assert_eq!(extended, all);
+        // below 20 left transparent: corner 1 (10) loses its share of the triangle
+        let cut = opaque_pixels(
+            "SELECT pgx.xarray_to_png('png-cut', 'depth', NULL, NULL, 64, 64, 'viridis', \
+             '{\"vmin\": 20, \"vmax\": 30, \"below_min\": \"transparent\"}')",
+        );
+        assert!(cut > 0 && cut < all * 3 / 4, "cut {cut} of {all}");
+        let none = opaque_pixels(
+            "SELECT pgx.xarray_to_png('png-cut', 'depth', NULL, NULL, 64, 64, 'viridis', \
+             '{\"vmin\": 0, \"vmax\": 5, \"above_max\": \"transparent\"}')",
+        );
+        assert_eq!(none, 0);
+    }
+
+    #[pg_test(
+        error = "pgx.xarray_to_png: below_min must be 'extend' or 'transparent', got \"red\""
+    )]
+    fn test_xarray_to_png_rejects_a_bad_out_of_range_mode() {
+        png_triangle("png-bad");
+        Spi::run(
+            "SELECT pgx.xarray_to_png('png-bad', 'depth', NULL, NULL, 8, 8, 'viridis', \
+             '{\"below_min\": \"red\"}')",
+        )
+        .unwrap();
     }
 }
 

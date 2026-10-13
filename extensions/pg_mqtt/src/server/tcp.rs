@@ -24,6 +24,7 @@ use tokio::sync::{broadcast, Notify};
 use crate::protocol::codec::*;
 use crate::protocol::handlers::*;
 use crate::protocol::types::*;
+use crate::server::fanout::{FanoutCursor, POLL_INTERVAL};
 use crate::storage::source_insert::MqttSourceInserter;
 use crate::storage::{execute_spi_request, MqttStorageClient, SpiBridge};
 use crate::validation::MqttSchemaValidator;
@@ -79,6 +80,7 @@ pub fn run_server(
     host: &str,
     port: u16,
     worker_id: i32,
+    worker_count: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reset shutdown flag at start
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
@@ -98,7 +100,7 @@ pub fn run_server(
     let bridge_clone = bridge.clone();
 
     let server_handle = runtime.spawn(async move {
-        run_server_async(&host_owned, port, bridge_clone, worker_id)
+        run_server_async(&host_owned, port, bridge_clone, worker_id, worker_count)
             .await
             .map_err(|e| e.to_string())
     });
@@ -201,6 +203,7 @@ async fn run_server_async(
     port: u16,
     bridge: Arc<SpiBridge>,
     worker_id: i32,
+    worker_count: i32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Use SO_REUSEPORT to allow multiple workers to bind to the same port
     let listener = create_reuseport_listener(host, port)?;
@@ -214,7 +217,7 @@ async fn run_server_async(
     let storage = Arc::new(MqttStorageClient::new((*bridge).clone()));
 
     // Create broker state for message routing
-    let broker_state = Arc::new(MqttBrokerState::new());
+    let broker_state = Arc::new(MqttBrokerState::for_worker(worker_id, worker_count));
 
     // Create schema validator and source inserter for typed topics
     let validator = Arc::new(MqttSchemaValidator::new(bridge.clone()));
@@ -222,6 +225,9 @@ async fn run_server_async(
 
     // Create a notify for shutdown signaling to spawned tasks
     let shutdown_notify = Arc::new(Notify::new());
+
+    // Deliver messages published from SQL or on other workers
+    tokio::spawn(run_fanout(storage.clone(), broker_state.clone(), worker_id));
 
     // Accept loop with shutdown check
     loop {
@@ -281,6 +287,46 @@ async fn run_server_async(
 
     eprintln!("pg_mqtt worker {}: async server stopped", worker_id);
     Ok(())
+}
+
+/// Poll `pgmqtt.outbox` and deliver new rows to this worker's subscribers
+/// (design/pg_mqtt/fanout.md). Runs until shutdown.
+///
+/// NOTE: This runs on tokio worker threads, so we cannot call pgrx FFI functions.
+async fn run_fanout(storage: Arc<MqttStorageClient>, state: Arc<MqttBrokerState>, worker_id: i32) {
+    let mut cursor = FanoutCursor::new();
+    let mut last_error: Option<String> = None;
+
+    while !is_shutdown_requested() {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let result = match storage.poll_outbox(cursor.cursor(), worker_id).await {
+            Ok((horizon, rows)) => {
+                let rows = cursor.advance(horizon, rows);
+                deliver_outbox_rows(&rows, &storage, &state).await
+            }
+            Err(e) => Err(e),
+        };
+        let result = match (result, cursor.cleanup_bound(std::time::Instant::now())) {
+            (Ok(()), Some(bound)) => storage.cleanup_outbox(bound).await,
+            (result, _) => result,
+        };
+
+        // Log each distinct failure once, not every 50 ms
+        match result {
+            Ok(()) => last_error = None,
+            Err(e) => {
+                let msg = e.to_string();
+                if last_error.as_deref() != Some(msg.as_str()) && !is_shutdown_requested() {
+                    eprintln!(
+                        "pg_mqtt worker {}: outbox fan-out failed: {}",
+                        worker_id, msg
+                    );
+                }
+                last_error = Some(msg);
+            }
+        }
+    }
 }
 
 /// Handle a single MQTT client connection

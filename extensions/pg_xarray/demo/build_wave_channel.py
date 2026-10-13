@@ -101,12 +101,10 @@ def write_selafin(path: Path) -> None:
     out += rec(b"pg_xarray wave_channel.slf (synthetic)".ljust(80, b" "))
     # 2) NBV1 (number of physical vars), NBV2 (clipped vars; 0 for us)
     out += rec(struct.pack(">ii", 3, 0))
-    # 3) Variable names + units — 3 * 32 bytes
-    out += rec(
-        s32("WATER DEPTH     M")
-        + s32("VELOCITY U      M/S")
-        + s32("VELOCITY V      M/S")
-    )
+    # 3) Variable names + units — one 32-byte record per variable
+    #    (16 name + 16 unit), as TELEMAC writes them
+    for name in ("WATER DEPTH     M", "VELOCITY U      M/S", "VELOCITY V      M/S"):
+        out += rec(s32(name))
     # 4) IPARAM (10 i32). IPARAM[10]=1 → DATE record follows (1-indexed
     #    in TELEMAC docs == [9] zero-indexed).
     iparam = [0] * 10

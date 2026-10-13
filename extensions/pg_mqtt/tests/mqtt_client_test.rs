@@ -23,8 +23,8 @@ use std::time::Duration;
 /// Connects to the broker, publishes a message, and verifies connection works.
 #[test]
 fn test_mqtt_connect_and_publish() {
-    skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-1", common::MQTT_HOST, common::MQTT_PORT);
+    skip_if_no_server!(common::mqtt_addr());
+    let mut mqttoptions = MqttOptions::new("test-client-1", common::MQTT_HOST, common::mqtt_port());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, mut connection) = Client::new(mqttoptions, 10);
@@ -90,8 +90,8 @@ fn test_mqtt_connect_and_publish() {
 /// Connects to the broker, subscribes to a topic, and waits for acknowledgment.
 #[test]
 fn test_mqtt_subscribe() {
-    skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-2", common::MQTT_HOST, common::MQTT_PORT);
+    skip_if_no_server!(common::mqtt_addr());
+    let mut mqttoptions = MqttOptions::new("test-client-2", common::MQTT_HOST, common::mqtt_port());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, mut connection) = Client::new(mqttoptions, 10);
@@ -147,8 +147,8 @@ fn test_mqtt_subscribe() {
 /// Test MQTT 5.0 ping/keepalive functionality
 #[test]
 fn test_mqtt_ping() {
-    skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-3", common::MQTT_HOST, common::MQTT_PORT);
+    skip_if_no_server!(common::mqtt_addr());
+    let mut mqttoptions = MqttOptions::new("test-client-3", common::MQTT_HOST, common::mqtt_port());
     mqttoptions.set_keep_alive(Duration::from_secs(5)); // rumqttc requires >= 5 secs
 
     let (_client, mut connection) = Client::new(mqttoptions, 10);
@@ -202,8 +202,8 @@ fn test_mqtt_ping() {
 /// Test connection with clean start flag
 #[test]
 fn test_mqtt_clean_session() {
-    skip_if_no_server!(common::MQTT_ADDR);
-    let mut mqttoptions = MqttOptions::new("test-client-4", common::MQTT_HOST, common::MQTT_PORT);
+    skip_if_no_server!(common::mqtt_addr());
+    let mut mqttoptions = MqttOptions::new("test-client-4", common::MQTT_HOST, common::mqtt_port());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     mqttoptions.set_clean_start(true);
 
@@ -257,7 +257,7 @@ fn test_mqtt_clean_session() {
 
 /// Helper: publish a message via MQTT and wait for the outgoing publish confirmation
 fn mqtt_publish_and_wait(client_id: &str, topic: &str, payload: &[u8]) -> bool {
-    let mut mqttoptions = MqttOptions::new(client_id, common::MQTT_HOST, common::MQTT_PORT);
+    let mut mqttoptions = MqttOptions::new(client_id, common::MQTT_HOST, common::mqtt_port());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     mqttoptions.set_clean_start(true);
 
@@ -350,7 +350,7 @@ fn setup_typed_topic(topic: &str, table_name: &str, schema_json: &str) {
 /// This tests the basic publish → store in pgmqtt.messages flow via the MQTT protocol.
 #[test]
 fn test_mqtt_publish_untyped_stored_in_db() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -404,7 +404,7 @@ fn test_mqtt_publish_untyped_stored_in_db() {
 /// and verifies the data is decomposed into the backing table's columns.
 #[test]
 fn test_mqtt_publish_typed_valid_payload() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -497,7 +497,7 @@ fn test_mqtt_publish_typed_valid_payload() {
 /// (missing required fields), and verifies it is NOT stored in the backing table.
 #[test]
 fn test_mqtt_publish_typed_invalid_payload_strict() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -580,7 +580,7 @@ fn test_mqtt_publish_typed_invalid_payload_strict() {
 /// Verifies that non-JSON payloads are rejected when a schema is bound.
 #[test]
 fn test_mqtt_publish_typed_non_json_strict() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -633,7 +633,7 @@ fn test_mqtt_publish_typed_non_json_strict() {
 /// Verifies backward compatibility: topics without schema bindings accept all payloads.
 #[test]
 fn test_mqtt_publish_no_schema_accepts_anything() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -684,7 +684,7 @@ fn test_mqtt_publish_no_schema_accepts_anything() {
 /// are correctly decomposed into the backing table.
 #[test]
 fn test_mqtt_typed_topic_full_roundtrip() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -774,7 +774,7 @@ fn test_mqtt_typed_topic_full_roundtrip() {
 /// Tests the manual workflow: register_schema → bind_schema → publish via MQTT
 #[test]
 fn test_mqtt_manual_schema_bind_and_publish() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -874,7 +874,7 @@ fn test_mqtt_manual_schema_bind_and_publish() {
 /// Test: Create typed topic from existing table, then publish via MQTT
 #[test]
 fn test_mqtt_create_typed_topic_from_table() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -951,7 +951,7 @@ fn test_mqtt_create_typed_topic_from_table() {
 /// tokens and quotes is stored verbatim — never re-substituted into the SQL.
 #[test]
 fn test_mqtt_dollar_placeholder_topic_stored_literally() {
-    skip_if_no_server!(common::MQTT_ADDR);
+    skip_if_no_server!(common::mqtt_addr());
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -981,4 +981,121 @@ fn test_mqtt_dollar_placeholder_topic_stored_literally() {
         sessions.trim() == "1" || sessions.trim() == "0",
         "session row query must not error"
     );
+}
+
+// ============================================================================
+// Fan-out: SQL publish and delivery across workers (design/pg_mqtt/fanout.md)
+// ============================================================================
+
+/// A connected subscriber whose received payloads arrive on `rx`
+struct Subscriber {
+    _client: Client,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+/// Connect, subscribe to `filter` and return once the SUBACK has arrived
+fn subscribe(client_id: &str, filter: &str) -> Subscriber {
+    let mut opts = MqttOptions::new(client_id, common::MQTT_HOST, common::mqtt_port());
+    opts.set_keep_alive(Duration::from_secs(5));
+    opts.set_clean_start(true);
+    let (client, mut connection) = Client::new(opts, 10);
+    client
+        .subscribe(filter, QoS::AtMostOnce)
+        .expect("Failed to subscribe");
+
+    let (suback_tx, suback_rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for event in connection.iter() {
+            match event {
+                Ok(Event::Incoming(Incoming::SubAck(_))) => {
+                    let _ = suback_tx.send(());
+                }
+                Ok(Event::Incoming(Incoming::Publish(p))) => {
+                    if tx.send(p.payload.to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    suback_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("no SUBACK within 5s");
+    Subscriber {
+        _client: client,
+        rx,
+    }
+}
+
+#[test]
+fn test_sql_publish_reaches_subscriber() {
+    skip_if_no_server!(common::mqtt_addr());
+    let sub = subscribe("fanout-sql-sub", "fanout/sql/#");
+
+    common::execute_sql("SELECT pgmqtt.mqtt_publish('fanout/sql/1', 'from sql')")
+        .expect("mqtt_publish failed");
+
+    let got = sub
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("subscriber did not receive the SQL-published message");
+    assert_eq!(got, b"from sql");
+}
+
+#[test]
+fn test_sql_publish_rolled_back_is_not_delivered() {
+    skip_if_no_server!(common::mqtt_addr());
+    let sub = subscribe("fanout-rollback-sub", "fanout/rollback/#");
+
+    common::execute_sql(
+        "DO $$ BEGIN
+           PERFORM pgmqtt.mqtt_publish('fanout/rollback/1', 'never');
+           RAISE EXCEPTION 'abort';
+         EXCEPTION WHEN raise_exception THEN NULL;
+         END $$",
+    )
+    .expect("DO block failed");
+    common::execute_sql("SELECT pgmqtt.mqtt_publish('fanout/rollback/2', 'after')")
+        .expect("mqtt_publish failed");
+
+    let got = sub
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("no message delivered");
+    assert_eq!(
+        got, b"after",
+        "the rolled-back publish must not be delivered"
+    );
+}
+
+/// With several workers, connections spread over them (SO_REUSEPORT). Eight
+/// subscribers are all on the publisher's worker with probability 4^-8, so
+/// this fails reliably when delivery does not cross workers.
+#[test]
+fn test_mqtt_publish_reaches_subscribers_on_every_worker() {
+    skip_if_no_server!(common::mqtt_addr());
+    let subs: Vec<Subscriber> = (0..8)
+        .map(|i| subscribe(&format!("fanout-xworker-sub-{i}"), "fanout/xworker"))
+        .collect();
+
+    assert!(mqtt_publish_and_wait(
+        "fanout-xworker-pub",
+        "fanout/xworker",
+        b"to all"
+    ));
+
+    for (i, sub) in subs.iter().enumerate() {
+        let got = sub
+            .rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("subscriber {i} did not receive the message"));
+        assert_eq!(got, b"to all");
+        assert!(
+            sub.rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "subscriber {i} received the message twice"
+        );
+    }
 }

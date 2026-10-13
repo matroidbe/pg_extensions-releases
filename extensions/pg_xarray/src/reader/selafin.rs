@@ -118,36 +118,53 @@ pub struct SelafinCell {
     pub centroid_y: f64,
 }
 
+/// 2D affine `[a, b, d, e, xoff, yoff]`: `X = a*x + b*y + xoff`,
+/// `Y = d*x + e*y + yoff` (PostGIS `ST_Affine` order).
+pub type Transform = [f64; 6];
+
 /// Top-level walk: parse the header, populate nodes + cells, and emit
 /// one `ChunkRecord` per `(variable, timestep)` pair. Variables are
 /// matched against `variable` case-insensitively after trimming.
-pub fn walk_selafin(uri: &str, variable: &str) -> Result<SelafinWalk, String> {
+///
+/// Node coordinates are the file's (IPARAM origin applied), mapped through
+/// `transform` when given: a model's local frame onto the ground.
+pub fn walk_selafin(
+    uri: &str,
+    variable: &str,
+    transform: Option<&Transform>,
+) -> Result<SelafinWalk, String> {
     let path = local_path(uri)?;
     let bytes = std::fs::read(&path).map_err(|e| format!("selafin: read '{path}': {e}"))?;
-    walk_bytes(&bytes, uri, variable)
+    walk_bytes(&bytes, uri, variable, transform)
 }
 
 // ----- core parser ------------------------------------------------------------
 
-fn walk_bytes(bytes: &[u8], uri: &str, variable: &str) -> Result<SelafinWalk, String> {
+fn walk_bytes(
+    bytes: &[u8],
+    uri: &str,
+    variable: &str,
+    transform: Option<&Transform>,
+) -> Result<SelafinWalk, String> {
     let mut p = Parser::new(bytes);
     // 1) title
     let _title = p.read_record_str(80)?;
     // 2) NBV1, NBV2
     let header_ints = p.read_record_i32(2)?;
     let nbv1 = header_ints[0] as usize;
-    let _nbv2 = header_ints[1] as usize;
+    let nbv2 = header_ints[1] as usize;
     if nbv1 == 0 {
         return Err("selafin: NBV1 == 0 (no variables in file)".into());
     }
-    // 3) variable names — NBV1 * 32 chars
-    let var_names_raw = p.read_record_bytes(32 * nbv1)?;
-    let var_names: Vec<String> = (0..nbv1)
-        .map(|i| {
-            let s = &var_names_raw[i * 32..(i + 1) * 32];
-            String::from_utf8_lossy(s).trim().to_string()
-        })
-        .collect();
+    // 3) variable names — one 32-char record per variable (16 name + 16
+    //    unit), NBV1 + NBV2 of them. Only NBV1 variables are stored per frame.
+    let mut var_names: Vec<String> = Vec::with_capacity(nbv1);
+    for i in 0..nbv1 + nbv2 {
+        let rec = p.read_record_bytes(32)?;
+        if i < nbv1 {
+            var_names.push(String::from_utf8_lossy(&rec[..16]).trim().to_string());
+        }
+    }
     // 4) IPARAM (10 i32s)
     let iparam = p.read_record_i32(10)?;
     let has_date = iparam[9] == 1;
@@ -191,12 +208,25 @@ fn walk_bytes(bytes: &[u8], uri: &str, variable: &str) -> Result<SelafinWalk, St
     // 9) Y
     let ys = p.read_record_f32(npoin)?;
 
-    // Build nodes
+    // Coordinates are stored relative to IPARAM(3), IPARAM(4) (TELEMAC's
+    // origin, which keeps large projected coordinates out of f32), then
+    // mapped through the caller's transform.
+    let (x0, y0) = (iparam[2] as f64, iparam[3] as f64);
+    let place = |x: f32, y: f32| -> (f64, f64) {
+        let (x, y) = (x as f64 + x0, y as f64 + y0);
+        match transform {
+            Some([a, b, d, e, xoff, yoff]) => (a * x + b * y + xoff, d * x + e * y + yoff),
+            None => (x, y),
+        }
+    };
     let nodes: Vec<SelafinNode> = (0..npoin)
-        .map(|i| SelafinNode {
-            node_id: (i + 1) as i64,
-            x: xs[i] as f64,
-            y: ys[i] as f64,
+        .map(|i| {
+            let (x, y) = place(xs[i], ys[i]);
+            SelafinNode {
+                node_id: (i + 1) as i64,
+                x,
+                y,
+            }
         })
         .collect();
     // Build cells — IKLE is row-major with `ndp` columns per cell.
@@ -290,12 +320,17 @@ fn walk_bytes(bytes: &[u8], uri: &str, variable: &str) -> Result<SelafinWalk, St
     }
 
     // Bbox of all nodes — used to set mesh_versions.extent.
-    let (x_min, x_max) = xs.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |a, &x| {
-        (a.0.min(x), a.1.max(x))
-    });
-    let (y_min, y_max) = ys.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |a, &y| {
-        (a.0.min(y), a.1.max(y))
-    });
+    // (of the placed nodes: a rotation moves the corners)
+    let (x_min, x_max) = nodes
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |a, n| {
+            (a.0.min(n.x), a.1.max(n.x))
+        });
+    let (y_min, y_max) = nodes
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |a, n| {
+            (a.0.min(n.y), a.1.max(n.y))
+        });
     let mesh_extent_wkt = format!(
         "POLYGON(({x_min} {y_min}, {x_max} {y_min}, {x_max} {y_max}, {x_min} {y_max}, {x_min} {y_min}))"
     );
@@ -544,5 +579,96 @@ mod tests {
     #[test]
     fn parse_chunk_key_rejects_missing_at() {
         assert!(parse_chunk_key("WATER DEPTH").is_err());
+    }
+
+    /// A minimal big-endian SELAFIN: one triangle, `vars` variables, `frames` frames.
+    fn tiny_selafin(vars: &[&str], frames: usize) -> Vec<u8> {
+        tiny_selafin_at(vars, frames, (0, 0))
+    }
+
+    /// `origin`: IPARAM(3), IPARAM(4), added to every coordinate
+    fn tiny_selafin_at(vars: &[&str], frames: usize, origin: (i32, i32)) -> Vec<u8> {
+        fn rec(out: &mut Vec<u8>, payload: &[u8]) {
+            let n = (payload.len() as i32).to_be_bytes();
+            out.extend_from_slice(&n);
+            out.extend_from_slice(payload);
+            out.extend_from_slice(&n);
+        }
+        let ints = |v: &[i32]| v.iter().flat_map(|i| i.to_be_bytes()).collect::<Vec<u8>>();
+        let floats = |v: &[f32]| v.iter().flat_map(|f| f.to_be_bytes()).collect::<Vec<u8>>();
+        let mut b = Vec::new();
+        rec(&mut b, format!("{:<72}SERAFIN ", "tiny").as_bytes());
+        rec(&mut b, &ints(&[vars.len() as i32, 0]));
+        for v in vars {
+            rec(&mut b, format!("{v:<16}{:<16}", "M").as_bytes());
+        }
+        rec(&mut b, &ints(&[1, 0, origin.0, origin.1, 0, 0, 0, 0, 0, 0]));
+        rec(&mut b, &ints(&[1, 3, 3, 1]));
+        rec(&mut b, &ints(&[1, 2, 3]));
+        rec(&mut b, &ints(&[1, 2, 3]));
+        rec(&mut b, &floats(&[0.0, 1.0, 0.0]));
+        rec(&mut b, &floats(&[0.0, 0.0, 1.0]));
+        for t in 0..frames {
+            rec(&mut b, &floats(&[t as f32]));
+            for v in 0..vars.len() {
+                rec(&mut b, &floats(&[v as f32; 3]));
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn walks_files_with_several_variables() {
+        // Every TELEMAC result has several variables, one name record each.
+        let bytes = tiny_selafin(&["VELOCITY U", "VELOCITY V", "WATER DEPTH"], 2);
+        let walk = walk_bytes(&bytes, "file:///tiny.slf", "WATER DEPTH", None).unwrap();
+        assert_eq!(walk.nodes.len(), 3);
+        assert_eq!(walk.variable_walk.chunks.len(), 2);
+        // the unit column is not part of the name
+        let Err(err) = walk_bytes(&bytes, "file:///tiny.slf", "nope", None) else {
+            panic!("found 'nope'")
+        };
+        assert!(err.contains(r#""WATER DEPTH""#), "{err}");
+    }
+
+    fn xy(walk: &SelafinWalk) -> Vec<(f64, f64)> {
+        walk.nodes.iter().map(|n| (n.x, n.y)).collect()
+    }
+
+    #[test]
+    fn applies_the_iparam_origin() {
+        // TELEMAC stores coordinates relative to IPARAM(3), IPARAM(4)
+        let bytes = tiny_selafin_at(&["WATER DEPTH"], 1, (1000, 2000));
+        let walk = walk_bytes(&bytes, "file:///tiny.slf", "WATER DEPTH", None).unwrap();
+        assert_eq!(
+            xy(&walk),
+            vec![(1000.0, 2000.0), (1001.0, 2000.0), (1000.0, 2001.0)]
+        );
+        assert!(
+            walk.mesh_extent_wkt.starts_with("POLYGON((1000 2000,"),
+            "{}",
+            walk.mesh_extent_wkt
+        );
+    }
+
+    #[test]
+    fn transform_moves_nodes_cells_and_extent() {
+        // Rotate 90 degrees and shift: X = -y + 500, Y = x + 100 (after the origin)
+        let bytes = tiny_selafin_at(&["WATER DEPTH"], 1, (10, 0));
+        let t = [0.0, -1.0, 1.0, 0.0, 500.0, 100.0];
+        let walk = walk_bytes(&bytes, "file:///tiny.slf", "WATER DEPTH", Some(&t)).unwrap();
+        assert_eq!(
+            xy(&walk),
+            vec![(500.0, 110.0), (500.0, 111.0), (499.0, 110.0)]
+        );
+        let c = &walk.cells[0];
+        assert!(
+            (c.centroid_x - 499.666_666).abs() < 1e-5 && (c.centroid_y - 110.333_333).abs() < 1e-5
+        );
+        // the extent is the bbox of the moved nodes
+        assert_eq!(
+            walk.mesh_extent_wkt,
+            "POLYGON((499 110, 500 110, 500 111, 499 111, 499 110))"
+        );
     }
 }

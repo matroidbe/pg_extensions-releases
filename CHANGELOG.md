@@ -4,6 +4,61 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.7.0 — 2026-10-13
+
+**pg_mqtt delivers every publish to every subscriber (0.4.0).** Two paths
+never reached a subscriber before (#26):
+
+- `mqtt_publish()` from SQL only stored the message.
+- With `pg_mqtt.worker_count > 1` (default 4) an MQTT publish reached only the
+  subscribers on the publisher's worker.
+
+Messages now fan out through a new unlogged `pgmqtt.outbox` table that every
+worker polls every 50 ms (design/pg_mqtt/fanout.md).
+
+- A SQL publish is delivered when its transaction commits. It is never
+  delivered if the transaction rolls back.
+- A long-running write transaction elsewhere in the cluster delays fan-out
+  until it ends.
+- `mqtt_publish()` also no longer fails on payloads containing a backslash
+  sequence such as `\x41`.
+
+**pg_prob draws fresh random values per row (0.3.1).** `sample`, `samples`,
+`summarize`, `mean`, `percentile`, `variance`, `stddev`, the `prob_*`
+functions, `covariance`, `correlation`, `correlated_pair` and
+`correlated_sample` were IMMUTABLE. PostgreSQL therefore folded an unseeded
+call with constant arguments into one value for the whole query. They are
+VOLATILE now, and a seeded call is still reproducible (#146).
+
+`pert(min, mode, max)` with the mode at the midpoint sampled almost only the
+two ends. It now uses the standard PERT Beta parameters (#152).
+
+**pg_xarray georeferences TELEMAC meshes and serves them to web maps (0.5.0).**
+
+- **SELAFIN origin:** the reader applies the file's IPARAM origin.
+- **`register_file(…, transform)`:** takes a 2D affine in `ST_Affine` order
+  that maps a mesh's local frame into its SRID. Registering again with another
+  transform moves the mesh, and the mesh extent moves with it.
+- **Faster registration:** a SELAFIN mesh registers with two set-based
+  statements instead of one per node and cell. On Malpasset that cut 85 s
+  to 2 s.
+- **WMS GetMap parameters:** `COLORSCALERANGE`, `BELOWMINCOLOR` and
+  `ABOVEMAXCOLOR` (ncWMS names). `xarray_to_png` gains matching `below_min` /
+  `above_max` options.
+- **Capabilities:** `EX_GeographicBoundingBox` is now in degrees.
+- **CORS:** every response carries `Access-Control-Allow-Origin: *`.
+
+**CI fixes:**
+
+- pg_mqtt's integration tests run on a random free MQTT port, because the
+  broker binds with SO_REUSEPORT and a second pg_mqtt on a fixed port
+  silently took a share of the test connections.
+- New clippy 1.98 lints are fixed in pg_streaming and pg_xarray. The
+  pg_streaming change is lint-only, so it is still 0.3.3.
+
+Extension versions: pg_mqtt 0.4.0, pg_prob 0.3.1, pg_xarray 0.5.0. Every
+other extension is unchanged from v0.6.0.
+
 ## v0.6.0 — 2026-10-09
 
 **pg_streaming reads a raw zone (0.3.3).** The opendal source can now serve

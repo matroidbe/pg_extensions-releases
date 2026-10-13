@@ -29,7 +29,10 @@ SELECT pgmqtt.mqtt_status();
 
 ### mqtt_publish
 
-Publish a message to a topic via SQL.
+Publish a message to a topic via SQL. It is stored, and delivered to the
+connected subscribers of the topic when the transaction commits (within about
+50 ms). A rolled-back publish is never delivered. A long-running write
+transaction elsewhere in the cluster delays delivery until it ends.
 
 ```sql
 SELECT pgmqtt.mqtt_publish('sensors/room1/temperature', '22.5');

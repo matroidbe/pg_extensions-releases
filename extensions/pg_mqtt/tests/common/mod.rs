@@ -9,12 +9,28 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio_postgres::NoTls;
 
-/// MQTT broker address — uses port 11883 to avoid conflicts with a dev PG
-/// running pg_mqtt on the default 1883. test.sh sets pg_mqtt.port = 11883
-/// in postgresql.conf to match.
 pub const MQTT_HOST: &str = "127.0.0.1";
-pub const MQTT_PORT: u16 = 11883;
-pub const MQTT_ADDR: &str = "127.0.0.1:11883";
+
+/// The broker port, from `PG_MQTT_PORT` — the variable `test.sh` exports
+/// after picking a random free port and writing it into `postgresql.conf`.
+///
+/// Resolved at runtime rather than fixed because the port is global to the
+/// machine and the broker binds with SO_REUSEPORT: a second pg_mqtt on a
+/// fixed port silently takes a share of the test connections.
+///
+/// The default keeps a bare `cargo test` working against a hand-started PG.
+pub fn mqtt_port() -> u16 {
+    std::env::var("PG_MQTT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11883)
+}
+
+/// `host:port` for the broker, resolved once per test binary.
+pub fn mqtt_addr() -> &'static str {
+    static ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ADDR.get_or_init(|| format!("{}:{}", MQTT_HOST, mqtt_port()))
+}
 
 /// Default PostgreSQL connection parameters for pgrx-managed instance
 pub const PG_HOST: &str = "localhost";

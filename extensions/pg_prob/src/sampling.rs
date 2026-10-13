@@ -27,7 +27,7 @@ pub(crate) fn sample_dist(dist: &Dist, rng: &mut dyn RngCore) -> f64 {
 // =============================================================================
 
 /// Sample a single value from a distribution
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn sample(dist: Dist, seed: default!(Option<i64>, "NULL")) -> f64 {
     prob_core::sample::sample(&dist.0, seed)
 }
@@ -37,7 +37,7 @@ pub fn sample(dist: Dist, seed: default!(Option<i64>, "NULL")) -> f64 {
 // =============================================================================
 
 /// Sample multiple values from a distribution
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn samples(dist: Dist, n: i32, seed: default!(Option<i64>, "NULL")) -> Vec<f64> {
     prob_core::sample::samples(&dist.0, n, seed)
 }
@@ -47,7 +47,7 @@ pub fn samples(dist: Dist, n: i32, seed: default!(Option<i64>, "NULL")) -> Vec<f
 // =============================================================================
 
 /// Compute summary statistics for a distribution via Monte Carlo sampling
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn summarize(
     dist: Dist,
     n: default!(i32, 10000),
@@ -61,7 +61,7 @@ pub fn summarize(
 // =============================================================================
 
 /// Probability that the distribution is below a threshold
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn prob_below(
     dist: Dist,
     threshold: f64,
@@ -72,7 +72,7 @@ pub fn prob_below(
 }
 
 /// Probability that the distribution is above a threshold
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn prob_above(
     dist: Dist,
     threshold: f64,
@@ -83,7 +83,7 @@ pub fn prob_above(
 }
 
 /// Probability that the distribution is between two thresholds
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn prob_between(
     dist: Dist,
     lower: f64,
@@ -101,13 +101,13 @@ pub fn prob_between(
 // =============================================================================
 
 /// Get the mean of a distribution via sampling
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn mean(dist: Dist, n: default!(i32, 10000), seed: default!(Option<i64>, "NULL")) -> f64 {
     prob_core::sample::mean(&dist.0, n, seed)
 }
 
 /// Get a specific percentile of a distribution
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn percentile(
     dist: Dist,
     p: f64,
@@ -122,13 +122,13 @@ pub fn percentile(
 // =============================================================================
 
 /// Compute the variance of a distribution via Monte Carlo sampling
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn variance(dist: Dist, n: default!(i32, 10000), seed: default!(Option<i64>, "NULL")) -> f64 {
     ok_or_pg(prob_core::sample::variance(&dist.0, n, seed))
 }
 
 /// Compute the standard deviation of a distribution via Monte Carlo sampling
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn stddev(dist: Dist, n: default!(i32, 10000), seed: default!(Option<i64>, "NULL")) -> f64 {
     ok_or_pg(prob_core::sample::stddev(&dist.0, n, seed))
 }
@@ -139,7 +139,7 @@ pub fn stddev(dist: Dist, n: default!(i32, 10000), seed: default!(Option<i64>, "
 /// returns near-zero for any pair of distributions. Use `fit_correlation(x, y)` on
 /// table data to discover real correlations, or use `correlated_pair()` /
 /// `correlated_sample()` for correlated sampling.
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn covariance(
     dist1: Dist,
     dist2: Dist,
@@ -160,7 +160,7 @@ pub fn covariance(
 /// returns near-zero for any pair of distributions. Use `fit_correlation(x, y)` on
 /// table data to discover real correlations, or use `correlated_pair()` /
 /// `correlated_sample()` for correlated sampling.
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(volatile, parallel_safe)]
 pub fn correlation(
     dist1: Dist,
     dist2: Dist,
@@ -245,6 +245,57 @@ mod tests {
         let cor = result.unwrap().unwrap();
         // Independent distributions → near-zero correlation
         assert!(cor.abs() < 0.05, "correlation was {}", cor);
+    }
+
+    // #146: an unseeded draw must not be constant-folded, so every function
+    // that draws random numbers is VOLATILE.
+    #[pg_test]
+    fn test_random_functions_are_volatile() {
+        let not_volatile = Spi::get_one::<String>(
+            "SELECT string_agg(DISTINCT p.proname, ', ' ORDER BY p.proname)
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'pgprob'
+               AND p.proname IN ('sample', 'samples', 'summarize', 'prob_below',
+                                 'prob_above', 'prob_between', 'mean', 'percentile',
+                                 'variance', 'stddev', 'covariance', 'correlation',
+                                 'correlated_pair', 'correlated_sample', 'simulate')
+               AND p.provolatile <> 'v'",
+        )
+        .unwrap();
+        assert_eq!(not_volatile, None, "not VOLATILE: {:?}", not_volatile);
+    }
+
+    #[pg_test]
+    fn test_unseeded_sample_with_constant_args_varies_per_row() {
+        let distinct = Spi::get_one::<i64>(
+            "SELECT count(DISTINCT pgprob.sample(pgprob.uniform(0.0001, 0.9999)))
+             FROM generate_series(1, 5)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(distinct, 5);
+    }
+
+    #[pg_test]
+    fn test_unseeded_samples_with_constant_args_differ() {
+        let same = Spi::get_one::<bool>(
+            "SELECT pgprob.samples(pgprob.normal(0, 1), 3)
+                  = pgprob.samples(pgprob.normal(0, 1), 3)",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!same);
+    }
+
+    #[pg_test]
+    fn test_seeded_sample_is_reproducible_per_row() {
+        let distinct = Spi::get_one::<i64>(
+            "SELECT count(DISTINCT pgprob.sample(pgprob.normal(0, 1), 42))
+             FROM generate_series(1, 5)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(distinct, 1);
     }
 
     #[pg_test]

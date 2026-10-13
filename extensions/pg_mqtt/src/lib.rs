@@ -126,6 +126,17 @@ extension_sql!(
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_topic_schemas_topic ON topic_schemas(topic);
+
+    -- Fan-out queue read by every worker (design/pg_mqtt/fanout.md)
+    CREATE UNLOGGED TABLE IF NOT EXISTS outbox (
+        id BIGSERIAL PRIMARY KEY,
+        xid xid8 NOT NULL DEFAULT pg_current_xact_id(),
+        topic TEXT NOT NULL,
+        payload BYTEA,
+        origin_worker INT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    );
+    CREATE INDEX IF NOT EXISTS idx_outbox_xid ON outbox(xid);
     "#,
     name = "bootstrap",
     bootstrap
@@ -259,7 +270,8 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
     );
 
     // Run server with SPI bridge polling loop
-    match crate::server::run_server(DEFAULT_HOST, port, worker_id) {
+    let worker_count = PG_MQTT_WORKER_COUNT.get();
+    match crate::server::run_server(DEFAULT_HOST, port, worker_id, worker_count) {
         // SIGTERM, or disabled by a reload
         Ok(()) => {
             pgrx::log!("pg_mqtt worker {}: shutting down", worker_id);
@@ -291,8 +303,26 @@ fn mqtt_status() -> String {
 /// If a schema is bound to the topic, the payload is validated against it.
 /// If the topic has a backing table (typed topic), the payload is decomposed
 /// into the table's columns instead of being stored in pgmqtt.messages.
+/// The message reaches connected subscribers when the transaction commits.
 #[pg_extern]
 fn mqtt_publish(topic: &str, payload: &str) -> i64 {
+    let id = store_published(topic, payload);
+    enqueue_for_subscribers(topic, payload);
+    id
+}
+
+/// Hand a message to the workers for delivery (design/pg_mqtt/fanout.md)
+fn enqueue_for_subscribers(topic: &str, payload: &str) {
+    if let Err(e) = Spi::run_with_args(
+        "INSERT INTO pgmqtt.outbox (topic, payload) VALUES ($1, convert_to($2, 'UTF8'))",
+        &[topic.into(), payload.into()],
+    ) {
+        pgrx::error!("Failed to publish message: {}", e);
+    }
+}
+
+/// Validate and store a SQL-published message; returns its id
+fn store_published(topic: &str, payload: &str) -> i64 {
     // Check if a schema is bound to this topic
     let binding: Result<Option<(String, Option<String>, String)>, _> = Spi::connect(|client| {
         let result = client.select(
@@ -378,7 +408,7 @@ fn mqtt_publish(topic: &str, payload: &str) -> i64 {
 fn insert_to_messages(topic: &str, payload: &str) -> i64 {
     let result = Spi::get_one_with_args::<i64>(
         "INSERT INTO pgmqtt.messages (topic, payload, qos, retain)
-         VALUES ($1, $2::bytea, 0, false)
+         VALUES ($1, convert_to($2, 'UTF8'), 0, false)
          RETURNING message_id",
         &[topic.into(), payload.into()],
     );
@@ -878,6 +908,48 @@ mod tests {
         .unwrap_or(0);
         // id + name + age = 3
         assert_eq!(col_count, 3);
+    }
+
+    // design/pg_mqtt/fanout.md: SQL publish reaches the workers via the outbox
+    #[pg_test]
+    fn test_publish_enqueues_outbox_row_from_sql() {
+        crate::mqtt_publish("fanout/untyped", r"raw \x41 payload");
+
+        let (payload, origin_is_null) = Spi::get_two::<Vec<u8>, bool>(
+            "SELECT payload, origin_worker IS NULL FROM pgmqtt.outbox
+             WHERE topic = 'fanout/untyped'",
+        )
+        .unwrap();
+        assert_eq!(payload.unwrap(), br"raw \x41 payload".to_vec());
+        assert_eq!(origin_is_null, Some(true));
+    }
+
+    #[pg_test]
+    fn test_publish_to_typed_topic_enqueues_outbox_row() {
+        let schema_def = r#"{"type":"object","properties":{"temp":{"type":"number"}}}"#;
+        crate::schema::mqtt_create_typed_topic(
+            "fanout/typed",
+            pgrx::JsonB(serde_json::from_str(schema_def).unwrap()),
+            None,
+            "STRICT",
+        );
+        crate::mqtt_publish("fanout/typed", r#"{"temp": 21.5}"#);
+
+        let n =
+            Spi::get_one::<i64>("SELECT count(*) FROM pgmqtt.outbox WHERE topic = 'fanout/typed'")
+                .unwrap();
+        assert_eq!(n, Some(1));
+    }
+
+    #[pg_test]
+    fn test_outbox_poll_sql_runs() {
+        // First poll: NULL cursor yields only the horizon
+        let horizon = Spi::get_one_with_args::<String>(
+            crate::server::fanout::POLL_SQL,
+            &[Option::<String>::None.into(), 0i32.into()],
+        )
+        .unwrap();
+        assert!(horizon.unwrap().parse::<u64>().is_ok());
     }
 }
 

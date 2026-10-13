@@ -2,7 +2,17 @@
 //!
 //! Parses the standard parameters (`LAYERS`, `BBOX`, `WIDTH`, `HEIGHT`,
 //! `CRS`, `TIME`, `STYLES`, `FORMAT`) and dispatches to the raster
-//! pipeline. Returns the PNG bytes as the response body, with
+//! pipeline. Three vendor parameters, named as in ncWMS / THREDDS, set
+//! the colour scale:
+//!
+//! * `COLORSCALERANGE=min,max`: the range the colormap spans (default:
+//!   the variable's catalog `valid_min`/`valid_max`, else the data's);
+//! * `BELOWMINCOLOR`, `ABOVEMAXCOLOR`: `extend` (default, the end colour)
+//!   or `transparent`. `COLORSCALERANGE=0.01,25&BELOWMINCOLOR=transparent`
+//!   on a water depth draws only the wet cells, so a base map shows
+//!   through the dry ground.
+//!
+//! Returns the PNG bytes as the response body, with
 //! `Cache-Control: max-age=N` so a reverse proxy (nginx, Varnish,
 //! CDN) can absorb steady-state read traffic.
 
@@ -10,7 +20,7 @@ use std::collections::HashMap;
 
 use pgrx::prelude::*;
 
-use crate::raster;
+use crate::raster::{self, OutOfRange};
 use crate::server::http::HttpResponse;
 
 use super::ogc_exception;
@@ -74,6 +84,7 @@ pub fn handle(params: &HashMap<String, String>, cache_seconds: u32) -> HttpRespo
         parsed.width,
         parsed.height,
         &parsed.style,
+        parsed.render_options(),
     ) {
         Ok(b) => b,
         Err(msg) => return ogc_exception(500, "InternalError", &msg),
@@ -102,6 +113,7 @@ fn catch_render(
     width: i32,
     height: i32,
     style: &str,
+    options: pgrx::JsonB,
 ) -> Result<Vec<u8>, String> {
     Ok(raster::xarray_to_png_impl(
         dataset,
@@ -111,7 +123,7 @@ fn catch_render(
         width,
         height,
         style,
-        None,
+        Some(options),
     ))
 }
 
@@ -128,6 +140,28 @@ struct GetMapParams {
     crs_srid: Option<i32>,
     time: Option<TimestampWithTimeZone>,
     style: String,
+    color_range: Option<(f64, f64)>,
+    below: OutOfRange,
+    above: OutOfRange,
+}
+
+impl GetMapParams {
+    /// The `pgx.xarray_to_png` options these parameters stand for.
+    fn render_options(&self) -> pgrx::JsonB {
+        let mode = |m: OutOfRange| match m {
+            OutOfRange::Extend => "extend",
+            OutOfRange::Transparent => "transparent",
+        };
+        let mut o = serde_json::json!({
+            "below_min": mode(self.below),
+            "above_max": mode(self.above),
+        });
+        if let Some((lo, hi)) = self.color_range {
+            o["vmin"] = lo.into();
+            o["vmax"] = hi.into();
+        }
+        pgrx::JsonB(o)
+    }
 }
 
 fn parse(params: &HashMap<String, String>) -> Result<GetMapParams, (&'static str, String)> {
@@ -203,6 +237,42 @@ fn parse(params: &HashMap<String, String>) -> Result<GetMapParams, (&'static str
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "viridis".to_string());
 
+    let color_range = params
+        .get("colorscalerange")
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let bad = || {
+                (
+                    "InvalidParameterValue",
+                    format!("COLORSCALERANGE='{s}' must be 'min,max' with min < max"),
+                )
+            };
+            let (lo, hi) = s.split_once(',').ok_or_else(bad)?;
+            let lo: f64 = lo.trim().parse().map_err(|_| bad())?;
+            let hi: f64 = hi.trim().parse().map_err(|_| bad())?;
+            if lo.is_finite() && hi.is_finite() && lo < hi {
+                Ok((lo, hi))
+            } else {
+                Err(bad())
+            }
+        })
+        .transpose()?;
+    let out_of_range = |key: &str, name: &str| {
+        params
+            .get(key)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                OutOfRange::parse(s).ok_or((
+                    "InvalidParameterValue",
+                    format!("{name}='{s}' must be 'extend' or 'transparent'"),
+                ))
+            })
+            .transpose()
+            .map(|m| m.unwrap_or(OutOfRange::Extend))
+    };
+    let below = out_of_range("belowmincolor", "BELOWMINCOLOR")?;
+    let above = out_of_range("abovemaxcolor", "ABOVEMAXCOLOR")?;
+
     Ok(GetMapParams {
         dataset: dataset.to_string(),
         variable: variable.to_string(),
@@ -215,6 +285,9 @@ fn parse(params: &HashMap<String, String>) -> Result<GetMapParams, (&'static str
         crs_srid,
         time,
         style,
+        color_range,
+        below,
+        above,
     })
 }
 
@@ -264,4 +337,68 @@ fn lookup_layer_srid(dataset: &str, variable: &str) -> Option<i32> {
         }
     });
     res.ok().flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raster::OutOfRange;
+
+    fn params(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut p: HashMap<String, String> = [
+            ("layers", "flood:WATER DEPTH"),
+            ("bbox", "0,0,10,10"),
+            ("width", "4"),
+            ("height", "4"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (k, v) in extra {
+            p.insert(k.to_string(), v.to_string());
+        }
+        p
+    }
+
+    #[test]
+    fn colour_scale_defaults_to_the_catalog_and_extends() {
+        let p = parse(&params(&[])).unwrap();
+        assert_eq!(p.color_range, None);
+        assert_eq!(p.below, OutOfRange::Extend);
+        assert_eq!(p.above, OutOfRange::Extend);
+    }
+
+    #[test]
+    fn ncwms_colour_scale_parameters() {
+        let p = parse(&params(&[
+            ("colorscalerange", "0.01,25"),
+            ("belowmincolor", "transparent"),
+            ("abovemaxcolor", "extend"),
+        ]))
+        .unwrap();
+        assert_eq!(p.color_range, Some((0.01, 25.0)));
+        assert_eq!(p.below, OutOfRange::Transparent);
+        assert_eq!(p.above, OutOfRange::Extend);
+        // case-insensitive values, as clients send them
+        let p = parse(&params(&[("abovemaxcolor", "TRANSPARENT")])).unwrap();
+        assert_eq!(p.above, OutOfRange::Transparent);
+    }
+
+    #[test]
+    fn bad_colour_scale_parameters_are_rejected() {
+        for (k, v) in [
+            ("colorscalerange", "25"),
+            ("colorscalerange", "a,b"),
+            ("colorscalerange", "25,0"),
+            ("colorscalerange", "1,1"),
+            ("belowmincolor", "0xFF0000"),
+        ] {
+            let err = parse(&params(&[(k, v)])).err();
+            assert_eq!(
+                err.map(|e| e.0),
+                Some("InvalidParameterValue"),
+                "{k}={v} should be rejected"
+            );
+        }
+    }
 }

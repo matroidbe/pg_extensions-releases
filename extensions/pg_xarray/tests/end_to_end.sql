@@ -1153,6 +1153,82 @@ SELECT node_id, geom_wkt, value::numeric(6,2) AS depth_m
  ORDER BY node_id;
 
 \echo
+\echo '=== 15b. SELAFIN transform: a local frame onto the ground (0.5.0) ==='
+
+-- The same fixture, registered as if its local frame were Lambert-93 turned
+-- by 90 degrees: X = -y + 1000000, Y = x + 6000000. Then registered again
+-- without a transform: the mesh moves back (nodes, cells and both extents).
+SELECT set_config('pgx_test.slf_uri', :'slf_uri', false);
+SELECT pgx.register_file('flood-geo', 'WATER DEPTH', :'slf_uri', 'selafin',
+                         srid := 2154, transform := ARRAY[0, -1, 1, 0, 1000000, 6000000]);
+
+DO $$
+DECLARE
+    n2        TEXT;
+    n2_srid   INT;
+    c_ok      BOOLEAN;
+    ext       TEXT;
+    mv_ext    TEXT;
+    n_in_bbox BIGINT;
+    err       TEXT;
+BEGIN
+    SELECT ST_AsText(mn.geom), ST_SRID(mn.geom) INTO n2, n2_srid
+      FROM pgx.mesh_nodes mn
+      JOIN pgx.mesh_versions mv ON mv.id = mn.mesh_version_id
+      JOIN pgx.meshes m ON m.id = mv.mesh_id JOIN pgx.datasets d ON d.id = m.dataset_id
+     WHERE d.name = 'flood-geo' AND mn.node_id = 2;
+    ASSERT n2 = 'POINT(1000000 6000001)', format('transformed node 2: %s', n2);
+    ASSERT n2_srid = 2154, format('transformed node srid: %s', n2_srid);
+
+    -- every cell centroid is the mean of its moved nodes
+    SELECT bool_and(ST_DWithin(mc.centroid, (SELECT ST_Centroid(ST_Collect(n.geom))
+                                               FROM pgx.mesh_nodes n
+                                              WHERE n.mesh_version_id = mc.mesh_version_id
+                                                AND n.node_id = ANY (mc.node_ids)), 1e-6))
+      INTO c_ok
+      FROM pgx.mesh_cells mc
+      JOIN pgx.mesh_versions mv ON mv.id = mc.mesh_version_id
+      JOIN pgx.meshes m ON m.id = mv.mesh_id JOIN pgx.datasets d ON d.id = m.dataset_id
+     WHERE d.name = 'flood-geo';
+    ASSERT c_ok, 'transformed cell centroids';
+
+    SELECT ST_AsText(ST_Envelope(m.extent)) INTO ext
+      FROM pgx.meshes m JOIN pgx.datasets d ON d.id = m.dataset_id WHERE d.name = 'flood-geo';
+    ASSERT ext = 'POLYGON((999999 6000000,999999 6000001,1000000 6000001,1000000 6000000,999999 6000000))',
+           format('transformed mesh extent: %s', ext);
+
+    -- a bbox query in the target CRS finds all four nodes
+    SELECT count(*) INTO n_in_bbox
+      FROM pgx.fetch_mesh('flood-geo', 'WATER DEPTH',
+                          at_time := '2024-01-01 00:00:00+00'::timestamptz,
+                          bbox_wkt := 'POLYGON((999990 5999990,1000010 5999990,1000010 6000010,999990 6000010,999990 5999990))');
+    ASSERT n_in_bbox = 4, format('fetch_mesh in the transformed bbox: %s', n_in_bbox);
+
+    -- registering again without a transform moves everything back
+    PERFORM pgx.register_file('flood-geo', 'WATER DEPTH', current_setting('pgx_test.slf_uri'), 'selafin');
+    SELECT ST_AsText(mn.geom) INTO n2
+      FROM pgx.mesh_nodes mn
+      JOIN pgx.mesh_versions mv ON mv.id = mn.mesh_version_id
+      JOIN pgx.meshes m ON m.id = mv.mesh_id JOIN pgx.datasets d ON d.id = m.dataset_id
+     WHERE d.name = 'flood-geo' AND mn.node_id = 2;
+    ASSERT n2 = 'POINT(1 0)', format('node 2 after re-registering: %s', n2);
+    SELECT ST_AsText(ST_Envelope(mv.extent)) INTO mv_ext
+      FROM pgx.mesh_versions mv JOIN pgx.meshes m ON m.id = mv.mesh_id
+      JOIN pgx.datasets d ON d.id = m.dataset_id WHERE d.name = 'flood-geo';
+    ASSERT mv_ext = 'POLYGON((0 0,0 1,1 1,1 0,0 0))', format('mesh_version extent after re-registering: %s', mv_ext);
+
+    -- transform is SELAFIN only, and needs six numbers
+    BEGIN
+        PERFORM pgx.register_file('flood-geo', 'WATER DEPTH', current_setting('pgx_test.slf_uri'), 'selafin',
+                                  transform := ARRAY[1, 0, 0]::float8[]);
+        RAISE EXCEPTION 'a 3-number transform was accepted';
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS err = MESSAGE_TEXT;
+        ASSERT err LIKE '%6 finite numbers%', format('short transform: %s', err);
+    END;
+END $$;
+
+\echo
 \echo '=== 16. Cloud-native register_file — GRIB2 over HTTP ==='
 
 -- Same GRIB2 fixture as §14, but registered via the localhost HTTP

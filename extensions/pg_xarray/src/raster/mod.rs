@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::glb::colormap;
 use crate::glb::mesh_assembly::{self, AssembledMesh, Keyframe};
+pub use rasterise::{ColorScale, OutOfRange};
 use viewport::{Viewport, WorldBbox};
 
 /// Top-level implementation called from the `#[pg_extern]` in `lib.rs`.
@@ -41,7 +42,7 @@ pub fn xarray_to_png_impl(
             height
         );
     }
-    let opts = parse_options(options.as_ref());
+    let opts = parse_options(options.as_ref()).unwrap_or_else(|e| pgrx::error!("{}", e));
 
     // Reuse the GLB mesh-assembly path. `at_time` narrows the time range
     // to a single timestep; if not supplied, we render the first available.
@@ -89,6 +90,11 @@ pub fn xarray_to_png_impl(
 
     let (vmin, vmax) = resolve_value_range(opts.vmin, opts.vmax, dataset, surface_var, &mesh);
     let lut = colormap::lookup(colormap_name);
+    let scale = ColorScale {
+        below: opts.below,
+        above: opts.above,
+        ..ColorScale::new(vmin, vmax)
+    };
 
     // Pick the viewport bbox: user-supplied takes precedence, else the
     // mesh's own envelope (so the user can call the function with NULL
@@ -116,8 +122,7 @@ pub fn xarray_to_png_impl(
         frame,
         &vp,
         lut,
-        vmin,
-        vmax,
+        &scale,
         opts.background,
     );
 
@@ -147,6 +152,8 @@ fn pick_frame(
 struct RasterOptions {
     vmin: Option<f64>,
     vmax: Option<f64>,
+    below: OutOfRange,
+    above: OutOfRange,
     max_cells: i32,
     background: [u8; 4],
 }
@@ -156,15 +163,24 @@ impl Default for RasterOptions {
         Self {
             vmin: None,
             vmax: None,
+            below: OutOfRange::Extend,
+            above: OutOfRange::Extend,
             max_cells: 1_000_000,
             background: [0, 0, 0, 0], // fully transparent
         }
     }
 }
 
-fn parse_options(j: Option<&pgrx::JsonB>) -> RasterOptions {
+fn parse_options(j: Option<&pgrx::JsonB>) -> Result<RasterOptions, String> {
     let mut out = RasterOptions::default();
-    let Some(j) = j else { return out };
+    let Some(j) = j else { return Ok(out) };
+    for (key, slot) in [("below_min", &mut out.below), ("above_max", &mut out.above)] {
+        if let Some(v) = j.0.get(key) {
+            *slot = v.as_str().and_then(OutOfRange::parse).ok_or_else(|| {
+                format!("pgx.xarray_to_png: {key} must be 'extend' or 'transparent', got {v}")
+            })?;
+        }
+    }
     if let Some(v) = j.0.get("vmin").and_then(|v| v.as_f64()) {
         out.vmin = Some(v);
     }
@@ -179,7 +195,7 @@ fn parse_options(j: Option<&pgrx::JsonB>) -> RasterOptions {
             out.background = rgba;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse `"#RRGGBB"` or `"#RRGGBBAA"` (with or without leading `#`)
@@ -248,8 +264,34 @@ fn compute_value_range(mesh: &AssembledMesh) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_color;
+    use super::{parse_color, parse_options, OutOfRange};
     use serde_json::json;
+
+    #[test]
+    fn options_below_min_and_above_max() {
+        let o = parse_options(None).unwrap();
+        assert_eq!((o.below, o.above), (OutOfRange::Extend, OutOfRange::Extend));
+        let j = pgrx::JsonB(json!({"vmin": 0.01, "vmax": 25, "below_min": "transparent"}));
+        let o = parse_options(Some(&j)).unwrap();
+        assert_eq!((o.vmin, o.vmax), (Some(0.01), Some(25.0)));
+        assert_eq!(
+            (o.below, o.above),
+            (OutOfRange::Transparent, OutOfRange::Extend)
+        );
+        let j = pgrx::JsonB(json!({"above_max": "transparent", "below_min": "extend"}));
+        let o = parse_options(Some(&j)).unwrap();
+        assert_eq!(
+            (o.below, o.above),
+            (OutOfRange::Extend, OutOfRange::Transparent)
+        );
+    }
+
+    #[test]
+    fn options_reject_an_unknown_out_of_range_mode() {
+        let j = pgrx::JsonB(json!({"below_min": "red"}));
+        let err = parse_options(Some(&j)).err().unwrap();
+        assert!(err.contains("below_min"), "{err}");
+    }
 
     #[test]
     fn parse_color_accepts_3_and_4_byte_hex() {

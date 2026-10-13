@@ -93,25 +93,27 @@ fn push_layer(xml: &mut String, layer: &LayerInfo) {
             "        <BoundingBox CRS=\"{crs}\" minx=\"{}\" miny=\"{}\" maxx=\"{}\" maxy=\"{}\"/>\n",
             b.min_x, b.min_y, b.max_x, b.max_y,
         ));
-        // EX_GeographicBoundingBox is required by the 1.3.0 spec; for
-        // non-geographic CRSs we emit the raw extent as a fallback so
-        // clients have something to centre on.
+    }
+    // EX_GeographicBoundingBox is in degrees (WGS 84). It is only written
+    // when the extent could be transformed, i.e. the layer has a real SRID:
+    // clients zoom to it, so projected metres here would be worse than none.
+    if let Some(g) = &layer.geo_bbox {
         xml.push_str("        <EX_GeographicBoundingBox>\n");
         xml.push_str(&format!(
             "          <westBoundLongitude>{}</westBoundLongitude>\n",
-            b.min_x
+            g.min_x
         ));
         xml.push_str(&format!(
             "          <eastBoundLongitude>{}</eastBoundLongitude>\n",
-            b.max_x
+            g.max_x
         ));
         xml.push_str(&format!(
             "          <southBoundLatitude>{}</southBoundLatitude>\n",
-            b.min_y
+            g.min_y
         ));
         xml.push_str(&format!(
             "          <northBoundLatitude>{}</northBoundLatitude>\n",
-            b.max_y
+            g.max_y
         ));
         xml.push_str("        </EX_GeographicBoundingBox>\n");
     }
@@ -139,6 +141,8 @@ pub(crate) struct LayerInfo {
     pub units: String,
     pub srid: i32,
     pub bbox: Option<LayerBbox>,
+    /// `bbox` in EPSG:4326 longitude/latitude, when the SRID is known.
+    pub geo_bbox: Option<LayerBbox>,
     /// Distinct chunk lower bounds in ISO 8601 — clients use these as
     /// the WMS-T time-dimension values.
     pub times: Vec<String>,
@@ -160,7 +164,19 @@ fn enumerate_layers() -> Result<Vec<LayerInfo>, String> {
                v.name                                  AS variable,
                COALESCE(v.units, '')                   AS units,
                COALESCE(v.srid, d.default_srid, 4326)  AS srid,
-               public.ST_AsText(m.extent)              AS extent_wkt
+               public.ST_AsText(m.extent)              AS extent_wkt,
+               -- the extent in degrees: densified first, so a rotated or
+               -- curved outline keeps its true bounds after transforming
+               CASE WHEN public.ST_SRID(m.extent) > 0
+                         AND EXISTS (SELECT 1 FROM public.spatial_ref_sys s
+                                     WHERE s.srid = public.ST_SRID(m.extent))
+                    THEN public.ST_AsText(public.ST_Envelope(public.ST_Transform(
+                             public.ST_Segmentize(m.extent,
+                                 greatest(public.ST_XMax(m.extent) - public.ST_XMin(m.extent),
+                                          public.ST_YMax(m.extent) - public.ST_YMin(m.extent),
+                                          1e-9) / 32),
+                             4326)))
+               END                                     AS geo_extent_wkt
         FROM   pgx.chunks       c
         JOIN   pgx.variables    v  ON v.id = c.variable_id
         JOIN   pgx.datasets     d  ON d.id = v.dataset_id
@@ -191,19 +207,23 @@ fn enumerate_layers() -> Result<Vec<LayerInfo>, String> {
             let units: String = row.get::<String>(3)?.unwrap_or_default();
             let srid: i32 = row.get::<i32>(4)?.unwrap_or(4326);
             let extent_wkt: Option<String> = row.get::<String>(5)?;
-            let bbox =
-                extent_wkt.and_then(|wkt| crate::raster::viewport::WorldBbox::from_wkt(&wkt));
+            let geo_wkt: Option<String> = row.get::<String>(6)?;
+            let to_bbox = |wkt: Option<String>| {
+                wkt.and_then(|w| crate::raster::viewport::WorldBbox::from_wkt(&w))
+                    .map(|b| LayerBbox {
+                        min_x: b.min_x,
+                        min_y: b.min_y,
+                        max_x: b.max_x,
+                        max_y: b.max_y,
+                    })
+            };
             out.push(LayerInfo {
                 dataset,
                 variable,
                 units,
                 srid,
-                bbox: bbox.map(|b| LayerBbox {
-                    min_x: b.min_x,
-                    min_y: b.min_y,
-                    max_x: b.max_x,
-                    max_y: b.max_y,
-                }),
+                bbox: to_bbox(extent_wkt),
+                geo_bbox: to_bbox(geo_wkt),
                 times: Vec::new(),
             });
         }
@@ -232,4 +252,51 @@ fn enumerate_layers() -> Result<Vec<LayerInfo>, String> {
     }
 
     Ok(layers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer(geo: Option<LayerBbox>) -> LayerInfo {
+        LayerInfo {
+            dataset: "flood".into(),
+            variable: "WATER DEPTH".into(),
+            units: "M".into(),
+            srid: 2154,
+            bbox: Some(LayerBbox {
+                min_x: 997099.7,
+                min_y: 6262285.8,
+                max_x: 1006294.8,
+                max_y: 6279500.4,
+            }),
+            geo_bbox: geo,
+            times: vec![],
+        }
+    }
+
+    #[test]
+    fn geographic_bbox_is_in_degrees() {
+        let mut xml = String::new();
+        push_layer(
+            &mut xml,
+            &layer(Some(LayerBbox {
+                min_x: 6.68,
+                min_y: 43.41,
+                max_x: 6.80,
+                max_y: 43.57,
+            })),
+        );
+        assert!(xml.contains("<westBoundLongitude>6.68</westBoundLongitude>"));
+        assert!(xml.contains("<northBoundLatitude>43.57</northBoundLatitude>"));
+        // the native extent stays in the layer's own CRS
+        assert!(xml.contains("<BoundingBox CRS=\"EPSG:2154\" minx=\"997099.7\""));
+    }
+
+    #[test]
+    fn no_geographic_bbox_without_a_known_srid() {
+        let mut xml = String::new();
+        push_layer(&mut xml, &layer(None));
+        assert!(!xml.contains("EX_GeographicBoundingBox"), "{xml}");
+    }
 }

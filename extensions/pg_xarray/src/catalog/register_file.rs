@@ -23,10 +23,23 @@ pub fn register_file_impl(
     z_axis: Option<&str>,
     srid: Option<i32>,
     auto_create: bool,
+    transform: Option<&[f64]>,
 ) -> i64 {
     if dataset.is_empty() || variable.is_empty() || uri.is_empty() {
         pgrx::error!("register_file: dataset, variable, and uri are required");
     }
+    let transform: Option<crate::reader::selafin::Transform> = match transform {
+        None => None,
+        Some(_) if !matches!(format, "selafin" | "slf") => {
+            pgrx::error!("register_file: transform is only supported for format 'selafin'")
+        }
+        Some(t) => match <[f64; 6]>::try_from(t) {
+            Ok(t) if t.iter().all(|v| v.is_finite()) => Some(t),
+            _ => pgrx::error!(
+                "register_file: transform must be 6 finite numbers [a, b, d, e, xoff, yoff], got {t:?}"
+            ),
+        },
+    };
 
     if auto_create {
         // Idempotent: register_dataset_impl is the only one we need
@@ -52,7 +65,14 @@ pub fn register_file_impl(
     // populates mesh_nodes + mesh_cells — handle it before falling
     // through to the variable-only formats below.
     if matches!(format, "selafin" | "slf") {
-        return register_selafin(dataset, variable, uri, srid, auto_create);
+        return register_selafin(
+            dataset,
+            variable,
+            uri,
+            srid,
+            auto_create,
+            transform.as_ref(),
+        );
     }
 
     let walks = match format {
@@ -279,8 +299,9 @@ fn register_selafin(
     uri: &str,
     srid: Option<i32>,
     auto_create: bool,
+    transform: Option<&crate::reader::selafin::Transform>,
 ) -> i64 {
-    let walk = match crate::reader::selafin::walk_selafin(uri, variable) {
+    let walk = match crate::reader::selafin::walk_selafin(uri, variable, transform) {
         Ok(w) => w,
         Err(e) => pgrx::error!("register_file: {}", e),
     };
@@ -307,26 +328,10 @@ fn register_selafin(
     let mesh_version_id =
         find_or_create_mesh_version(dataset, walk.time_from, walk.time_to, &walk.mesh_extent_wkt);
 
-    // 3) Upsert nodes (point geometry) and cells (centroid + node IDs).
-    for node in &walk.nodes {
-        let geom_wkt = format!("POINT({} {})", node.x, node.y);
-        crate::catalog::crud::register_mesh_node_impl(
-            mesh_version_id,
-            node.node_id,
-            &geom_wkt,
-            None,
-        );
-    }
-    for cell in &walk.cells {
-        let centroid_wkt = format!("POINT({} {})", cell.centroid_x, cell.centroid_y);
-        crate::catalog::crud::register_mesh_cell_impl(
-            mesh_version_id,
-            cell.cell_id,
-            cell.node_ids.clone(),
-            &centroid_wkt,
-            None,
-        );
-    }
+    // 3) Upsert nodes (point geometry) and cells (centroid + node IDs), each in
+    //    one set-based statement: a TELEMAC mesh has tens of thousands of each,
+    //    and every variable of the file registers them again.
+    upsert_selafin_mesh(mesh_version_id, &walk.nodes, &walk.cells);
 
     // 4) Upsert the variable + register one chunk per timestep.
     if auto_create {
@@ -375,6 +380,71 @@ fn register_selafin(
     count
 }
 
+/// Same rows and conflict handling as `register_mesh_node` / `register_mesh_cell`
+/// called per element (geometry in the version's effective SRID, attrs kept), but
+/// as one INSERT ... SELECT FROM unnest(...) each.
+fn upsert_selafin_mesh(
+    mesh_version_id: i64,
+    nodes: &[crate::reader::selafin::SelafinNode],
+    cells: &[crate::reader::selafin::SelafinCell],
+) {
+    const EFFECTIVE_SRID: &str = "SELECT COALESCE(m.crs, d.default_srid, 4326) AS srid \
+         FROM pgx.mesh_versions mv \
+         JOIN pgx.meshes   m ON m.id = mv.mesh_id \
+         JOIN pgx.datasets d ON d.id = m.dataset_id \
+         WHERE mv.id = $1";
+    let ids: Vec<i64> = nodes.iter().map(|n| n.node_id).collect();
+    let xs: Vec<f64> = nodes.iter().map(|n| n.x).collect();
+    let ys: Vec<f64> = nodes.iter().map(|n| n.y).collect();
+    Spi::run_with_args(
+        &format!(
+            "WITH eff AS ({EFFECTIVE_SRID}) \
+             INSERT INTO pgx.mesh_nodes (mesh_version_id, node_id, geom) \
+             SELECT $1, u.id, public.ST_SetSRID(public.ST_MakePoint(u.x, u.y), (SELECT srid FROM eff)) \
+             FROM unnest($2::bigint[], $3::float8[], $4::float8[]) AS u(id, x, y) \
+             ON CONFLICT (mesh_version_id, node_id) DO UPDATE SET geom = EXCLUDED.geom"
+        ),
+        &[mesh_version_id.into(), ids.into(), xs.into(), ys.into()],
+    )
+    .unwrap_or_else(|e| pgrx::error!("register_file (selafin): mesh nodes: {}", e));
+
+    // node_ids: every SELAFIN cell has the same number of nodes (NDP), so they
+    // travel as one flat array sliced per cell
+    let ndp = cells.first().map_or(0, |c| c.node_ids.len());
+    if cells.iter().any(|c| c.node_ids.len() != ndp || ndp == 0) {
+        pgrx::error!(
+            "register_file (selafin): cells must all have the same, non-zero number of nodes"
+        );
+    }
+    let ids: Vec<i64> = cells.iter().map(|c| c.cell_id).collect();
+    let cx: Vec<f64> = cells.iter().map(|c| c.centroid_x).collect();
+    let cy: Vec<f64> = cells.iter().map(|c| c.centroid_y).collect();
+    let flat: Vec<i64> = cells
+        .iter()
+        .flat_map(|c| c.node_ids.iter().copied())
+        .collect();
+    Spi::run_with_args(
+        &format!(
+            "WITH eff AS ({EFFECTIVE_SRID}) \
+             INSERT INTO pgx.mesh_cells (mesh_version_id, cell_id, node_ids, centroid) \
+             SELECT $1, u.id, ($5::bigint[])[(u.i - 1) * $6 + 1 : u.i * $6], \
+                    public.ST_SetSRID(public.ST_MakePoint(u.x, u.y), (SELECT srid FROM eff)) \
+             FROM unnest($2::bigint[], $3::float8[], $4::float8[]) WITH ORDINALITY AS u(id, x, y, i) \
+             ON CONFLICT (mesh_version_id, cell_id) DO UPDATE \
+             SET node_ids = EXCLUDED.node_ids, centroid = EXCLUDED.centroid"
+        ),
+        &[
+            mesh_version_id.into(),
+            ids.into(),
+            cx.into(),
+            cy.into(),
+            flat.into(),
+            (ndp as i64).into(),
+        ],
+    )
+    .unwrap_or_else(|e| pgrx::error!("register_file (selafin): mesh cells: {}", e));
+}
+
 /// Look up the first mesh_version for the dataset's mesh; create one
 /// if absent. Returns the mesh_version_id.
 fn find_or_create_mesh_version(
@@ -393,6 +463,17 @@ fn find_or_create_mesh_version(
         .ok()
         .flatten();
     if let Some(id) = existing {
+        // Registering again (e.g. with another transform) may move the mesh
+        Spi::run_with_args(
+            "UPDATE pgx.mesh_versions mv
+                SET extent = public.ST_GeomFromText($2, COALESCE(m.crs, d.default_srid, 4326))
+               FROM pgx.meshes m JOIN pgx.datasets d ON d.id = m.dataset_id
+              WHERE mv.id = $1 AND m.id = mv.mesh_id",
+            &[id.into(), extent_wkt.into()],
+        )
+        .unwrap_or_else(|e| {
+            pgrx::error!("register_file (selafin): update mesh_version extent: {}", e)
+        });
         return id;
     }
     // No version yet — create one covering the file's time span. For
@@ -476,7 +557,7 @@ pub fn register_zarr_store_impl(
             continue;
         }
         let chunks = register_file_impl(
-            dataset, &sv.name, uri, "zarr", lat_axis, lon_axis, time_axis, z_axis, srid, true,
+            dataset, &sv.name, uri, "zarr", lat_axis, lon_axis, time_axis, z_axis, srid, true, None,
         );
         n_vars += 1;
         total_chunks += chunks;
