@@ -423,7 +423,10 @@ fn insert_to_messages(topic: &str, payload: &str) -> i64 {
 /// Insert a JSON payload into a typed topic's backing table.
 ///
 /// Uses json_populate_record to decompose JSON into table columns automatically.
-/// Excludes the `id` column so the BIGSERIAL default generates it.
+/// Excludes the `id` column so the BIGSERIAL default generates it. A backing
+/// table need not have an `id` column at all (a timeseries table keyed by time
+/// has none): then nothing is RETURNed and the result is 0, exactly as the
+/// broker path does (storage/source_insert.rs).
 fn insert_to_source_table(source_table: &str, json_value: &serde_json::Value) -> i64 {
     if !json_value.is_object() {
         pgrx::error!("Payload must be a JSON object for typed topics");
@@ -431,14 +434,14 @@ fn insert_to_source_table(source_table: &str, json_value: &serde_json::Value) ->
 
     let json_text = serde_json::to_string(json_value).unwrap_or_default();
 
-    // Get non-id column names so the BIGSERIAL id gets its default value
-    let columns: Vec<String> = Spi::connect(|client| {
+    // All column names, in order; `id` is left out of the INSERT so its
+    // default applies, and only RETURNed when it exists.
+    let all_columns: Vec<String> = Spi::connect(|client| {
         let mut cols = Vec::new();
         let table = client.select(
             &format!(
                 "SELECT column_name::text FROM information_schema.columns
                  WHERE table_schema || '.' || table_name = '{}'
-                   AND column_name != 'id'
                  ORDER BY ordinal_position",
                 source_table.replace('\'', "''")
             ),
@@ -454,6 +457,9 @@ fn insert_to_source_table(source_table: &str, json_value: &serde_json::Value) ->
     })
     .unwrap_or_default();
 
+    let has_id = all_columns.iter().any(|c| c == "id");
+    let columns: Vec<&String> = all_columns.iter().filter(|c| *c != "id").collect();
+
     if columns.is_empty() {
         pgrx::error!(
             "Could not find columns for typed topic table '{}'",
@@ -461,12 +467,24 @@ fn insert_to_source_table(source_table: &str, json_value: &serde_json::Value) ->
         );
     }
 
-    let col_list = columns.join(", ");
-    let query = format!(
-        "INSERT INTO {} ({}) SELECT {} FROM json_populate_record(null::{}, $1::json) RETURNING id",
+    let col_list = columns
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert = format!(
+        "INSERT INTO {} ({}) SELECT {} FROM json_populate_record(null::{}, $1::json)",
         source_table, col_list, col_list, source_table
     );
 
+    if !has_id {
+        return match Spi::run_with_args(&insert, &[json_text.into()]) {
+            Ok(()) => 0,
+            Err(e) => pgrx::error!("Failed to insert into typed topic table: {}", e),
+        };
+    }
+
+    let query = format!("{insert} RETURNING id");
     let result = Spi::get_one_with_args::<i64>(&query, &[json_text.into()]);
 
     match result {
@@ -861,6 +879,39 @@ mod tests {
         // Verify in backing table
         let sensor =
             Spi::get_one::<String>("SELECT sensor FROM pgmqtt.readings_test WHERE id = 1").unwrap();
+        assert_eq!(sensor, Some("DHT22".to_string()));
+    }
+
+    // A typed topic over a table with no `id` column (a timeseries hypertable,
+    // say): the SQL publish path must not depend on `RETURNING id`, matching
+    // the broker path (storage/source_insert.rs), which returns 0 there.
+    #[pg_test]
+    fn test_publish_to_typed_topic_from_table_without_id() {
+        bootstrap_schema_tables();
+
+        Spi::run(
+            "CREATE TABLE pgmqtt.no_id_readings_test (
+                ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+                sensor TEXT NOT NULL,
+                value NUMERIC NOT NULL
+            )",
+        )
+        .unwrap();
+
+        crate::schema::mqtt_create_typed_topic_from_table(
+            "readings/no-id",
+            "pgmqtt.no_id_readings_test",
+            "STRICT",
+        );
+
+        let id = crate::mqtt_publish(
+            "readings/no-id",
+            r#"{"ts": "2026-10-14T00:00:00Z", "sensor": "DHT22", "value": 23.1}"#,
+        );
+        assert_eq!(id, 0, "no id column, so no id to return");
+
+        let sensor =
+            Spi::get_one::<String>("SELECT sensor FROM pgmqtt.no_id_readings_test").unwrap();
         assert_eq!(sensor, Some("DHT22".to_string()));
     }
 

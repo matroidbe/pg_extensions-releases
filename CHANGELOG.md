@@ -4,6 +4,18 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.7.1 — 2026-10-14
+
+**pg_mqtt publishes from SQL to a typed topic over a table with no `id` (0.4.1).**
+`mqtt_publish()` to a topic made by `mqtt_create_typed_topic_from_table()`
+failed with `column "id" does not exist` when the table has no `id` column — a
+timeseries table keyed by time, for instance — because the insert always ended
+in `RETURNING id`. It now returns the `id` only when the column exists and 0
+otherwise, as an MQTT client's publish to the same topic already did.
+
+Extension versions: pg_mqtt 0.4.1. Every other extension is unchanged from
+v0.7.0.
+
 ## v0.7.0 — 2026-10-13
 
 **pg_mqtt delivers every publish to every subscriber (0.4.0).** Two paths

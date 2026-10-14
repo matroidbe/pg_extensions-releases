@@ -1,0 +1,3 @@
+-- pg_mqtt 0.4.0 -> 0.4.1
+-- No SQL changes: mqtt_publish() to a typed topic whose backing table has no
+-- `id` column no longer fails on `RETURNING id`.
