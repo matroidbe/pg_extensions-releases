@@ -242,7 +242,9 @@ pub fn claim_next_job() -> Result<Option<TrainingJob>, PgMlError> {
 
     // Use Spi::get_one which returns Ok(None) when no rows match
     // This can happen when there are no queued jobs, which is normal
-    let job_id: Option<i64> = match Spi::get_one(&claim_sql) {
+    // pg_bgworker::spi: an idle poll claims nothing, so it must take no XID
+    // (Spi::get_one would — an empty commit every poll).
+    let job_id: Option<i64> = match pg_bgworker::spi::get_one(&claim_sql) {
         Ok(id) => id,
         Err(pgrx::spi::SpiError::InvalidPosition) => {
             // No rows returned - no jobs to claim

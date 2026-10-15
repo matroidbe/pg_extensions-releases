@@ -1002,6 +1002,43 @@ mod tests {
         .unwrap();
         assert!(horizon.unwrap().parse::<u64>().is_ok());
     }
+
+    /// Every worker polls the outbox through the SPI bridge 20 times a
+    /// second. A poll must not take an XID: with one, each was an empty
+    /// commit — ~80 WAL records a second from an idle server.
+    #[pg_test]
+    fn test_outbox_poll_through_the_bridge_takes_no_xid() {
+        use pg_spi::{execute_query_in_transaction, ColumnType, SpiParam};
+        assert!(!pg_bgworker::spi::xid_assigned());
+
+        let polled = execute_query_in_transaction(
+            crate::server::fanout::POLL_SQL,
+            &[SpiParam::Text(None), SpiParam::Int4(Some(0))],
+            &[ColumnType::Text, ColumnType::Text, ColumnType::Bytea],
+        )
+        .unwrap();
+        assert_eq!(polled.rows.len(), 1, "the horizon row");
+        assert!(
+            !pg_bgworker::spi::xid_assigned(),
+            "an idle poll took an XID"
+        );
+
+        // A write through the same path still writes
+        execute_query_in_transaction(
+            crate::server::fanout::ENQUEUE_SQL,
+            &[
+                SpiParam::Text(Some("idle/xid".into())),
+                SpiParam::Bytea(Some(b"x".to_vec())),
+                SpiParam::Int4(Some(0)),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(pg_bgworker::spi::xid_assigned());
+        let n = Spi::get_one::<i64>("SELECT count(*) FROM pgmqtt.outbox WHERE topic = 'idle/xid'")
+            .unwrap();
+        assert_eq!(n, Some(1));
+    }
 }
 
 #[cfg(test)]

@@ -124,7 +124,6 @@ fn execute_query(
     params: &[SpiParam],
     column_types: &[ColumnType],
 ) -> Result<SpiResult, SpiError> {
-    // Use connect_mut for all queries since we might need to run mutating queries
     Spi::connect_mut(|client| {
         // Bind parameters as typed SQL arguments. The query text is passed to
         // Postgres verbatim; values never enter the SQL string.
@@ -145,8 +144,12 @@ fn execute_query(
         // That last case is unknowable from the text without resolving the
         // function, so there is no heuristic to fix. Running an ordinary read
         // with read_only=false is harmless, so pay that and be correct.
-        let table = client
-            .update(query, None, &args)
+        //
+        // But not through `client.update`, which calls GetCurrentTransactionId()
+        // first: every read — an idle outbox poll, a Kafka long-poll — then
+        // committed with an XID, a WAL commit record and an XID burnt each
+        // time. pg_bgworker::spi takes an XID only when a row is written.
+        let table = pg_bgworker::spi::execute(client, query, None, &args)
             .map_err(|e| SpiError::QueryFailed(e.to_string()))?;
 
         // Capture the affected-row count BEFORE consuming the table by

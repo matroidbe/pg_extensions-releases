@@ -24,7 +24,9 @@ fn assign_unassigned_pipelines() {
     let worker_count = PG_STREAMING_WORKER_COUNT.get();
 
     // Get unassigned running pipelines
-    let unassigned = Spi::get_one::<pgrx::JsonB>(
+    // Every second, idle or not: pg_bgworker::spi takes an XID only when a
+    // row is written, where Spi::get_one/run always would.
+    let unassigned = pg_bgworker::spi::get_one::<pgrx::JsonB>(
         "SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb) \
          FROM pgstreams.pipelines WHERE state = 'running' AND worker_id IS NULL",
     );
@@ -42,7 +44,7 @@ fn assign_unassigned_pipelines() {
     }
 
     // Get current assignment counts per executor
-    let counts = Spi::get_one::<pgrx::JsonB>(
+    let counts = pg_bgworker::spi::get_one::<pgrx::JsonB>(
         "SELECT COALESCE(jsonb_object_agg(worker_id::text, cnt), '{}'::jsonb) \
          FROM (SELECT worker_id, count(*) AS cnt FROM pgstreams.pipelines \
          WHERE state = 'running' AND worker_id IS NOT NULL \
@@ -65,7 +67,7 @@ fn assign_unassigned_pipelines() {
         load.sort_by_key(|&(wid, cnt)| (cnt, wid));
         let (target_worker, current_count) = load[0];
 
-        let result = Spi::run_with_args(
+        let result = pg_bgworker::spi::run_with_args(
             "UPDATE pgstreams.pipelines SET worker_id = $1, updated_at = now() \
              WHERE id = $2 AND state = 'running' AND worker_id IS NULL",
             &[target_worker.into(), (pipeline_id as i32).into()],
@@ -92,7 +94,7 @@ fn reclaim_stale_assignments() {
 
     // Reclaim pipelines assigned to executor IDs that no longer exist
     // (e.g., worker_count was reduced)
-    let result = Spi::get_one_with_args::<i64>(
+    let result = pg_bgworker::spi::get_one_with_args::<i64>(
         "WITH reclaimed AS (\
            UPDATE pgstreams.pipelines SET worker_id = NULL, updated_at = now() \
            WHERE state = 'running' AND worker_id IS NOT NULL AND worker_id >= $1 \

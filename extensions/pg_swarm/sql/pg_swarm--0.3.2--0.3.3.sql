@@ -1,0 +1,3 @@
+-- pg_swarm 0.3.2 -> 0.3.3
+-- No SQL changes: An idle scheduler's task claim no longer commits an empty
+-- transaction every poll.

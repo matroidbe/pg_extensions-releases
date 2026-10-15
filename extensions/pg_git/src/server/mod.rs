@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+/// Longest idle sleep of the main loop; requests wake it at once
+const IDLE_WAIT: Duration = Duration::from_millis(100);
+
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn request_shutdown() {
@@ -32,7 +35,7 @@ pub fn is_shutdown_requested() -> bool {
 pub fn run_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 
-    let (bridge, mut receiver): (SpiBridge, SpiReceiver) = SpiBridge::new(256);
+    let (bridge, mut receiver): (SpiBridge, SpiReceiver) = SpiBridge::waking_worker(256);
     let bridge: Arc<SpiBridge> = Arc::new(bridge);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -93,13 +96,16 @@ pub fn run_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error
             }
         }
 
+        // Each bridge request sets our latch (SpiBridge::waking_worker), so
+        // this sleeps until there is work; IDLE_WAIT only paces the loop's
+        // housekeeping. It was a 1 ms poll: ~1,000 wakeups a second, idle.
         // Idle wait. wait_latch (not thread::sleep) so the latch wakes us
         // promptly when a procsignal (e.g. a barrier) arrives; the interrupt
         // itself is processed by check_for_interrupts!() at the top of the
         // loop. wait_latch also gives this backend a real wait_event in
         // pg_stat_activity (PG_WAIT_EXTENSION). Returns false on SIGTERM or
         // postmaster death — break in either case.
-        if processed == 0 && !BackgroundWorker::wait_latch(Some(Duration::from_millis(1))) {
+        if processed == 0 && !BackgroundWorker::wait_latch(Some(IDLE_WAIT)) {
             break;
         }
     }

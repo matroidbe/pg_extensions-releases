@@ -145,7 +145,7 @@ impl KafkaInput {
               LIMIT $4\
             ) sub";
 
-        let result = Spi::get_one_with_args::<pgrx::JsonB>(
+        let result = pg_bgworker::spi::get_one_with_args::<pgrx::JsonB>(
             query,
             &[
                 topic_id.into(),
@@ -189,7 +189,7 @@ impl KafkaInput {
             offset_column,
         );
 
-        let result = Spi::get_one_with_args::<pgrx::JsonB>(
+        let result = pg_bgworker::spi::get_one_with_args::<pgrx::JsonB>(
             &query,
             &[self.last_offset.into(), (batch_size as i64).into()],
         );

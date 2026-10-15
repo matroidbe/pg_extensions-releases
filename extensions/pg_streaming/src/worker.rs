@@ -15,7 +15,10 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::config::{PG_STREAMING_DATABASE, PG_STREAMING_ENABLED, PG_STREAMING_POLL_INTERVAL_MS};
+use crate::config::{
+    PG_STREAMING_DATABASE, PG_STREAMING_ENABLED, PG_STREAMING_IDLE_POLL_INTERVAL_MS,
+    PG_STREAMING_POLL_INTERVAL_MS,
+};
 use crate::engine::coordinator::run_coordinator_tick;
 use crate::engine::executor::run_executor_tick;
 
@@ -111,24 +114,38 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
     let mut compiled = HashMap::new();
 
     // Executor loop: discover pipelines, process batches, commit offsets.
-    // The poll interval is read every round, so a reload applies.
-    while BackgroundWorker::wait_latch(Some(Duration::from_millis(
-        PG_STREAMING_POLL_INTERVAL_MS.get() as u64,
-    ))) {
+    // Polls every poll_interval_ms while records flow, backing off to
+    // idle_poll_interval_ms while none do. Both are read every round, so a
+    // reload applies.
+    let mut wait = Duration::ZERO;
+    while BackgroundWorker::wait_latch(Some(wait)) {
         if BackgroundWorker::sigterm_received() {
             break;
         }
-        if !loop_round(slot) {
-            continue;
-        }
-
-        BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
-            run_executor_tick(worker_id, &mut compiled);
-        }));
+        let busy = loop_round(slot)
+            && BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
+                run_executor_tick(worker_id, &mut compiled)
+            }));
+        wait = next_poll_wait(
+            wait,
+            busy,
+            Duration::from_millis(PG_STREAMING_POLL_INTERVAL_MS.get() as u64),
+            Duration::from_millis(PG_STREAMING_IDLE_POLL_INTERVAL_MS.get() as u64),
+        );
     }
 
     log!("pg_streaming executor {}: shutting down", worker_id);
     SUPERVISOR.exit_clean(slot);
+}
+
+/// The executor's next wait: `poll` after a round that took in records,
+/// otherwise double the last wait, between `poll` and `idle`.
+fn next_poll_wait(last: Duration, busy: bool, poll: Duration, idle: Duration) -> Duration {
+    if busy {
+        poll
+    } else {
+        (last * 2).clamp(poll, idle.max(poll))
+    }
 }
 
 /// Timer background worker main function
@@ -148,4 +165,35 @@ pub extern "C-unwind" fn pg_streaming_timer_main(_arg: pg_sys::Datum) {
 
     log!("pg_streaming timer: shutting down");
     SUPERVISOR.exit_clean(TIMER_SLOT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_poll_wait;
+    use std::time::Duration;
+
+    const POLL: Duration = Duration::from_millis(10);
+    const IDLE: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn idle_rounds_back_off_to_the_idle_interval() {
+        let mut wait = Duration::ZERO;
+        let mut seen = vec![];
+        for _ in 0..8 {
+            wait = next_poll_wait(wait, false, POLL, IDLE);
+            seen.push(wait.as_millis());
+        }
+        assert_eq!(seen, [10, 20, 40, 80, 160, 250, 250, 250]);
+    }
+
+    #[test]
+    fn a_busy_round_polls_at_the_poll_interval_again() {
+        assert_eq!(next_poll_wait(IDLE, true, POLL, IDLE), POLL);
+    }
+
+    #[test]
+    fn an_idle_interval_below_the_poll_interval_never_polls_faster() {
+        let wait = next_poll_wait(POLL, false, POLL, Duration::from_millis(1));
+        assert_eq!(wait, POLL);
+    }
 }

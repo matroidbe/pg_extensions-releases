@@ -1,0 +1,3 @@
+-- pg_ortools 0.3.3 -> 0.3.4
+-- No SQL changes: An idle solver worker's job claim no longer commits an empty
+-- transaction every poll.

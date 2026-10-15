@@ -434,8 +434,8 @@ COMMENT ON FUNCTION pgstreams.call_guarded(TEXT, JSONB, TEXT) IS
 
 use crate::config::{
     PG_STREAMING_BATCH_SIZE, PG_STREAMING_CHECKPOINT_INTERVAL_MS, PG_STREAMING_DATABASE,
-    PG_STREAMING_ENABLED, PG_STREAMING_METRICS_ENABLED, PG_STREAMING_POLL_INTERVAL_MS,
-    PG_STREAMING_WORKER_COUNT,
+    PG_STREAMING_ENABLED, PG_STREAMING_IDLE_POLL_INTERVAL_MS, PG_STREAMING_METRICS_ENABLED,
+    PG_STREAMING_POLL_INTERVAL_MS, PG_STREAMING_WORKER_COUNT,
 };
 use pgrx::bgworkers::*;
 use std::time::Duration;
@@ -495,6 +495,17 @@ pub extern "C-unwind" fn _PG_init() {
         c"Poll interval in milliseconds",
         c"How often executor workers poll for new input records",
         &PG_STREAMING_POLL_INTERVAL_MS,
+        1,
+        60000,
+        pgrx::GucContext::Sighup,
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_streaming.idle_poll_interval_ms",
+        c"Longest executor poll interval while idle",
+        c"While no assigned pipeline takes in records, an executor's wait doubles from poll_interval_ms up to this",
+        &PG_STREAMING_IDLE_POLL_INTERVAL_MS,
         1,
         60000,
         pgrx::GucContext::Sighup,

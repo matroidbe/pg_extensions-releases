@@ -169,7 +169,7 @@ impl InputConnector for TableInput {
         }
         self.last_poll_ms = now;
 
-        let result = Spi::get_one_with_args::<pgrx::JsonB>(
+        let result = pg_bgworker::spi::get_one_with_args::<pgrx::JsonB>(
             &self.poll_sql,
             &[self.last_offset.into(), (batch_size as i64).into()],
         );

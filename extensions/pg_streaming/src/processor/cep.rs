@@ -529,7 +529,8 @@ impl Processor for CepProcessor {
     fn process(&self, batch: RecordBatch) -> Result<RecordBatch, String> {
         if batch.is_empty() {
             // Still clean up expired patterns
-            Spi::run(&self.cleanup_sql).map_err(|e| format!("CEP cleanup failed: {}", e))?;
+            pg_bgworker::spi::run(&self.cleanup_sql)
+                .map_err(|e| format!("CEP cleanup failed: {}", e))?;
             return Ok(vec![]);
         }
 

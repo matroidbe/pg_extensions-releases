@@ -94,7 +94,9 @@ pub fn claim_next_job() -> Result<Option<SolveJob>, PgOrtoolsError> {
         pid
     );
 
-    let job_id: Option<i64> = match Spi::get_one(&claim_sql) {
+    // pg_bgworker::spi: an idle poll claims nothing, so it must take no XID
+    // (Spi::get_one would — an empty commit every poll).
+    let job_id: Option<i64> = match pg_bgworker::spi::get_one(&claim_sql) {
         Ok(id) => id,
         Err(pgrx::spi::SpiError::InvalidPosition) => return Ok(None),
         Err(e) => {

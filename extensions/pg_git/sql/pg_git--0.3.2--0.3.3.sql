@@ -1,0 +1,3 @@
+-- pg_git 0.3.2 -> 0.3.3
+-- No SQL changes: Reads through the SPI bridge no longer take a transaction ID; the
+-- main loop sleeps until a request arrives instead of waking every millisecond.

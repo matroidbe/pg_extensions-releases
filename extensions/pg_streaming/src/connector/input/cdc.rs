@@ -249,7 +249,7 @@ impl InputConnector for CdcInput {
         }
         self.last_poll_ms = now;
 
-        let result = Spi::get_one_with_args::<pgrx::JsonB>(
+        let result = pg_bgworker::spi::get_one_with_args::<pgrx::JsonB>(
             &self.peek_sql,
             &[(batch_size as i64).into(), self.last_lsn.into()],
         );

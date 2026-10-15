@@ -14,6 +14,10 @@ pub static PG_STREAMING_BATCH_SIZE: pgrx::GucSetting<i32> = pgrx::GucSetting::<i
 /// GUC setting for the poll interval in milliseconds
 pub static PG_STREAMING_POLL_INTERVAL_MS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(10);
 
+/// GUC setting for the longest wait between executor polls while idle
+pub static PG_STREAMING_IDLE_POLL_INTERVAL_MS: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(250);
+
 /// GUC setting for the checkpoint interval in milliseconds
 pub static PG_STREAMING_CHECKPOINT_INTERVAL_MS: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(1000);

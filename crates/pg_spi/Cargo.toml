@@ -9,14 +9,15 @@ description = "Async-safe SPI bridge for PostgreSQL extensions"
 
 [features]
 default = ["pg18"]
-pg14 = ["pgrx/pg14"]
-pg15 = ["pgrx/pg15"]
-pg16 = ["pgrx/pg16"]
-pg17 = ["pgrx/pg17"]
-pg18 = ["pgrx/pg18"]
+pg14 = ["pgrx/pg14", "pg_bgworker/pg14"]
+pg15 = ["pgrx/pg15", "pg_bgworker/pg15"]
+pg16 = ["pgrx/pg16", "pg_bgworker/pg16"]
+pg17 = ["pgrx/pg17", "pg_bgworker/pg17"]
+pg18 = ["pgrx/pg18", "pg_bgworker/pg18"]
 
 [dependencies]
 pgrx.workspace = true
+pg_bgworker = { path = "../pg_bgworker", default-features = false }
 tokio = { workspace = true, features = ["sync"] }
 thiserror.workspace = true
 serde_json.workspace = true

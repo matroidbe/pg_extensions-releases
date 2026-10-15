@@ -1,0 +1,3 @@
+-- pg_ml 0.3.2 -> 0.3.3
+-- No SQL changes: An idle training worker's job claim no longer commits an empty
+-- transaction every poll.

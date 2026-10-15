@@ -23,15 +23,47 @@ pub struct SpiRequest {
 #[derive(Clone)]
 pub struct SpiBridge {
     tx: mpsc::Sender<SpiRequest>,
+    wake: Option<WorkerLatch>,
+}
+
+/// The executing worker's latch, set after each request is queued so its
+/// main loop wakes at once instead of polling the channel.
+#[derive(Clone, Copy)]
+struct WorkerLatch(*mut pgrx::pg_sys::Latch);
+
+// SAFETY: the pointer is only handed to SetLatch, which PostgreSQL makes safe
+// to call from outside the latch owner's flow of control (signal handlers,
+// other processes): it only stores flags and wakes the owner.
+unsafe impl Send for WorkerLatch {}
+unsafe impl Sync for WorkerLatch {}
+
+// Declared directly: pgrx's pg_sys wrapper refuses calls from any thread but
+// the main one, and requests are sent from tokio threads. SetLatch never
+// raises an ERROR, so no pg_guard is needed.
+extern "C" {
+    fn SetLatch(latch: *mut pgrx::pg_sys::Latch);
 }
 
 impl SpiBridge {
     /// Create a new SPI bridge with the given channel capacity
     ///
     /// Returns both the bridge (for async tasks) and receiver (for SPI executor).
+    /// The executor must poll the receiver; see [`SpiBridge::waking_worker`].
     pub fn new(capacity: usize) -> (Self, SpiReceiver) {
         let (tx, rx) = mpsc::channel(capacity);
-        (SpiBridge { tx }, SpiReceiver { rx })
+        (SpiBridge { tx, wake: None }, SpiReceiver { rx })
+    }
+
+    /// Like [`SpiBridge::new`], but every request sets the latch of the
+    /// background worker that calls this (call it on the worker's main
+    /// thread). The worker can then sleep in `wait_latch` until a request
+    /// arrives, instead of waking every millisecond to look for one.
+    pub fn waking_worker(capacity: usize) -> (Self, SpiReceiver) {
+        let (mut bridge, receiver) = Self::new(capacity);
+        // SAFETY: read on the worker's main thread, where MyLatch is its own
+        // process latch for the life of the process.
+        bridge.wake = Some(WorkerLatch(unsafe { pgrx::pg_sys::MyLatch }));
+        (bridge, receiver)
     }
 
     /// Execute a query and return results
@@ -54,6 +86,12 @@ impl SpiBridge {
             .send(request)
             .await
             .map_err(|_| SpiError::ChannelClosed)?;
+        // After the send: the worker resets its latch on waking and then
+        // drains the channel, so a request is never left behind.
+        if let Some(latch) = self.wake {
+            // SAFETY: see WorkerLatch
+            unsafe { SetLatch(latch.0) };
+        }
 
         response_rx.await.map_err(|_| SpiError::ChannelClosed)?
     }

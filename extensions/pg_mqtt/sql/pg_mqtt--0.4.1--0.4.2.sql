@@ -1,0 +1,4 @@
+-- pg_mqtt 0.4.1 -> 0.4.2
+-- No SQL changes: Outbox polls and other reads through the SPI bridge no longer take
+-- a transaction ID (an empty commit each); the main loop sleeps until a request
+-- arrives instead of waking every millisecond.

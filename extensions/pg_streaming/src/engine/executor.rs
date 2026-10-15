@@ -12,9 +12,11 @@ use std::collections::HashMap;
 
 /// Main executor loop — called from worker.rs
 /// Discovers running pipelines, compiles them, and processes batches.
-pub fn run_executor_tick(worker_id: i32, compiled: &mut HashMap<i32, CompiledPipeline>) {
+/// Returns whether any pipeline took in records (the loop polls fast while
+/// it does, and backs off while idle).
+pub fn run_executor_tick(worker_id: i32, compiled: &mut HashMap<i32, CompiledPipeline>) -> bool {
     if !PG_STREAMING_ENABLED.get() {
-        return;
+        return false;
     }
 
     let batch_size = PG_STREAMING_BATCH_SIZE.get();
@@ -28,7 +30,7 @@ pub fn run_executor_tick(worker_id: i32, compiled: &mut HashMap<i32, CompiledPip
                 worker_id,
                 e
             );
-            return;
+            return false;
         }
     };
 
@@ -62,13 +64,12 @@ pub fn run_executor_tick(worker_id: i32, compiled: &mut HashMap<i32, CompiledPip
     }
 
     // Process one batch for each compiled pipeline
+    let mut busy = false;
     let pipeline_ids: Vec<i32> = compiled.keys().copied().collect();
     for pipeline_id in pipeline_ids {
         if let Some(pipeline) = compiled.get_mut(&pipeline_id) {
             match pipeline.process_batch(batch_size) {
-                Ok(_result) => {
-                    // Successful batch — nothing to log unless debugging
-                }
+                Ok(result) => busy |= result.records_in > 0,
                 Err(e) => {
                     log!(
                         "pg_streaming executor {}: pipeline '{}' failed: {}",
@@ -82,19 +83,29 @@ pub fn run_executor_tick(worker_id: i32, compiled: &mut HashMap<i32, CompiledPip
             }
         }
     }
+    busy
 }
 
 /// Discover pipelines assigned to this executor (state='running' AND worker_id matches)
+///
+/// A read-only `select`: `Spi::get_one*` would assign an XID, and this runs
+/// every poll on every executor — hundreds of empty commits a second idle.
 fn discover_assigned_pipelines(
     worker_id: i32,
 ) -> Result<Vec<(i32, String, serde_json::Value)>, String> {
-    let result = Spi::get_one_with_args::<pgrx::JsonB>(
-        "SELECT COALESCE(jsonb_agg(jsonb_build_object(\
+    let result = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT COALESCE(jsonb_agg(jsonb_build_object(\
            'id', id, 'name', name, 'definition', definition\
          )), '[]'::jsonb) \
          FROM pgstreams.pipelines WHERE state = 'running' AND worker_id = $1",
-        &[worker_id.into()],
-    );
+                Some(1),
+                &[worker_id.into()],
+            )?
+            .first()
+            .get_one::<pgrx::JsonB>()
+    });
 
     let jsonb = result.map_err(|e| format!("Failed to query pipelines: {}", e))?;
 
@@ -140,4 +151,51 @@ fn mark_pipeline_failed(pipeline_id: i32, error: &str) {
          updated_at = now() WHERE id = $1",
         &[pipeline_id.into(), error.into()],
     );
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::run_executor_tick;
+    use pg_bgworker::spi::{self, xid_assigned};
+    use pgrx::prelude::*;
+    use std::collections::HashMap;
+
+    // Each executor ticks every poll_interval_ms and the coordinator every
+    // second. An idle tick that takes an XID commits an empty transaction:
+    // ~400 WAL commit records a second from an idle server.
+
+    #[pg_test]
+    fn test_an_idle_executor_tick_takes_no_xid() {
+        assert!(!xid_assigned());
+        assert!(!run_executor_tick(0, &mut HashMap::new()), "nothing to do");
+        assert!(!xid_assigned(), "an idle executor tick took an XID");
+    }
+
+    #[pg_test]
+    fn test_an_idle_coordinator_tick_takes_no_xid() {
+        assert!(!xid_assigned());
+        crate::engine::coordinator::run_coordinator_tick();
+        assert!(!xid_assigned(), "an idle coordinator tick took an XID");
+    }
+
+    #[pg_test]
+    fn test_lazy_spi_takes_an_xid_only_when_it_writes() {
+        // A claim that matches nothing
+        let claimed = spi::get_one::<i32>(
+            "UPDATE pgstreams.pipelines SET worker_id = 0 WHERE false RETURNING id",
+        );
+        assert!(matches!(claimed, Err(pgrx::spi::SpiError::InvalidPosition)));
+        assert!(!xid_assigned(), "a write that touched no row took an XID");
+
+        // Several statements, DDL and DML, still run (not read-only)
+        spi::run("CREATE TEMP TABLE lazy_t (n int); INSERT INTO lazy_t VALUES (1), (2)").unwrap();
+        assert!(xid_assigned());
+        let n = spi::get_one_with_args::<i64>(
+            "SELECT count(*) FROM lazy_t WHERE n >= $1",
+            &[1i32.into()],
+        )
+        .unwrap();
+        assert_eq!(n, Some(2));
+    }
 }

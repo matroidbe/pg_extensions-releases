@@ -4,13 +4,14 @@
 //! database its workers connect to, and must not crash-loop while that
 //! database does not have the extension yet.
 
+pub mod spi;
 pub mod supervision;
 
 use std::ffi::CString;
 use std::time::Duration;
 
 use pgrx::bgworkers::BackgroundWorker;
-use pgrx::{GucSetting, Spi};
+use pgrx::GucSetting;
 
 /// Database a worker connects to when nothing is configured.
 pub const DEFAULT_DATABASE: &str = "postgres";
@@ -55,7 +56,7 @@ pub fn wait_for_extension(extension: &str, database: &str) -> bool {
     let mut announced = false;
     loop {
         let installed = BackgroundWorker::transaction(|| {
-            Spi::get_one_with_args::<bool>(
+            spi::get_one_with_args::<bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname = $1)",
                 &[extension.into()],
             )

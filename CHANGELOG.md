@@ -4,6 +4,31 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.7.2 — 2026-10-15
+
+**Idle background workers no longer write WAL.** An idle server committed
+~490 empty transactions a second — ~22 KB/s of WAL (≈2 GB a day) and 42 million
+transaction IDs a day pushed toward wraparound vacuum, with no data changing.
+pgrx's `Spi::get_one*` / `Spi::run*` / `SpiClient::update` take a transaction ID
+before running anything, so every poll — even a read, even an `UPDATE …
+RETURNING` claim that matches nothing — ended in a commit record. Polls now run
+through `pg_bgworker::spi` (and the same change in `pg_spi`'s bridge executor),
+which runs statements `read_only = false` without that step: PostgreSQL takes an
+ID only when a row is written.
+
+- pg_streaming (0.3.4): executor and coordinator ticks and input polls (table,
+  Kafka topic, CDC) and the CEP expiry. Executors now back off while no pipeline
+  takes in records, doubling from `pg_streaming.poll_interval_ms` (10 ms) up to
+  the new `pg_streaming.idle_poll_interval_ms` (250 ms) — 400 polls a second
+  idle became 16.
+- pg_mqtt (0.4.2), pg_kafka (0.3.3), pg_s3 (0.3.3), pg_git (0.3.3): reads
+  through the SPI bridge — pg_mqtt's 50 ms outbox fan-out poll, Kafka fetch
+  long-polls. Their main loops also slept only 1 ms between checks for a
+  request (~1,000 wakeups a second per worker); a request now sets the worker's
+  latch (`SpiBridge::waking_worker`) and the loop sleeps up to 100 ms between.
+- pg_ml (0.3.3), pg_ortools (0.3.4), pg_swarm (0.3.3): the job / task claim of
+  an idle worker.
+
 ## v0.7.1 — 2026-10-14
 
 **pg_mqtt publishes from SQL to a typed topic over a table with no `id` (0.4.1).**

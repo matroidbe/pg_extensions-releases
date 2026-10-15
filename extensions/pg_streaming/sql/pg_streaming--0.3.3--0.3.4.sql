@@ -1,0 +1,4 @@
+-- pg_streaming 0.3.3 -> 0.3.4
+-- No SQL changes: Idle executors and coordinator no longer commit an empty transaction
+-- every poll; executors back off to pg_streaming.idle_poll_interval_ms (new
+-- GUC) while no pipeline takes in records.

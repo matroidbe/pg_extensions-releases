@@ -30,6 +30,9 @@ use pg_observability::{
     init_prometheus_on_port, init_tracing, warn,
 };
 
+/// Longest idle sleep of the main loop; requests wake it at once
+const IDLE_WAIT: Duration = Duration::from_millis(100);
+
 /// Connection counter for monitoring
 static CONNECTION_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -109,7 +112,7 @@ pub fn run_server(
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 
     // Create SPI bridge with capacity for pending requests
-    let (bridge, mut receiver) = SpiBridge::new(1024);
+    let (bridge, mut receiver) = SpiBridge::waking_worker(1024);
     let bridge = Arc::new(bridge);
 
     // Create the tokio runtime
@@ -203,13 +206,16 @@ pub fn run_server(
             }
         }
 
+        // Each bridge request sets our latch (SpiBridge::waking_worker), so
+        // this sleeps until there is work; IDLE_WAIT only paces the loop's
+        // housekeeping. It was a 1 ms poll: ~1,000 wakeups a second, idle.
         // Idle wait. wait_latch (not thread::sleep) so the latch wakes us
         // promptly when a procsignal (e.g. a barrier) arrives — the actual
         // interrupt processing happens via check_for_interrupts!() at the top
         // of the loop. wait_latch also gives this backend a real wait_event
         // in pg_stat_activity (PG_WAIT_EXTENSION). Returns false on SIGTERM
         // or postmaster death — break in either case.
-        if processed == 0 && !BackgroundWorker::wait_latch(Some(Duration::from_millis(1))) {
+        if processed == 0 && !BackgroundWorker::wait_latch(Some(IDLE_WAIT)) {
             break;
         }
     }

@@ -124,7 +124,9 @@ fn wait_for_node_id() -> NodeWait {
 /// - **round_robin**: workers only claim tasks assigned to their node
 fn claim_and_execute_task(node_id: i64) {
     // Try round-robin first (tasks assigned to this node), then greedy (any unassigned task)
-    let claimed = Spi::get_one_with_args::<i64>(
+    // pg_bgworker::spi: an idle poll claims nothing, so it must take no XID
+    // (Spi::get_one would — an empty commit every poll).
+    let claimed = pg_bgworker::spi::get_one_with_args::<i64>(
         "UPDATE pgswarm.tasks
          SET status = 'running',
              node_id = $1,
