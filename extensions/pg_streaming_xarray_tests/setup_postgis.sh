@@ -43,15 +43,17 @@ fi
 PG_CONFIG="$PG_INSTALL/bin/pg_config"
 SHARE_DIR="$($PG_CONFIG --sharedir)"
 PKGLIB_DIR="$($PG_CONFIG --pkglibdir)"
+# PostgreSQL 16+ builds modules as .dylib on macOS (PGXS DLSUFFIX), .so elsewhere.
+case "$(uname -s)" in Darwin) DLSUFFIX=.dylib ;; *) DLSUFFIX=.so ;; esac
 
 # -----------------------------------------------------------------------------
 # 1. Short-circuit if PostGIS is already in the pgrx install.
 # -----------------------------------------------------------------------------
 if [[ -f "$SHARE_DIR/extension/postgis.control" \
-   && -f "$PKGLIB_DIR/postgis-3.so" ]]; then
+   && -f "$PKGLIB_DIR/postgis-3$DLSUFFIX" ]]; then
     log "PostGIS already installed for pgrx PG $PG_VERSION at:"
     log "  $SHARE_DIR/extension/postgis.control"
-    log "  $PKGLIB_DIR/postgis-3.so"
+    log "  $PKGLIB_DIR/postgis-3$DLSUFFIX"
     exit 0
 fi
 
@@ -77,10 +79,10 @@ if [[ -n "$BREW_PREFIX" ]] && [[ -d "$BREW_PREFIX/Cellar/postgis" ]]; then
         cp "$BREW_SHARE"/postgis*.control \
            "$BREW_SHARE"/postgis*.sql \
            "$SHARE_DIR/extension/" 2>/dev/null || true
-        cp "$BREW_LIB"/postgis*.so "$PKGLIB_DIR/" 2>/dev/null || true
+        cp "$BREW_LIB"/postgis*$DLSUFFIX "$PKGLIB_DIR/" 2>/dev/null || true
 
         if [[ -f "$SHARE_DIR/extension/postgis.control" \
-           && -f "$PKGLIB_DIR/postgis-3.so" ]]; then
+           && -f "$PKGLIB_DIR/postgis-3$DLSUFFIX" ]]; then
             log "✓ PostGIS copied from brew."
             exit 0
         else
@@ -94,7 +96,8 @@ fi
 # -----------------------------------------------------------------------------
 # 3. Build from source.
 # -----------------------------------------------------------------------------
-POSTGIS_VERSION="${POSTGIS_VERSION:-3.5.2}"
+# 3.6 is the first PostGIS that builds against PostgreSQL 18 (pqsignal change).
+POSTGIS_VERSION="${POSTGIS_VERSION:-3.6.4}"
 
 GEOS_CONFIG="$(command -v geos-config || true)"
 if [[ -z "$GEOS_CONFIG" && -n "$BREW_PREFIX" ]]; then
@@ -137,7 +140,9 @@ fi
 
 cd "postgis-$POSTGIS_VERSION"
 
-if [[ ! -f Makefile ]]; then
+# The tarball ships a placeholder Makefile that only says "run configure";
+# configure writes GNUmakefile, which GNU make prefers. Test for that.
+if [[ ! -f GNUmakefile ]]; then
     log "Configuring PostGIS for pgrx PG $PG_VERSION..."
     PG_CONFIG="$PG_CONFIG" \
     LDFLAGS="-L$BREW_PREFIX/lib -Wl,-rpath,$BREW_PREFIX/lib" \
@@ -155,7 +160,7 @@ fi
 
 log "Building PostGIS (this takes a few minutes)..."
 LD_LIBRARY_PATH="$BREW_PREFIX/lib:${LD_LIBRARY_PATH:-}" \
-    make -j"$(nproc)" > /tmp/postgis-build-$$.log 2>&1 \
+    make -j"$(getconf _NPROCESSORS_ONLN)" > /tmp/postgis-build-$$.log 2>&1 \
     || { error "build failed; see /tmp/postgis-build-$$.log"; exit 3; }
 
 log "Installing PostGIS extension into pgrx PG $PG_VERSION..."
@@ -168,24 +173,24 @@ LD_LIBRARY_PATH="$BREW_PREFIX/lib:${LD_LIBRARY_PATH:-}" \
 # The .so for the core postgis library is installed by `make install`
 # from the libpgcommon/postgis dir, but we skipped that. Install the
 # loaded library manually.
-SO_SRC="$(find "$BUILD_DIR/postgis-$POSTGIS_VERSION" -name 'postgis-3.so' \
+SO_SRC="$(find "$BUILD_DIR/postgis-$POSTGIS_VERSION" -name "postgis-3$DLSUFFIX" \
             -not -path '*/extensions/*' 2>/dev/null | head -1)"
 if [[ -n "$SO_SRC" ]]; then
     cp "$SO_SRC" "$PKGLIB_DIR/"
 fi
 
 # Also install address_standardizer if it was built (a postgis extension).
-ADDR_SO="$(find "$BUILD_DIR/postgis-$POSTGIS_VERSION" -name 'address_standardizer-3.so' 2>/dev/null | head -1)"
+ADDR_SO="$(find "$BUILD_DIR/postgis-$POSTGIS_VERSION" -name "address_standardizer-3$DLSUFFIX" 2>/dev/null | head -1)"
 if [[ -n "$ADDR_SO" ]]; then
     cp "$ADDR_SO" "$PKGLIB_DIR/" 2>/dev/null || true
 fi
 
 if [[ -f "$SHARE_DIR/extension/postgis.control" \
-   && -f "$PKGLIB_DIR/postgis-3.so" ]]; then
+   && -f "$PKGLIB_DIR/postgis-3$DLSUFFIX" ]]; then
     log "✓ PostGIS $POSTGIS_VERSION built and installed for pgrx PG $PG_VERSION."
 else
     error "Install completed but the expected files are missing:"
     error "  $SHARE_DIR/extension/postgis.control"
-    error "  $PKGLIB_DIR/postgis-3.so"
+    error "  $PKGLIB_DIR/postgis-3$DLSUFFIX"
     exit 4
 fi

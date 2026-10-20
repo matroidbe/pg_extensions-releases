@@ -17,3 +17,11 @@
 # rustc than the CI runner's (e.g. aws-* crates via deltalake-aws needing
 # 1.94.1 on a 1.92.0 runner) abort resolution outright.
 incompatible-rust-versions = "fallback"
+
+# A pgrx extension is a cdylib that references PostgreSQL's own symbols, which
+# only exist in the backend that loads it. Linux linkers allow undefined
+# symbols in shared objects by default; Apple's ld64 does not, so every macOS
+# build fails at link time without this. Target-scoped, so it is a no-op on
+# every other host.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

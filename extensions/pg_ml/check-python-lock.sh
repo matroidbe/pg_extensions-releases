@@ -9,20 +9,33 @@
 #   ./check-python-lock.sh --fix    relock (no upgrades) and re-export
 #
 # To take newer packages: uv lock --upgrade && ./check-python-lock.sh --fix
+#
+# The lock is read and written with one pinned uv: uv releases change how the
+# export spells platform markers (0.13.3 differs from 0.13.1), so an unpinned
+# uv makes the check fail whenever a new uv ships. To move the pin, change
+# UV_VERSION and run --fix in the same commit.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-EXPORT=(uv export --frozen --no-dev --no-emit-project --format requirements-txt)
+UV_VERSION=0.13.1
+uv_found=$(uv --version 2>/dev/null || true)
+if [[ "$uv_found" == "uv $UV_VERSION" || "$uv_found" == "uv $UV_VERSION "* ]]; then
+    UV=(uv)
+else
+    UV=(uvx --quiet --from "uv==$UV_VERSION" uv)
+fi
+
+EXPORT=("${UV[@]}" export --frozen --no-dev --no-emit-project --format requirements-txt)
 
 if [[ "${1:-}" == "--fix" ]]; then
-    uv lock
+    "${UV[@]}" lock
     "${EXPORT[@]}" > requirements.lock.txt
     echo "requirements.lock.txt regenerated"
     exit 0
 fi
 
-if ! uv lock --check; then
+if ! "${UV[@]}" lock --check; then
     echo "uv.lock is out of date with pyproject.toml; run ./check-python-lock.sh --fix" >&2
     exit 1
 fi

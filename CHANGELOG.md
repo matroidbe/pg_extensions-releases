@@ -4,6 +4,67 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.7.3 — 2026-10-20
+
+**pg_feature reworked against Featuretools (0.4.0, #168).** The matrix, `_train`
+and `_live` are now rendered by one generator from the same per-feature SQL
+expressions, so a model never scores on features computed differently from
+the ones it was trained on (`_live` counted `COUNT(*)` where the matrix counted
+`COUNT(col)`).
+
+- **`cutoff_interval`:** the generated `pgft._cutoffs_<project>` table is kept.
+  Dropping it with CASCADE used to take the matrix and `_train` with it.
+- **Depth 2:** depth-2 features are now computed (child ⋈ grandchild, inner
+  then outer aggregation). Before, `_train` selected columns the matrix did
+  not have.
+- **Windows** now apply with no cutoff or a single cutoff, where they were
+  silently all-time. Target rows are filtered by the target's time index.
+- **Column order** follows feature order. Names over 63 bytes get a hash
+  suffix, and duplicate or unknown primitive names are an error.
+- **New primitives:** `median`, `any`, `all`, `first`, `last`, `trend`, and
+  more (`pgft.list_primitives()`).
+- **Registry functions** (`add_relationship`, `remove_relationship`,
+  `remove_time_index`, `discover_*`) work as the first write of a
+  transaction. Before, they failed with "INSERT is not allowed in a
+  non-volatile function".
+- **`discover_time_indexes`** no longer fails on its own query, and prefers
+  `created_at`-style columns over `updated_at`.
+- **`discover_relationships`** finds foreign keys whose parent table is in
+  another schema. It no longer cross-products composite keys, which it now
+  skips.
+- **`make_temporal_cutoffs`:** `num_windows` works, and a dependent matrix is
+  no longer dropped (no CASCADE).
+- **`avg_time_between`** works on `date` time indexes.
+- **Keyword columns** such as `desc` are quoted.
+- **`tables`:** the filter always includes the target.
+- **Input validation:** conflicting or non-positive cutoff options, bad
+  windows and unknown `target_id`s are rejected up front.
+
+**pg_ml runs on macOS and can be bottled there (0.3.4).** The embedded
+interpreter gets the venv's `PYTHONEXECUTABLE`, so joblib/loky workers no
+longer exit at once. The Python lock resolves for darwin-arm64: PyCaret's
+`[full]` extras minus catboost, which has no macOS wheel. XGBoost and LightGBM
+need Homebrew's `libomp`. A bottle built against a fixed Python creates its
+runtime venv on that interpreter, in `<data directory>/pg_ml/venv`.
+
+**Every extension builds on macOS.** pgrx cdylibs link with
+`-undefined dynamic_lookup` on Apple targets. The upgrade-path and bottle
+scripts run on macOS.
+
+**darwin-arm64 bottles are built in CI.** The release workflow builds and
+verifies a darwin-arm64 bottle of every extension on a GitHub-hosted
+`macos-15` runner, next to the linux-amd64 ones. The release carries one
+`SHA256SUMS` for both targets. pg_solid, pg_xarray and pg_ml link the pinned
+kegs of the `matroidbe/eidos` tap (`eidos-opencascade@7.9`, `eidos-hdf5@1.14`
+and `eidos-netcdf@4.9`, `eidos-python@3.11`), which `brew upgrade` does not
+replace.
+
+**CI tests each tree once.** A commit whose files already passed CI, reached
+through another branch or merge commit, skips the suite (design/ci).
+
+Extension versions: pg_feature 0.4.0, pg_ml 0.3.4. Every other extension is
+unchanged from v0.7.2.
+
 ## v0.7.2 — 2026-10-15
 
 **Idle background workers no longer write WAL.** An idle server committed

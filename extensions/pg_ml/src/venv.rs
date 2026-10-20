@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::config::{get_python_path, get_venv_path, AUTO_SETUP, UV_PATH};
+use crate::config::{get_python_path, get_venv_path, AUTO_SETUP, BASE_PYTHON, UV_PATH};
 use crate::error::PgMlError;
 
 /// Hashed export of uv.lock, embedded at compile time so a venv created at
@@ -39,6 +39,10 @@ fn find_uv_in_paths() -> Result<PathBuf, PgMlError> {
         "/usr/lib/postgresql/16/lib/uv",
         "/usr/lib/postgresql/15/lib/uv",
         "/usr/lib/postgresql/14/lib/uv",
+        // Homebrew: a server started by `brew services` may not have its
+        // bin directory on PATH.
+        "/opt/homebrew/bin/uv",
+        "/usr/local/bin/uv",
     ];
     for path in bundled_paths {
         let p = PathBuf::from(path);
@@ -92,14 +96,15 @@ pub fn ensure_venv() -> Result<(), PgMlError> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Create venv with Python 3.11 (must match the version pg_ml was compiled against)
-    // The Makefile ensures PYO3_PYTHON points to this venv before building
+    // Build the venv on the Python pg_ml linked against (BASE_PYTHON): the
+    // Makefile points PYO3_PYTHON at its own venv, a bottle at a fixed one.
     pgrx::info!(
-        "pg_ml: Creating Python 3.11 virtual environment at {:?}...",
+        "pg_ml: Creating a Python virtual environment ({}) at {:?}...",
+        BASE_PYTHON,
         venv_path
     );
     let output = Command::new(&uv)
-        .args(["venv", "--python", "3.11"])
+        .args(["venv", "--python", BASE_PYTHON])
         .arg(&venv_path)
         .output()?;
 
@@ -171,9 +176,29 @@ fn find_python_version_dir(base: &std::path::Path) -> Option<String> {
     None
 }
 
-/// Find the base Python prefix from the venv's pyvenv.cfg.
-/// The `home` key points to `<base>/bin`, so the parent is the prefix.
+/// Find the base Python prefix of a venv: what the embedded interpreter needs
+/// as PYTHONHOME to find its standard library.
 fn find_base_python_prefix(venv: &std::path::Path) -> Option<PathBuf> {
+    // Ask the venv's interpreter: sys.base_prefix is the base installation's
+    // real prefix whatever its layout. The parent of pyvenv.cfg's `home` is
+    // only right for a flat install (uv-managed CPython); for a macOS framework
+    // build such as Homebrew's, `home` is /opt/homebrew/opt/python@3.11/bin but
+    // the stdlib is under .../Frameworks/Python.framework/Versions/3.11, and
+    // that PYTHONHOME makes the embedded interpreter die at startup with
+    // "No module named 'encodings'".
+    let output = Command::new(venv.join("bin").join("python"))
+        .args(["-I", "-c", "import sys; print(sys.base_prefix)"])
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONPATH")
+        .output();
+    if let Ok(output) = output {
+        let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() && !prefix.is_empty() {
+            return Some(PathBuf::from(prefix));
+        }
+    }
+
+    // Fallback without running Python: the parent of pyvenv.cfg's `home`.
     let pyvenv_cfg = venv.join("pyvenv.cfg");
     let cfg_content = std::fs::read_to_string(pyvenv_cfg).ok()?;
     for line in cfg_content.lines() {
@@ -220,6 +245,13 @@ pub fn ensure_python() -> Result<(), PgMlError> {
         let venv = get_venv_path();
         std::env::set_var("VIRTUAL_ENV", &venv);
 
+        // sys.executable must be the venv's Python: joblib/loky starts its
+        // workers by running it. On Linux CPython resolves it through PATH
+        // (the venv's bin/ is put first below); on macOS it takes the running
+        // binary instead, i.e. postgres, unless PYTHONEXECUTABLE says otherwise
+        // (a macOS-only variable that Linux ignores).
+        std::env::set_var("PYTHONEXECUTABLE", get_python_path());
+
         // Set PYTHONHOME to the base Python prefix so stdlib is found
         if let Some(base_prefix) = find_base_python_prefix(&venv) {
             std::env::set_var("PYTHONHOME", &base_prefix);
@@ -260,13 +292,52 @@ mod tests {
 
     #[test]
     fn test_default_venv_path() {
-        use crate::config::DEFAULT_VENV_PATH;
-        // Default path constant - either from PG_ML_VENV_PATH env var at compile time
-        // or the hardcoded default
+        use crate::config::COMPILED_VENV_PATH;
+        // Compiled in from PG_ML_VENV_PATH (the dev .cargo/config.toml sets
+        // `.venv`), or unset for a bottle, whose venv goes in the data directory.
+        if let Some(path) = COMPILED_VENV_PATH {
+            assert!(!path.is_empty());
+            assert!(path.contains("venv") || path.contains("pg_ml"), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_base_prefix_comes_from_the_venv_interpreter() {
+        // A framework build's stdlib is not under the parent of pyvenv.cfg's
+        // `home`; the interpreter's own sys.base_prefix is what counts.
+        let venv = std::env::temp_dir().join(format!("pg_ml_prefix_{}", std::process::id()));
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            "home = /opt/homebrew/opt/python@3.11/bin\n",
+        )
+        .unwrap();
+        let python = bin.join("python");
+        std::fs::write(
+            &python,
+            "#!/bin/sh\necho /opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prefix = find_base_python_prefix(&venv);
+        std::fs::remove_dir_all(&venv).ok();
+        assert_eq!(
+            prefix,
+            Some(PathBuf::from(
+                "/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_base_python_names_an_interpreter() {
+        use crate::config::BASE_PYTHON;
         assert!(
-            DEFAULT_VENV_PATH == "/var/lib/postgresql/pg_ml" || DEFAULT_VENV_PATH.contains("pg_ml"),
-            "DEFAULT_VENV_PATH should contain 'pg_ml', got: {}",
-            DEFAULT_VENV_PATH
+            BASE_PYTHON == "3.11" || BASE_PYTHON.ends_with("python3.11"),
+            "BASE_PYTHON must be a 3.11 (the lock is resolved for it), got: {BASE_PYTHON}"
         );
     }
 

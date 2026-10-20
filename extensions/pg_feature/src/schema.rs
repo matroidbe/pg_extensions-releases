@@ -69,48 +69,32 @@ pub enum PgType {
 
 impl PgType {
     /// Determine the type category from a data_type string
+    ///
+    /// Matches whole type names (`information_schema.columns.data_type` spellings
+    /// and their common aliases), so e.g. `interval` and `point` are not integers.
     pub fn from_data_type(data_type: &str) -> Self {
-        let dt = data_type.to_lowercase();
-        if dt.contains("int") || dt == "serial" || dt == "bigserial" || dt == "smallserial" {
-            PgType::Integer
-        } else if dt.contains("numeric")
-            || dt.contains("decimal")
-            || dt.contains("real")
-            || dt.contains("double")
-            || dt.contains("float")
-        {
-            PgType::Numeric
-        } else if dt.contains("bool") {
-            PgType::Boolean
-        } else if dt.contains("char")
-            || dt.contains("text")
-            || dt == "name"
-            || dt.contains("varchar")
-        {
-            PgType::Text
-        } else if dt.contains("timestamp") {
-            PgType::Timestamp
-        } else if dt == "date" {
-            PgType::Date
-        } else if dt.contains("time") && !dt.contains("timestamp") {
-            PgType::Time
-        } else if dt.contains("json") {
-            PgType::Json
-        } else if dt.starts_with("_") || dt.contains("[]") || dt == "array" {
-            PgType::Array
-        } else {
-            PgType::Other
+        let dt = data_type.trim().to_lowercase();
+        // Strip a type modifier: numeric(10,2), character varying(20)
+        let base = dt.split('(').next().unwrap_or("").trim();
+        match base {
+            "smallint" | "integer" | "bigint" | "int" | "int2" | "int4" | "int8" | "serial"
+            | "smallserial" | "bigserial" => PgType::Integer,
+            "numeric" | "decimal" | "real" | "double precision" | "float4" | "float8" => {
+                PgType::Numeric
+            }
+            "boolean" | "bool" => PgType::Boolean,
+            "text" | "character varying" | "varchar" | "character" | "char" | "bpchar" | "name"
+            | "citext" => PgType::Text,
+            "timestamp" | "timestamptz" => PgType::Timestamp,
+            "date" => PgType::Date,
+            "time" | "timetz" => PgType::Time,
+            "json" | "jsonb" => PgType::Json,
+            "array" => PgType::Array,
+            _ if base.starts_with("timestamp") => PgType::Timestamp,
+            _ if base.starts_with("time ") => PgType::Time,
+            _ if base.starts_with('_') || base.ends_with("[]") => PgType::Array,
+            _ => PgType::Other,
         }
-    }
-
-    /// Check if this type is numeric (for aggregation primitives)
-    pub fn is_numeric(&self) -> bool {
-        matches!(self, PgType::Integer | PgType::Numeric)
-    }
-
-    /// Check if this type is temporal (for time-based transforms)
-    pub fn is_temporal(&self) -> bool {
-        matches!(self, PgType::Timestamp | PgType::Date | PgType::Time)
     }
 }
 
@@ -131,84 +115,199 @@ pub fn parse_table_ref(table_name: &str) -> Result<TableRef, PgFeatureError> {
 }
 
 /// Quote an identifier if it needs quoting
+///
+/// Same rule as PostgreSQL's `quote_ident`: a name stays bare only if it is a
+/// lowercase identifier that does not start with a digit and is not a keyword
+/// that needs quoting.
 pub fn quote_identifier(name: &str) -> String {
-    // Check if the identifier needs quoting
-    let needs_quoting = name
+    let plain = name
         .chars()
-        .any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_')
-        || is_reserved_word(name);
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
 
-    if needs_quoting {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    } else {
+    if plain && !is_reserved_word(name) {
         name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
 
-/// Check if a word is a SQL reserved word (simplified check)
+/// Keywords that cannot be used as a bare column name: every PostgreSQL keyword
+/// outside the unreserved category (`SELECT word FROM pg_get_keywords() WHERE
+/// catcode <> 'U'`, PostgreSQL 18)
+const QUOTED_KEYWORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "between",
+    "bigint",
+    "binary",
+    "bit",
+    "boolean",
+    "both",
+    "case",
+    "cast",
+    "char",
+    "character",
+    "check",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "dec",
+    "decimal",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "float",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "inout",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "json",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "national",
+    "natural",
+    "nchar",
+    "none",
+    "normalize",
+    "not",
+    "notnull",
+    "null",
+    "nullif",
+    "numeric",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "outer",
+    "overlaps",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "real",
+    "references",
+    "returning",
+    "right",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "similar",
+    "smallint",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "time",
+    "timestamp",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "varchar",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// Check if a word is a keyword that must be quoted
 fn is_reserved_word(word: &str) -> bool {
-    let reserved = [
-        "select",
-        "from",
-        "where",
-        "and",
-        "or",
-        "not",
-        "in",
-        "is",
-        "null",
-        "true",
-        "false",
-        "table",
-        "column",
-        "index",
-        "create",
-        "drop",
-        "alter",
-        "insert",
-        "update",
-        "delete",
-        "join",
-        "left",
-        "right",
-        "inner",
-        "outer",
-        "on",
-        "as",
-        "order",
-        "by",
-        "group",
-        "having",
-        "limit",
-        "offset",
-        "union",
-        "except",
-        "intersect",
-        "case",
-        "when",
-        "then",
-        "else",
-        "end",
-        "primary",
-        "key",
-        "foreign",
-        "references",
-        "unique",
-        "check",
-        "default",
-        "constraint",
-        "user",
-        "role",
-        "grant",
-        "revoke",
-        "all",
-        "any",
-        "between",
-        "like",
-        "ilike",
-        "similar",
-    ];
-    reserved.contains(&word.to_lowercase().as_str())
+    QUOTED_KEYWORDS.contains(&word)
 }
 
 /// Verify that a table exists
@@ -286,12 +385,11 @@ pub fn get_table_columns(table_ref: &TableRef) -> Result<Vec<ColumnInfo>, PgFeat
 }
 
 /// Get the primary key column(s) for a table
-#[allow(dead_code)]
 pub fn get_primary_key_columns(table_ref: &TableRef) -> Result<Vec<String>, PgFeatureError> {
     let pk_columns = Spi::connect(|client| {
         let sql = format!(
             r#"
-            SELECT a.attname
+            SELECT a.attname::text
             FROM pg_index i
             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             JOIN pg_class c ON c.oid = i.indrelid
@@ -378,6 +476,21 @@ mod tests {
         );
         assert_eq!(PgType::from_data_type("date"), PgType::Date);
         assert_eq!(PgType::from_data_type("jsonb"), PgType::Json);
+        assert_eq!(
+            PgType::from_data_type("time without time zone"),
+            PgType::Time
+        );
+        assert_eq!(PgType::from_data_type("ARRAY"), PgType::Array);
+    }
+
+    #[test]
+    fn test_pg_type_not_fooled_by_substrings() {
+        // "interval" and "point" contain "int"; neither is an integer
+        assert_eq!(PgType::from_data_type("interval"), PgType::Other);
+        assert_eq!(PgType::from_data_type("point"), PgType::Other);
+        assert_eq!(PgType::from_data_type("tsrange"), PgType::Other);
+        assert_eq!(PgType::from_data_type("USER-DEFINED"), PgType::Other);
+        assert_eq!(PgType::from_data_type("uuid"), PgType::Other);
     }
 
     #[test]
@@ -387,6 +500,16 @@ mod tests {
         assert_eq!(quote_identifier("with space"), "\"with space\"");
         assert_eq!(quote_identifier("select"), "\"select\"");
         assert_eq!(quote_identifier("has\"quote"), "\"has\"\"quote\"");
+        // Keywords the old hand-written list missed
+        assert_eq!(quote_identifier("desc"), "\"desc\"");
+        assert_eq!(quote_identifier("do"), "\"do\"");
+        assert_eq!(quote_identifier("window"), "\"window\"");
+        // Unreserved keywords stay bare, as with quote_ident
+        assert_eq!(quote_identifier("key"), "key");
+        assert_eq!(quote_identifier("index"), "index");
+        // A leading digit needs quoting
+        assert_eq!(quote_identifier("1st"), "\"1st\"");
+        assert_eq!(quote_identifier("_x1"), "_x1");
     }
 
     #[test]

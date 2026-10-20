@@ -123,6 +123,21 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_python_executable_is_venv_python() {
+        // joblib/loky (PyCaret's parallel backend) starts workers by running
+        // sys.executable. Embedded in the backend it must be the venv's Python,
+        // not the postgres binary, or every worker exits at once.
+        let info = crate::python_info();
+        let info: serde_json::Value = serde_json::from_str(&info).expect("python_info is JSON");
+        let expected = crate::get_python_path();
+        assert_eq!(
+            info["executable"].as_str(),
+            expected.to_str(),
+            "sys.executable should be the venv python"
+        );
+    }
+
+    #[pg_test]
     fn test_find_uv_function() {
         // Test that find_uv doesn't panic in PostgreSQL context
         let result = crate::find_uv();
@@ -965,11 +980,12 @@ pub mod pg_test {
     }
 
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // Use local .venv folder in pg_ml extension directory
-        // This venv should be created during development setup with:
-        //   uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python .
+        // Use the local .venv folder in this crate's directory (test.sh creates
+        // it with `uv sync --locked`), wherever the checkout lives. A fixed
+        // /home/ubuntu/... path broke every other checkout: pg_ml then tried to
+        // create a venv there, which fails outright on macOS (/home is autofs).
         vec![
-            "pg_ml.venv_path = '/home/ubuntu/dev/pg_extensions/extensions/pg_ml/.venv'",
+            concat!("pg_ml.venv_path = '", env!("CARGO_MANIFEST_DIR"), "/.venv'"),
             "shared_preload_libraries = 'pg_ml'",
         ]
     }

@@ -38,14 +38,13 @@ pub(crate) fn set_time_index_impl(
     // Validate the column type
     match data_type {
         Some(dt) => {
+            // A time of day cannot be compared with a cutoff timestamp
             let valid_types = [
                 "timestamp without time zone",
                 "timestamp with time zone",
                 "date",
-                "time without time zone",
-                "time with time zone",
             ];
-            if !valid_types.iter().any(|t| dt.to_lowercase().contains(t)) {
+            if !valid_types.contains(&dt.to_lowercase().as_str()) {
                 return Err(PgFeatureError::InvalidParameter(format!(
                     "Column '{}' has type '{}', expected a timestamp or date type",
                     time_column, dt
@@ -81,60 +80,6 @@ pub(crate) fn set_time_index_impl(
     Ok(id)
 }
 
-/// Verify that a column exists and is a timestamp/date type
-#[allow(dead_code)]
-fn verify_time_column(table_ref: &TableRef, time_column: &str) -> Result<(), PgFeatureError> {
-    // Use Spi::connect_mut to avoid read-only mode that would affect subsequent writes
-    let column_exists = Spi::connect_mut(|client| {
-        let sql = format!(
-            r#"
-            SELECT data_type::text
-            FROM information_schema.columns
-            WHERE table_schema = '{}'
-              AND table_name = '{}'
-              AND column_name = '{}'
-            "#,
-            escape_literal(&table_ref.schema),
-            escape_literal(&table_ref.name),
-            escape_literal(time_column)
-        );
-        let mut result = client.select(&sql, None, &[])?;
-
-        if let Some(row) = result.next() {
-            let data_type: Option<String> = row.get(1)?;
-            Ok::<_, pgrx::spi::Error>(data_type)
-        } else {
-            Ok::<_, pgrx::spi::Error>(None)
-        }
-    })?;
-
-    match column_exists {
-        Some(data_type) => {
-            let valid_types = [
-                "timestamp without time zone",
-                "timestamp with time zone",
-                "date",
-                "time without time zone",
-                "time with time zone",
-            ];
-            if !valid_types
-                .iter()
-                .any(|t| data_type.to_lowercase().contains(t))
-            {
-                return Err(PgFeatureError::InvalidParameter(format!(
-                    "Column '{}' has type '{}', expected a timestamp or date type",
-                    time_column, data_type
-                )));
-            }
-            Ok(())
-        }
-        None => Err(PgFeatureError::ColumnNotFound(
-            format!("{}.{}", table_ref.schema, table_ref.name),
-            time_column.to_string(),
-        )),
-    }
-}
-
 /// List all registered time indexes
 pub(crate) fn list_time_indexes_impl() -> Result<Vec<(i64, String, String, String)>, PgFeatureError>
 {
@@ -162,121 +107,69 @@ pub(crate) fn list_time_indexes_impl() -> Result<Vec<(i64, String, String, Strin
 /// Remove a time index for a table
 pub(crate) fn remove_time_index_impl(table_name: &str) -> Result<bool, PgFeatureError> {
     let table_ref = parse_table_ref(table_name)?;
-
-    let deleted = Spi::connect_mut(|client| {
-        let sql = format!(
-            r#"
-            DELETE FROM pgft.time_indexes
-            WHERE schema_name = '{}' AND table_name = '{}'
-            RETURNING id
-            "#,
-            escape_literal(&table_ref.schema),
-            escape_literal(&table_ref.name)
-        );
-        let result = client.select(&sql, None, &[])?;
-
-        // Count the rows returned
-        let mut count = 0;
-        for _ in result {
-            count += 1;
-        }
-        Ok::<_, pgrx::spi::Error>(count > 0)
-    })?;
-
-    Ok(deleted)
+    // A read-write SPI call: a select would be read-only, and fail, whenever this
+    // is the transaction's first write
+    let deleted = Spi::get_one_with_args::<bool>(
+        "WITH d AS (
+            DELETE FROM pgft.time_indexes WHERE schema_name = $1 AND table_name = $2 RETURNING 1
+         )
+         SELECT COUNT(*) > 0 FROM d",
+        &[
+            table_ref.schema.as_str().into(),
+            table_ref.name.as_str().into(),
+        ],
+    )?;
+    Ok(deleted.unwrap_or(false))
 }
 
-/// Auto-discover time indexes by looking for timestamp columns
-pub(crate) fn discover_time_indexes_impl(schema_name: &str) -> Result<i32, PgFeatureError> {
-    // Common time column names to look for
-    let time_column_patterns = [
-        "created_at",
-        "updated_at",
-        "timestamp",
-        "event_time",
-        "event_timestamp",
-        "date",
-        "datetime",
-        "time",
-        "occurred_at",
-        "transaction_time",
-        "order_date",
-        "purchase_date",
-    ];
+/// Common time column names, most preferred first. `updated_at` comes last: it
+/// moves when a row changes, so it says little about when the row became known.
+const TIME_COLUMN_NAMES: &[&str] = &[
+    "created_at",
+    "occurred_at",
+    "event_time",
+    "event_timestamp",
+    "transaction_time",
+    "order_date",
+    "purchase_date",
+    "timestamp",
+    "datetime",
+    "date",
+    "time",
+    "updated_at",
+];
 
-    let discovered = Spi::connect_mut(|client| {
-        // Find tables with timestamp columns matching common patterns
-        // Note: Cast sql_identifier columns to text for Rust compatibility
-        let query = format!(
-            r#"
-            SELECT DISTINCT
-                c.table_schema::text,
-                c.table_name::text,
-                c.column_name::text
+/// Auto-discover time indexes by looking for timestamp/date columns with a
+/// common time column name; one per table, the most preferred name wins
+pub(crate) fn discover_time_indexes_impl(schema_name: &str) -> Result<i32, PgFeatureError> {
+    let names: Vec<String> = TIME_COLUMN_NAMES.iter().map(|n| n.to_string()).collect();
+    let discovered = Spi::get_one_with_args::<i64>(
+        r#"
+        WITH candidates AS (
+            SELECT DISTINCT ON (c.table_name)
+                   c.table_schema::text AS schema_name,
+                   c.table_name::text AS table_name,
+                   c.column_name::text AS time_column
             FROM information_schema.columns c
             JOIN information_schema.tables t
                 ON c.table_schema = t.table_schema AND c.table_name = t.table_name
-            WHERE c.table_schema = '{}'
+            WHERE c.table_schema = $1
               AND t.table_type = 'BASE TABLE'
-              AND (c.data_type LIKE '%timestamp%' OR c.data_type = 'date')
-              AND (
-                  {}
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM pgft.time_indexes ti
-                  WHERE ti.schema_name = c.table_schema::text AND ti.table_name = c.table_name::text
-              )
-            ORDER BY c.table_name, c.column_name
-            "#,
-            escape_literal(schema_name),
-            time_column_patterns
-                .iter()
-                .map(|p| format!("LOWER(c.column_name::text) = '{}'", p))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        );
-
-        let result = client.select(&query, None, &[])?;
-
-        // Collect rows first since we need mutable client for updates
-        let mut rows = Vec::new();
-        for row in result {
-            let table_schema: String = row.get(1)?.unwrap_or_default();
-            let table_name: String = row.get(2)?.unwrap_or_default();
-            let column_name: String = row.get(3)?.unwrap_or_default();
-            rows.push((table_schema, table_name, column_name));
-        }
-
-        let mut count = 0;
-        let mut seen_tables = std::collections::HashSet::new();
-
-        for (table_schema, table_name, column_name) in rows {
-            // Only register one time index per table (first match wins)
-            let table_key = format!("{}.{}", table_schema, table_name);
-            if seen_tables.contains(&table_key) {
-                continue;
-            }
-            seen_tables.insert(table_key);
-
-            // Insert the time index
-            let insert_sql = format!(
-                r#"
-                INSERT INTO pgft.time_indexes (schema_name, table_name, time_column)
-                VALUES ('{}', '{}', '{}')
-                ON CONFLICT (schema_name, table_name) DO NOTHING
-                "#,
-                escape_literal(&table_schema),
-                escape_literal(&table_name),
-                escape_literal(&column_name)
-            );
-            Spi::run(&insert_sql)?;
-            count += 1;
-        }
-
-        Ok::<_, pgrx::spi::Error>(count)
-    })?;
-
-    Ok(discovered)
+              AND c.data_type::text IN ('timestamp without time zone', 'timestamp with time zone', 'date')
+              AND LOWER(c.column_name::text) = ANY($2)
+            ORDER BY c.table_name, array_position($2, LOWER(c.column_name::text))
+        ),
+        ins AS (
+            INSERT INTO pgft.time_indexes (schema_name, table_name, time_column)
+            SELECT * FROM candidates ORDER BY table_name
+            ON CONFLICT (schema_name, table_name) DO NOTHING
+            RETURNING 1
+        )
+        SELECT COUNT(*) FROM ins
+        "#,
+        &[schema_name.into(), names.into()],
+    )?;
+    Ok(discovered.unwrap_or(0) as i32)
 }
 
 /// Get the time index column for a table, if registered

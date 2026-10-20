@@ -7,11 +7,6 @@ use crate::schema::{parse_table_ref, verify_table_exists, TableRef};
 use crate::PgFeatureError;
 use pgrx::prelude::*;
 
-/// Escape a string literal for use in SQL
-fn escape_literal(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
 /// A relationship between two tables
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -51,41 +46,28 @@ pub(crate) fn add_relationship_impl(
         return Err(PgFeatureError::TableNotFound(child_ref.qualified_name()));
     }
 
-    // Insert the relationship
-    let id = Spi::connect_mut(|client| {
-        let rel_name_sql = match relationship_name {
-            Some(name) => format!("'{}'", escape_literal(name)),
-            None => "NULL".to_string(),
-        };
-        let sql = format!(
-            r#"
-            INSERT INTO pgft.relationships
-                (parent_schema, parent_table, parent_column, child_schema, child_table, child_column, relationship_name)
-            VALUES ('{}', '{}', '{}', '{}', '{}', '{}', {})
-            ON CONFLICT (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
-            DO UPDATE SET relationship_name = EXCLUDED.relationship_name, created_at = NOW()
-            RETURNING id
-            "#,
-            escape_literal(&parent_ref.schema),
-            escape_literal(&parent_ref.name),
-            escape_literal(parent_column),
-            escape_literal(&child_ref.schema),
-            escape_literal(&child_ref.name),
-            escape_literal(child_column),
-            rel_name_sql
-        );
-        let mut result = client.select(&sql, None, &[])?;
-
-        if let Some(row) = result.next() {
-            Ok(row
-                .get::<i64>(1)?
-                .ok_or_else(|| PgFeatureError::SqlError("Failed to get inserted id".to_string()))?)
-        } else {
-            Err(PgFeatureError::SqlError(
-                "Insert returned no rows".to_string(),
-            ))
-        }
-    })?;
+    // get_one_with_args writes through a read-write SPI call; a select would be
+    // read-only, and fail, whenever this is the transaction's first write
+    let id = Spi::get_one_with_args::<i64>(
+        r#"
+        INSERT INTO pgft.relationships
+            (parent_schema, parent_table, parent_column, child_schema, child_table, child_column, relationship_name)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
+        DO UPDATE SET relationship_name = EXCLUDED.relationship_name, created_at = NOW()
+        RETURNING id::bigint
+        "#,
+        &[
+            parent_ref.schema.as_str().into(),
+            parent_ref.name.as_str().into(),
+            parent_column.into(),
+            child_ref.schema.as_str().into(),
+            child_ref.name.as_str().into(),
+            child_column.into(),
+            relationship_name.into(),
+        ],
+    )?
+    .ok_or_else(|| PgFeatureError::SqlError("Insert returned no id".to_string()))?;
 
     Ok(id)
 }
@@ -146,153 +128,51 @@ pub(crate) fn list_relationships_impl() -> Result<
 
 /// Remove a relationship by ID
 pub(crate) fn remove_relationship_impl(relationship_id: i64) -> Result<bool, PgFeatureError> {
-    let deleted = Spi::connect_mut(|client| {
-        let sql = format!(
-            "DELETE FROM pgft.relationships WHERE id = {} RETURNING id",
-            relationship_id
-        );
-        let result = client.select(&sql, None, &[])?;
-        // Count the rows returned
-        let mut count = 0;
-        for _ in result {
-            count += 1;
-        }
-        Ok::<_, pgrx::spi::Error>(count > 0)
-    })?;
-
-    Ok(deleted)
+    let deleted = Spi::get_one_with_args::<bool>(
+        "WITH d AS (DELETE FROM pgft.relationships WHERE id = $1 RETURNING 1)
+         SELECT COUNT(*) > 0 FROM d",
+        &[relationship_id.into()],
+    )?;
+    Ok(deleted.unwrap_or(false))
 }
 
 /// Auto-discover relationships from foreign key constraints
+///
+/// Registers every single-column foreign key whose child table is in `schema_name`;
+/// the parent may live in any schema. Composite foreign keys are skipped: a
+/// relationship joins on one column. Returns the number of new relationships.
 pub(crate) fn discover_relationships_impl(schema_name: &str) -> Result<i32, PgFeatureError> {
-    let discovered = Spi::connect_mut(|client| {
-        // Query foreign key constraints
-        // Note: Cast sql_identifier columns to text for Rust compatibility
-        let query = format!(
-            r#"
-            SELECT
-                kcu.table_schema::text AS child_schema,
-                kcu.table_name::text AS child_table,
-                kcu.column_name::text AS child_column,
-                ccu.table_schema::text AS parent_schema,
-                ccu.table_name::text AS parent_table,
-                ccu.column_name::text AS parent_column
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-                ON tc.constraint_name = kcu.constraint_name
-                AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage ccu
-                ON tc.constraint_name = ccu.constraint_name
-                AND tc.table_schema = ccu.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND kcu.table_schema = '{}'
-              AND NOT EXISTS (
-                  SELECT 1 FROM pgft.relationships r
-                  WHERE r.parent_schema = ccu.table_schema::text
-                    AND r.parent_table = ccu.table_name::text
-                    AND r.parent_column = ccu.column_name::text
-                    AND r.child_schema = kcu.table_schema::text
-                    AND r.child_table = kcu.table_name::text
-                    AND r.child_column = kcu.column_name::text
-              )
-            ORDER BY kcu.table_name, kcu.column_name
-            "#,
-            escape_literal(schema_name)
-        );
-        let result = client.select(&query, None, &[])?;
-
-        // Collect rows first since we need to run inserts
-        let mut rows = Vec::new();
-        for row in result {
-            let child_schema: String = row.get(1)?.unwrap_or_default();
-            let child_table: String = row.get(2)?.unwrap_or_default();
-            let child_column: String = row.get(3)?.unwrap_or_default();
-            let parent_schema: String = row.get(4)?.unwrap_or_default();
-            let parent_table: String = row.get(5)?.unwrap_or_default();
-            let parent_column: String = row.get(6)?.unwrap_or_default();
-            rows.push((
-                child_schema,
-                child_table,
-                child_column,
-                parent_schema,
-                parent_table,
-                parent_column,
-            ));
-        }
-
-        let mut count = 0;
-        for (child_schema, child_table, child_column, parent_schema, parent_table, parent_column) in
-            rows
-        {
-            // Insert the relationship
-            let insert_sql = format!(
-                r#"
-                INSERT INTO pgft.relationships
-                    (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
-                VALUES ('{}', '{}', '{}', '{}', '{}', '{}')
-                ON CONFLICT (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
-                DO NOTHING
-                "#,
-                escape_literal(&parent_schema),
-                escape_literal(&parent_table),
-                escape_literal(&parent_column),
-                escape_literal(&child_schema),
-                escape_literal(&child_table),
-                escape_literal(&child_column)
-            );
-            Spi::run(&insert_sql)?;
-            count += 1;
-        }
-
-        Ok::<_, pgrx::spi::Error>(count)
-    })?;
-
-    Ok(discovered)
-}
-
-/// Get all relationships for a target table (where target is the parent)
-#[allow(dead_code)]
-pub(crate) fn get_child_relationships(
-    target: &TableRef,
-) -> Result<Vec<Relationship>, PgFeatureError> {
-    let relationships = Spi::connect(|client| {
-        let sql = format!(
-            r#"
-            SELECT id, parent_schema, parent_table, parent_column,
-                   child_schema, child_table, child_column, relationship_name
-            FROM pgft.relationships
-            WHERE parent_schema = '{}' AND parent_table = '{}'
-            ORDER BY child_table, child_column
-            "#,
-            escape_literal(&target.schema),
-            escape_literal(&target.name)
-        );
-        let result = client.select(&sql, None, &[])?;
-
-        let mut rels = Vec::new();
-        for row in result {
-            let id: i64 = row.get(1)?.unwrap_or(0);
-            let parent_schema: String = row.get(2)?.unwrap_or_default();
-            let parent_table: String = row.get(3)?.unwrap_or_default();
-            let parent_column: String = row.get(4)?.unwrap_or_default();
-            let child_schema: String = row.get(5)?.unwrap_or_default();
-            let child_table: String = row.get(6)?.unwrap_or_default();
-            let child_column: String = row.get(7)?.unwrap_or_default();
-            let relationship_name: Option<String> = row.get(8)?;
-
-            rels.push(Relationship {
-                id,
-                parent: TableRef::new(&parent_schema, &parent_table),
-                parent_column,
-                child: TableRef::new(&child_schema, &child_table),
-                child_column,
-                name: relationship_name,
-            });
-        }
-        Ok::<_, pgrx::spi::Error>(rels)
-    })?;
-
-    Ok(relationships)
+    let discovered = Spi::get_one_with_args::<i64>(
+        r#"
+        WITH fks AS (
+            SELECT pn.nspname::text AS parent_schema, pc.relname::text AS parent_table,
+                   pa.attname::text AS parent_column,
+                   cn.nspname::text AS child_schema, cc.relname::text AS child_table,
+                   ca.attname::text AS child_column
+            FROM pg_constraint con
+            JOIN pg_class cc ON cc.oid = con.conrelid
+            JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+            JOIN pg_class pc ON pc.oid = con.confrelid
+            JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            JOIN pg_attribute ca ON ca.attrelid = con.conrelid AND ca.attnum = con.conkey[1]
+            JOIN pg_attribute pa ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[1]
+            WHERE con.contype = 'f'
+              AND cardinality(con.conkey) = 1
+              AND cn.nspname = $1
+        ),
+        ins AS (
+            INSERT INTO pgft.relationships
+                (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
+            SELECT * FROM fks ORDER BY child_table, child_column
+            ON CONFLICT (parent_schema, parent_table, parent_column, child_schema, child_table, child_column)
+            DO NOTHING
+            RETURNING 1
+        )
+        SELECT COUNT(*) FROM ins
+        "#,
+        &[schema_name.into()],
+    )?;
+    Ok(discovered.unwrap_or(0) as i32)
 }
 
 /// Get all relationships in the registry

@@ -102,6 +102,17 @@ Each release's `SHA256SUMS` covers its bottles. Runtime libraries are not bundle
 OpenCASCADE 7.6 (Debian 12 / Ubuntu 24.04; build from source against 7.8),
 pg_xarray needs PostGIS, and pg_image's ONNX functions need ONNX Runtime.
 
+Releases from v0.7.2 also carry darwin-arm64 bottles (Apple Silicon, macOS 14+; Intel Macs build
+from source). These link Homebrew's libraries at their versioned paths. In v0.7.2 the pg_solid
+bottle needs exactly the Homebrew `opencascade` it was built against (7.9.x): after `brew upgrade
+opencascade` moves to another version, `CREATE EXTENSION pg_solid` fails with "Library not
+loaded"; build pg_solid from source (`pgx install <checkout>/extensions/pg_solid`) or install the
+bottle of a later release. Later releases build their darwin bottles in CI, and pg_solid, pg_xarray
+and pg_ml link the pinned kegs of the (private) `matroidbe/eidos` Homebrew tap, which `brew
+upgrade` does not replace; `pgx install --bottle <url> --install-deps` installs the keg. pgx
+refuses a bottle whose linked libraries are missing, so a mismatch shows up at install time rather
+than at `CREATE EXTENSION`.
+
 #### From source
 
 ```bash

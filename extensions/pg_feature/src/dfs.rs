@@ -2,17 +2,25 @@
 //!
 //! The core algorithm for automated feature generation from relational data.
 //! Generates features by traversing relationships and applying primitives.
+//! Generation itself (`generate_features`) is pure: it works on a
+//! `SchemaInfo` snapshot loaded up front.
 
-use crate::primitives::{get_primitives_by_name, is_applicable, Primitive};
+use crate::primitives::STACKABLE_OUTER;
+use crate::primitives::{get_primitives_by_name, is_applicable, is_numeric, Input, Prim};
 use crate::relationships::{get_all_relationships, Relationship};
-use crate::schema::{get_table_columns, parse_table_ref, PgType, TableRef};
+use crate::schema::{
+    get_primary_key_columns, get_table_columns, parse_table_ref, quote_identifier, ColumnInfo,
+    PgType, TableRef,
+};
 use crate::sql_gen::{CutoffSpec, IfExists, SqlGenerator};
 use crate::time_indexes::get_time_index;
 use crate::{get_max_features, PgFeatureError};
 use pgrx::datum::TimestampWithTimeZone;
 use pgrx::prelude::*;
-use std::collections::HashMap;
-use std::fmt;
+use std::collections::{HashMap, HashSet};
+
+/// PostgreSQL's identifier length limit (NAMEDATALEN - 1)
+const MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// Escape a string literal for use in SQL
 fn escape_literal(s: &str) -> String {
@@ -20,55 +28,82 @@ fn escape_literal(s: &str) -> String {
 }
 
 /// A generated feature specification
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FeatureSpec {
     /// Name of the feature (e.g., "orders_COUNT", "orders_SUM_amount")
     pub name: String,
-    /// The primitive used to generate this feature
-    pub primitive: Box<dyn Primitive>,
-    /// Source table for the feature
+    /// The primitive applied last (the outer one at depth 2)
+    pub primitive: Prim,
+    /// The grandchild-level primitive of a depth-2 feature
+    pub inner: Option<Prim>,
+    /// Table the base column lives in
     pub source_table: TableRef,
-    /// Source column for the feature
+    /// Base column (the key column for row counts, the time index for time primitives)
     pub source_column: String,
+    /// Relationships from the target down to `source_table`; empty for transforms
+    pub path: Vec<Relationship>,
     /// Depth at which this feature was generated
     pub depth: i32,
     /// Human-readable description
     pub description: String,
-    /// Feature type ("aggregation" or "transform")
-    pub feature_type: String,
     /// Rolling window interval (e.g., "30 days", "90 days") - None means all-time
     pub window: Option<String>,
 }
 
-// Manual Debug implementation since Box<dyn Primitive> doesn't implement Debug
-impl fmt::Debug for FeatureSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FeatureSpec")
-            .field("name", &self.name)
-            .field("primitive", &self.primitive.name())
-            .field("source_table", &self.source_table)
-            .field("source_column", &self.source_column)
-            .field("depth", &self.depth)
-            .field("description", &self.description)
-            .field("feature_type", &self.feature_type)
-            .field("window", &self.window)
-            .finish()
+impl FeatureSpec {
+    /// "aggregation" or "transform"
+    pub fn feature_type(&self) -> &'static str {
+        if self.path.is_empty() {
+            "transform"
+        } else {
+            "aggregation"
+        }
+    }
+
+    /// Primitive as stored in the catalog: `mean(sum)` for stacked features
+    pub fn primitive_label(&self) -> String {
+        match self.inner {
+            Some(inner) => format!("{}({})", self.primitive.name(), inner.name()),
+            None => self.primitive.name().to_string(),
+        }
     }
 }
 
-// Implement Clone for Box<dyn Primitive>
-impl Clone for Box<dyn Primitive> {
-    fn clone(&self) -> Self {
-        // Since we can't clone trait objects directly, we need to use a workaround
-        // We'll recreate the primitive based on its name
-        let name = self.name();
-        get_primitives_by_name(&[name.to_string()], self.is_aggregation())
+/// Columns, keys and time indexes of the tables DFS touches
+#[derive(Debug, Default)]
+pub struct SchemaInfo {
+    pub columns: HashMap<TableRef, Vec<ColumnInfo>>,
+    pub primary_keys: HashMap<TableRef, Vec<String>>,
+    pub time_indexes: HashMap<TableRef, String>,
+}
+
+impl SchemaInfo {
+    fn columns(&self, table: &TableRef) -> Result<&[ColumnInfo], PgFeatureError> {
+        self.columns
+            .get(table)
+            .map(Vec::as_slice)
+            .ok_or_else(|| PgFeatureError::TableNotFound(table.qualified_name()))
+    }
+
+    /// Columns that identify rows rather than describe them: the primary key
+    /// and both sides of every relationship touching the table
+    fn key_columns(&self, table: &TableRef, rels: &[Relationship]) -> HashSet<String> {
+        let mut keys: HashSet<String> = self
+            .primary_keys
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
             .into_iter()
-            .next()
-            .unwrap_or_else(|| {
-                // Fallback: create a Count primitive
-                Box::new(crate::primitives::Count)
-            })
+            .collect();
+        for r in rels {
+            if &r.child == table {
+                keys.insert(r.child_column.clone());
+            }
+            if &r.parent == table {
+                keys.insert(r.parent_column.clone());
+            }
+        }
+        keys
     }
 }
 
@@ -99,102 +134,97 @@ pub(crate) fn synthesize_features_impl(
     output_name: &str,
     if_exists: &str,
 ) -> Result<SynthesisResult, PgFeatureError> {
-    // Parse target table
     let target_ref = parse_table_ref(target_table)?;
-
-    // Parse output table
     let output_ref = parse_table_ref(output_name)?;
 
-    // Parse if_exists
     let exists_behavior = IfExists::from_str(if_exists).ok_or_else(|| {
         PgFeatureError::InvalidParameter(format!("Invalid if_exists: {}", if_exists))
     })?;
+    if exists_behavior == IfExists::Error && relation_exists(&output_ref)? {
+        return Err(PgFeatureError::InvalidParameter(format!(
+            "{} already exists (use if_exists => 'replace')",
+            output_ref.qualified_name()
+        )));
+    }
 
-    // Get primitives (needed early for relationships)
-    let agg_prims = get_primitives_by_name(agg_primitives, true);
-    let trans_prims = get_primitives_by_name(trans_primitives, false);
+    let agg_prims =
+        get_primitives_by_name(agg_primitives, true).map_err(PgFeatureError::InvalidParameter)?;
+    let trans_prims = get_primitives_by_name(trans_primitives, false)
+        .map_err(PgFeatureError::InvalidParameter)?;
 
-    // Get relationships (needed for auto-cutoff generation)
-    let all_relationships = get_all_relationships()?;
-
-    // Filter relationships to included tables if specified
-    let relationships: Vec<Relationship> = if let Some(included_tables) = tables {
-        let included_refs: Vec<TableRef> = included_tables
-            .iter()
-            .filter_map(|t| parse_table_ref(t).ok())
-            .collect();
-
-        all_relationships
-            .into_iter()
-            .filter(|r| {
-                included_refs.iter().any(|t| t == &r.parent)
-                    && included_refs.iter().any(|t| t == &r.child)
-            })
-            .collect()
-    } else {
-        all_relationships
-    };
-
-    // Build time index map
-    let mut time_indexes: HashMap<String, String> = HashMap::new();
-    for rel in &relationships {
-        if let Ok(Some(time_col)) = get_time_index(&rel.child) {
-            time_indexes.insert(rel.child.qualified_name(), time_col);
+    check_cutoff_modes(
+        cutoff_time.is_some(),
+        cutoff_times_table.is_some(),
+        cutoff_interval.is_some(),
+    )?;
+    if let Some(interval) = cutoff_interval {
+        if !is_positive_interval(interval)? {
+            return Err(PgFeatureError::InvalidParameter(format!(
+                "cutoff_interval must be a positive interval, got '{}'",
+                interval
+            )));
+        }
+    }
+    for window in windows.unwrap_or(&[]) {
+        if !is_positive_interval(window)? {
+            return Err(PgFeatureError::InvalidParameter(format!(
+                "window '{}' is not a positive interval",
+                window
+            )));
         }
     }
 
-    // Track if we created a temp cutoff table (for cleanup)
-    let mut temp_cutoff_table: Option<String> = None;
+    let relationships = filter_relationships(&target_ref, get_all_relationships()?, tables)?;
+
+    let schema = load_schema(&target_ref, &relationships)?;
+    require_column(&target_ref, schema.columns(&target_ref)?, target_id)?;
 
     // Build cutoff specification
+    let mut cutoffs_table_used = cutoff_times_table.map(str::to_string);
     let cutoff_spec = if let Some(cutoff_table) = cutoff_times_table {
-        let table_ref = parse_table_ref(cutoff_table)?;
+        let table = parse_table_ref(cutoff_table)?;
+        let columns = get_table_columns(&table)?;
+        require_column(&table, &columns, target_id)?;
+        require_column(&table, &columns, cutoff_time_column)?;
         CutoffSpec::PerEntity {
-            table: table_ref,
+            table,
             id_column: target_id.to_string(),
             time_column: cutoff_time_column.to_string(),
         }
     } else if let Some(interval) = cutoff_interval {
-        // Auto-generate cutoffs from data
-        let temp_table_name = format!("pgft._cutoffs_{}", project_name.replace('-', "_"));
-        temp_cutoff_table = Some(temp_table_name.clone());
-
-        // Generate cutoffs using time bounds from related tables
+        // Kept after the build: the matrix reads from it, and REFRESH needs it
+        let table = TableRef::new("pgft", &format!("_cutoffs_{}", project_name));
         generate_auto_cutoffs(
             &target_ref,
             target_id,
             interval,
             &relationships,
-            &time_indexes,
-            &temp_table_name,
+            &schema.time_indexes,
+            &table,
         )?;
-
-        let table_ref = parse_table_ref(&temp_table_name)?;
+        cutoffs_table_used = Some(table.qualified_name());
         CutoffSpec::PerEntity {
-            table: table_ref,
+            table,
             id_column: target_id.to_string(),
             time_column: "cutoff_time".to_string(),
         }
     } else if let Some(cutoff) = cutoff_time {
-        // Format timestamp for SQL
-        let cutoff_str = format!("'{}'", cutoff.to_iso_string());
-        CutoffSpec::Single(cutoff_str)
+        CutoffSpec::Single(format!("'{}'::timestamptz", cutoff.to_iso_string()))
     } else {
         CutoffSpec::None
     };
 
-    // Generate features using DFS algorithm (now with windows support)
     let features = generate_features(
         &target_ref,
         target_id,
         &relationships,
+        &schema,
         &agg_prims,
         &trans_prims,
         max_depth,
-        windows,
+        windows.unwrap_or(&[]),
     )?;
 
-    // Check feature limit
     let max_features = get_max_features();
     if features.len() > max_features as usize {
         return Err(PgFeatureError::FeatureGenError(format!(
@@ -204,68 +234,42 @@ pub(crate) fn synthesize_features_impl(
         )));
     }
 
-    // Determine if we should generate _train and _live views
-    let generate_views = matches!(cutoff_spec, CutoffSpec::PerEntity { .. });
-
-    // Build SQL generator
     let generator = SqlGenerator {
-        target: target_ref.clone(),
-        target_id: target_id.to_string(),
-        features: features.clone(),
-        relationships: relationships.clone(),
-        time_indexes: time_indexes.clone(),
-        cutoff: cutoff_spec.clone(),
-        output: output_ref.clone(),
-        if_exists: exists_behavior,
+        target: &target_ref,
+        target_id,
+        features: &features,
+        time_indexes: &schema.time_indexes,
     };
 
-    // Generate and execute SQL
-    let statements = generator.generate();
-    let mut row_count = 0i64;
+    for sql in generator.matrix_statements(&output_ref, &cutoff_spec, exists_behavior) {
+        Spi::run(&sql)?;
+    }
+    let row_count = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM {}",
+        output_ref.sql_identifier()
+    ))?
+    .unwrap_or(0);
 
-    Spi::connect_mut(|client| {
-        for sql in &statements {
-            Spi::run(sql)?;
+    // _train and _live views when using per-entity cutoffs
+    if matches!(cutoff_spec, CutoffSpec::PerEntity { .. }) {
+        for suffix in ["_train", "_live"] {
+            Spi::run(&format!(
+                "DROP VIEW IF EXISTS {}.{}",
+                quote_identifier(&output_ref.schema),
+                quote_identifier(&format!("{}{}", output_ref.name, suffix))
+            ))?;
         }
-
-        // Get row count from the output
-        let count_query = format!("SELECT COUNT(*) FROM {}", output_ref.sql_identifier());
-        let mut result = client.select(&count_query, None, &[])?;
-        if let Some(row) = result.next() {
-            row_count = row.get::<i64>(1)?.unwrap_or(0);
-        }
-
-        Ok::<_, PgFeatureError>(())
-    })?;
-
-    // Generate _train and _live views if using per-entity cutoffs
-    if generate_views {
-        generate_auxiliary_views(
-            &target_ref,
-            target_id,
-            &features,
-            &relationships,
-            &time_indexes,
-            &output_ref,
-        )?;
+        Spi::run(&generator.train_view_sql(&output_ref))?;
+        Spi::run(&generator.live_view_sql(&output_ref))?;
     }
 
-    // Clean up temp cutoff table if we created one
-    if let Some(temp_table) = temp_cutoff_table {
-        let drop_sql = format!("DROP TABLE IF EXISTS {} CASCADE", temp_table);
-        Spi::run(&drop_sql)?;
-    }
-
-    // Store feature definitions
     store_feature_definitions(project_name, &features)?;
-
-    // Store feature matrix metadata
     store_feature_matrix_metadata(
         project_name,
         &target_ref,
         target_id,
         cutoff_time,
-        cutoff_times_table,
+        cutoffs_table_used.as_deref(),
         cutoff_interval,
         windows,
         &output_ref,
@@ -281,66 +285,400 @@ pub(crate) fn synthesize_features_impl(
     })
 }
 
-/// Generate features using DFS algorithm
-fn generate_features(
+/// Only one way of choosing cutoffs may be given
+fn check_cutoff_modes(single: bool, table: bool, interval: bool) -> Result<(), PgFeatureError> {
+    if [single, table, interval].iter().filter(|m| **m).count() > 1 {
+        return Err(PgFeatureError::InvalidParameter(
+            "pass only one of cutoff_time, cutoff_times_table and cutoff_interval".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Keep the relationships among the target and the listed tables; the target is
+/// always included, so `tables` only needs to name the related tables
+fn filter_relationships(
+    target: &TableRef,
+    relationships: Vec<Relationship>,
+    tables: Option<&[String]>,
+) -> Result<Vec<Relationship>, PgFeatureError> {
+    let Some(tables) = tables else {
+        return Ok(relationships);
+    };
+    let mut included = vec![target.clone()];
+    for t in tables {
+        included.push(parse_table_ref(t)?);
+    }
+    Ok(relationships
+        .into_iter()
+        .filter(|r| included.contains(&r.parent) && included.contains(&r.child))
+        .collect())
+}
+
+/// Whether `value` is an interval greater than zero; a value that is not an
+/// interval at all raises PostgreSQL's own input error
+fn is_positive_interval(value: &str) -> Result<bool, PgFeatureError> {
+    Ok(
+        Spi::get_one_with_args::<bool>("SELECT $1::interval > interval '0'", &[value.into()])?
+            .unwrap_or(false),
+    )
+}
+
+fn require_column(
+    table: &TableRef,
+    columns: &[ColumnInfo],
+    column: &str,
+) -> Result<(), PgFeatureError> {
+    if columns.iter().any(|c| c.name == column) {
+        Ok(())
+    } else {
+        Err(PgFeatureError::ColumnNotFound(
+            table.qualified_name(),
+            column.to_string(),
+        ))
+    }
+}
+
+fn relation_exists(table: &TableRef) -> Result<bool, PgFeatureError> {
+    Ok(Spi::get_one_with_args::<bool>(
+        "SELECT to_regclass($1) IS NOT NULL",
+        &[table.sql_identifier().into()],
+    )?
+    .unwrap_or(false))
+}
+
+/// Load columns, primary keys and time indexes for the target, its children
+/// and its grandchildren
+fn load_schema(
+    target: &TableRef,
+    relationships: &[Relationship],
+) -> Result<SchemaInfo, PgFeatureError> {
+    let mut tables = vec![target.clone()];
+    for rel in relationships.iter().filter(|r| &r.parent == target) {
+        tables.push(rel.child.clone());
+        for gc in relationships.iter().filter(|r| r.parent == rel.child) {
+            tables.push(gc.child.clone());
+        }
+    }
+
+    let mut schema = SchemaInfo::default();
+    for table in tables {
+        if schema.columns.contains_key(&table) {
+            continue;
+        }
+        schema
+            .columns
+            .insert(table.clone(), get_table_columns(&table)?);
+        schema
+            .primary_keys
+            .insert(table.clone(), get_primary_key_columns(&table)?);
+        if let Some(tc) = get_time_index(&table)? {
+            schema.time_indexes.insert(table, tc);
+        }
+    }
+    Ok(schema)
+}
+
+/// Window configurations: all-time, plus each window if the rows have a time index
+fn window_configs(windows: &[String], has_time_index: bool) -> Vec<Option<String>> {
+    let mut configs = vec![None];
+    if has_time_index {
+        configs.extend(windows.iter().map(|w| Some(w.clone())));
+    }
+    configs
+}
+
+/// Name for a related table in feature names; disambiguated by the foreign key
+/// when the parent has several relationships to the same table
+fn table_label(rel: &Relationship, rels: &[Relationship]) -> String {
+    let parallel = rels
+        .iter()
+        .filter(|r| r.parent == rel.parent && r.child == rel.child)
+        .count();
+    if parallel > 1 {
+        format!("{}_{}", rel.child.name, rel.child_column)
+    } else {
+        rel.child.name.clone()
+    }
+}
+
+fn with_window(name: String, window: &Option<String>) -> String {
+    match window {
+        None => name,
+        Some(w) => format!("{}_{}", name, window_to_suffix(w)),
+    }
+}
+
+fn window_phrase(window: &Option<String>) -> String {
+    match window {
+        None => String::new(),
+        Some(w) => format!(" in last {}", w),
+    }
+}
+
+/// An input to an aggregation at one level: (primitive, column, column type, name part)
+struct AggInput {
+    prim: Prim,
+    column: String,
+    column_type: PgType,
+    /// "" for row/time inputs, "_{column}" for column inputs
+    name_part: String,
+}
+
+/// Every aggregation applicable to a table, in feature order:
+/// row/time primitives first, then per column, per primitive
+fn aggregation_inputs(
+    table: &TableRef,
+    key_column: &str,
+    schema: &SchemaInfo,
+    rels: &[Relationship],
+    aggs: &[Prim],
+) -> Result<Vec<AggInput>, PgFeatureError> {
+    let time = schema.time_indexes.get(table);
+    let mut inputs = Vec::new();
+    for &p in aggs {
+        match p.input() {
+            Input::Rows => inputs.push(AggInput {
+                prim: p,
+                column: key_column.to_string(),
+                column_type: PgType::Other,
+                name_part: String::new(),
+            }),
+            Input::TimeIndex => {
+                if let Some(tc) = time {
+                    inputs.push(AggInput {
+                        prim: p,
+                        column: tc.clone(),
+                        column_type: PgType::Timestamp,
+                        name_part: String::new(),
+                    })
+                }
+            }
+            Input::Column => {}
+        }
+    }
+    let keys = schema.key_columns(table, rels);
+    for column in schema.columns(table)? {
+        if keys.contains(&column.name) {
+            continue;
+        }
+        for &p in aggs {
+            if is_applicable(p, column.pg_type) && (!p.needs_time_index() || time.is_some()) {
+                inputs.push(AggInput {
+                    prim: p,
+                    column: column.name.clone(),
+                    column_type: column.pg_type,
+                    name_part: format!("_{}", column.name),
+                });
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+/// Generate features using the DFS algorithm
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_features(
     target: &TableRef,
     target_id: &str,
     relationships: &[Relationship],
-    agg_primitives: &[Box<dyn Primitive>],
-    trans_primitives: &[Box<dyn Primitive>],
+    schema: &SchemaInfo,
+    agg_primitives: &[Prim],
+    trans_primitives: &[Prim],
     max_depth: i32,
-    windows: Option<&[String]>,
+    windows: &[String],
 ) -> Result<Vec<FeatureSpec>, PgFeatureError> {
     let mut features = Vec::new();
 
-    // Get target table columns for transform features
-    let target_columns = get_table_columns(target)?;
-
-    // Generate transform features on target table (no window support for transforms)
-    for column in &target_columns {
-        // Skip the primary key
+    // Depth 0: transforms of target columns
+    for column in schema.columns(target)? {
         if column.name == target_id {
             continue;
         }
-
-        for primitive in trans_primitives {
-            if is_applicable(primitive.as_ref(), column.pg_type) {
-                let feature_name = format!("{}_{}", column.name, primitive.name().to_uppercase());
-                let description = format!(
-                    "{} of {} from {}",
-                    primitive.description(),
-                    column.name,
-                    target.name
-                );
-
+        for &primitive in trans_primitives {
+            if is_applicable(primitive, column.pg_type) {
                 features.push(FeatureSpec {
-                    name: feature_name,
-                    primitive: primitive.clone(),
+                    name: format!("{}_{}", column.name, primitive.name().to_uppercase()),
+                    primitive,
+                    inner: None,
                     source_table: target.clone(),
                     source_column: column.name.clone(),
+                    path: vec![],
                     depth: 0,
-                    description,
-                    feature_type: "transform".to_string(),
+                    description: format!(
+                        "{} of {} from {}",
+                        primitive.description(),
+                        column.name,
+                        target.name
+                    ),
                     window: None,
                 });
             }
         }
     }
 
-    // Generate aggregation features at each depth level
-    for depth in 1..=max_depth {
-        let new_features = generate_depth_features(
-            target,
-            relationships,
-            agg_primitives,
-            trans_primitives,
-            depth,
-            windows,
-        )?;
-        features.extend(new_features);
+    let child_rels: Vec<&Relationship> = relationships
+        .iter()
+        .filter(|r| &r.parent == target)
+        .collect();
+
+    // Depth 1: aggregations of each child
+    if max_depth >= 1 {
+        for rel in &child_rels {
+            let label = table_label(rel, relationships);
+            let has_time = schema.time_indexes.contains_key(&rel.child);
+            let inputs = aggregation_inputs(
+                &rel.child,
+                &rel.child_column,
+                schema,
+                relationships,
+                agg_primitives,
+            )?;
+            for input in &inputs {
+                for window in window_configs(windows, has_time) {
+                    features.push(FeatureSpec {
+                        name: with_window(
+                            format!(
+                                "{}_{}{}",
+                                label,
+                                input.prim.name().to_uppercase(),
+                                input.name_part
+                            ),
+                            &window,
+                        ),
+                        primitive: input.prim,
+                        inner: None,
+                        source_table: rel.child.clone(),
+                        source_column: input.column.clone(),
+                        path: vec![(*rel).clone()],
+                        depth: 1,
+                        description: format!(
+                            "{} of {} from {}{} grouped by {}",
+                            input.prim.description(),
+                            input.column,
+                            rel.child.name,
+                            window_phrase(&window),
+                            rel.parent.name
+                        ),
+                        window,
+                    });
+                }
+            }
+        }
     }
 
+    // Depth 2: aggregate each child's aggregation of its grandchildren
+    if max_depth >= 2 {
+        let outers: Vec<Prim> = agg_primitives
+            .iter()
+            .copied()
+            .filter(|p| STACKABLE_OUTER.contains(&p.name()))
+            .collect();
+
+        for rel in &child_rels {
+            let label = table_label(rel, relationships);
+            let grandchild_rels = relationships
+                .iter()
+                .filter(|r| r.parent == rel.child && r.child != *target && r.id != rel.id);
+            for gc_rel in grandchild_rels {
+                let gc_label = table_label(gc_rel, relationships);
+                let has_time = schema.time_indexes.contains_key(&rel.child)
+                    || schema.time_indexes.contains_key(&gc_rel.child);
+                let inputs = aggregation_inputs(
+                    &gc_rel.child,
+                    &gc_rel.child_column,
+                    schema,
+                    relationships,
+                    agg_primitives,
+                )?;
+                for input in inputs
+                    .iter()
+                    .filter(|i| is_numeric(i.prim.output_type(i.column_type)))
+                {
+                    for &outer in &outers {
+                        for window in window_configs(windows, has_time) {
+                            features.push(FeatureSpec {
+                                name: with_window(
+                                    format!(
+                                        "{}_{}_{}_{}{}",
+                                        label,
+                                        outer.name().to_uppercase(),
+                                        gc_label,
+                                        input.prim.name().to_uppercase(),
+                                        input.name_part
+                                    ),
+                                    &window,
+                                ),
+                                primitive: outer,
+                                inner: Some(input.prim),
+                                source_table: gc_rel.child.clone(),
+                                source_column: input.column.clone(),
+                                path: vec![(*rel).clone(), gc_rel.clone()],
+                                depth: 2,
+                                description: format!(
+                                    "{} of ({} of {} from {}) from {}{} grouped by {}",
+                                    outer.description(),
+                                    input.prim.description(),
+                                    input.column,
+                                    gc_rel.child.name,
+                                    rel.child.name,
+                                    window_phrase(&window),
+                                    target.name
+                                ),
+                                window,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    finalize_names(&mut features, target_id)?;
     Ok(features)
+}
+
+/// FNV-1a, for stable short suffixes
+fn fnv1a(s: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Fit a name into PostgreSQL's identifier limit, keeping it unique
+pub fn fit_identifier(name: &str) -> String {
+    if name.len() <= MAX_IDENTIFIER_BYTES {
+        return name.to_string();
+    }
+    let suffix = format!("_{:08x}", fnv1a(name));
+    let mut cut = MAX_IDENTIFIER_BYTES - suffix.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &name[..cut], suffix)
+}
+
+/// Shorten over-long names and reject duplicates
+fn finalize_names(features: &mut [FeatureSpec], target_id: &str) -> Result<(), PgFeatureError> {
+    let mut seen: HashSet<String> = [target_id.to_string(), "cutoff_time".to_string()]
+        .into_iter()
+        .collect();
+    for f in features.iter_mut() {
+        if f.name.len() > MAX_IDENTIFIER_BYTES {
+            f.description = format!("{} [full name: {}]", f.description, f.name);
+            f.name = fit_identifier(&f.name);
+        }
+        if !seen.insert(f.name.clone()) {
+            return Err(PgFeatureError::FeatureGenError(format!(
+                "duplicate feature name '{}'; rename the column or restrict tables/primitives",
+                f.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a window interval string to a suffix (e.g., "30 days" -> "30d")
@@ -359,211 +697,17 @@ pub fn window_to_suffix(window: &str) -> String {
         .replace(' ', "")
 }
 
-/// Generate features at a specific depth level
-fn generate_depth_features(
-    target: &TableRef,
-    relationships: &[Relationship],
-    agg_primitives: &[Box<dyn Primitive>],
-    _trans_primitives: &[Box<dyn Primitive>],
-    depth: i32,
-    windows: Option<&[String]>,
-) -> Result<Vec<FeatureSpec>, PgFeatureError> {
-    let mut features = Vec::new();
-
-    // Build list of windows to generate (None = all-time, Some = specific window)
-    let window_configs: Vec<Option<String>> = {
-        let mut configs = vec![None]; // Always include all-time aggregation
-        if let Some(wins) = windows {
-            for w in wins {
-                configs.push(Some(w.clone()));
-            }
-        }
-        configs
-    };
-
-    // For depth 1, generate features from direct children
-    if depth == 1 {
-        // Find relationships where target is the parent
-        let child_rels: Vec<&Relationship> = relationships
-            .iter()
-            .filter(|r| &r.parent == target)
-            .collect();
-
-        for rel in child_rels {
-            let child_columns = get_table_columns(&rel.child)?;
-
-            for column in &child_columns {
-                // Skip foreign key column
-                if column.name == rel.child_column {
-                    continue;
-                }
-
-                for primitive in agg_primitives {
-                    if is_applicable(primitive.as_ref(), column.pg_type) {
-                        // Generate feature for each window configuration
-                        for window in &window_configs {
-                            let base_name = format!(
-                                "{}_{}{}",
-                                rel.child.name,
-                                primitive.name().to_uppercase(),
-                                if column.name != rel.child.name {
-                                    format!("_{}", column.name)
-                                } else {
-                                    String::new()
-                                }
-                            );
-
-                            let feature_name = match window {
-                                None => base_name,
-                                Some(w) => format!("{}_{}", base_name, window_to_suffix(w)),
-                            };
-
-                            let description = match window {
-                                None => format!(
-                                    "{} of {} from {} grouped by {}",
-                                    primitive.description(),
-                                    column.name,
-                                    rel.child.name,
-                                    rel.parent.name
-                                ),
-                                Some(w) => format!(
-                                    "{} of {} from {} in last {} grouped by {}",
-                                    primitive.description(),
-                                    column.name,
-                                    rel.child.name,
-                                    w,
-                                    rel.parent.name
-                                ),
-                            };
-
-                            features.push(FeatureSpec {
-                                name: feature_name,
-                                primitive: primitive.clone(),
-                                source_table: rel.child.clone(),
-                                source_column: column.name.clone(),
-                                depth,
-                                description,
-                                feature_type: "aggregation".to_string(),
-                                window: window.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // For depth > 1, generate features by aggregating over existing features
-    // This is more complex and requires stacking primitives
-    // For MVP, we support depth 1 and 2
-    if depth == 2 {
-        // Find grandchild relationships (child of child)
-        let child_rels: Vec<&Relationship> = relationships
-            .iter()
-            .filter(|r| &r.parent == target)
-            .collect();
-
-        for rel in &child_rels {
-            // Find relationships where our child is the parent
-            let grandchild_rels: Vec<&Relationship> = relationships
-                .iter()
-                .filter(|r| r.parent == rel.child)
-                .collect();
-
-            for gc_rel in grandchild_rels {
-                let gc_columns = get_table_columns(&gc_rel.child)?;
-
-                for column in &gc_columns {
-                    if column.name == gc_rel.child_column {
-                        continue;
-                    }
-
-                    // For depth 2, we apply two aggregations
-                    // First aggregate from grandchild to child, then from child to target
-                    for inner_prim in agg_primitives {
-                        if !is_applicable(inner_prim.as_ref(), column.pg_type) {
-                            continue;
-                        }
-
-                        // The inner aggregation produces a numeric result
-                        for outer_prim in agg_primitives {
-                            // Outer primitive must work on numeric types
-                            if !is_applicable(outer_prim.as_ref(), PgType::Numeric) {
-                                continue;
-                            }
-
-                            // Generate feature for each window configuration
-                            for window in &window_configs {
-                                let base_name = format!(
-                                    "{}_{}_{}_{}_{}",
-                                    rel.child.name,
-                                    outer_prim.name().to_uppercase(),
-                                    gc_rel.child.name,
-                                    inner_prim.name().to_uppercase(),
-                                    column.name
-                                );
-
-                                let feature_name = match window {
-                                    None => base_name,
-                                    Some(w) => format!("{}_{}", base_name, window_to_suffix(w)),
-                                };
-
-                                let description = match window {
-                                    None => format!(
-                                        "{} of ({} of {} from {}) from {} grouped by {}",
-                                        outer_prim.description(),
-                                        inner_prim.description(),
-                                        column.name,
-                                        gc_rel.child.name,
-                                        rel.child.name,
-                                        target.name
-                                    ),
-                                    Some(w) => format!(
-                                        "{} of ({} of {} from {}) from {} in last {} grouped by {}",
-                                        outer_prim.description(),
-                                        inner_prim.description(),
-                                        column.name,
-                                        gc_rel.child.name,
-                                        rel.child.name,
-                                        w,
-                                        target.name
-                                    ),
-                                };
-
-                                features.push(FeatureSpec {
-                                    name: feature_name,
-                                    primitive: outer_prim.clone(),
-                                    source_table: gc_rel.child.clone(),
-                                    source_column: column.name.clone(),
-                                    depth,
-                                    description,
-                                    feature_type: "aggregation".to_string(),
-                                    window: window.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(features)
-}
-
 /// Store feature definitions in the catalog
 fn store_feature_definitions(
     project_name: &str,
     features: &[FeatureSpec],
 ) -> Result<(), PgFeatureError> {
-    // Clear existing definitions for this project
     let delete_sql = format!(
         "DELETE FROM pgft.feature_definitions WHERE project_name = '{}'",
         escape_literal(project_name)
     );
     Spi::run(&delete_sql)?;
 
-    // Insert new definitions
     for feature in features {
         let insert_sql = format!(
             r#"
@@ -573,8 +717,8 @@ fn store_feature_definitions(
             "#,
             escape_literal(project_name),
             escape_literal(&feature.name),
-            escape_literal(&feature.feature_type),
-            escape_literal(feature.primitive.name()),
+            feature.feature_type(),
+            escape_literal(&feature.primitive_label()),
             escape_literal(&feature.source_column),
             escape_literal(&feature.source_table.qualified_name()),
             feature.depth,
@@ -612,11 +756,11 @@ fn store_feature_matrix_metadata(
         None => "NULL".to_string(),
     };
     let windows_sql = match windows {
-        Some(wins) => {
+        Some(wins) if !wins.is_empty() => {
             let escaped: Vec<String> = wins.iter().map(|w| escape_literal(w)).collect();
             format!("ARRAY['{}']", escaped.join("','"))
         }
-        None => "NULL".to_string(),
+        _ => "NULL".to_string(),
     };
 
     let sql = format!(
@@ -672,95 +816,91 @@ pub(crate) fn make_temporal_cutoffs_impl(
     let target_ref = parse_table_ref(target_table)?;
     let output_ref = parse_table_ref(output_table)?;
 
-    let count = Spi::connect_mut(|client| {
-        // Drop existing table if exists
-        let drop_sql = format!(
-            "DROP TABLE IF EXISTS {} CASCADE",
-            output_ref.sql_identifier()
-        );
-        Spi::run(&drop_sql)?;
+    if num_windows.is_some_and(|n| n < 1) {
+        return Err(PgFeatureError::InvalidParameter(
+            "num_windows must be at least 1".to_string(),
+        ));
+    }
+    if !is_positive_interval(window_size)? {
+        return Err(PgFeatureError::InvalidParameter(format!(
+            "window_size must be a positive interval, got '{}'",
+            window_size
+        )));
+    }
 
-        // Build the generate_series based on parameters
-        let series_clause = if let Some(end) = end_time {
-            format!(
-                "generate_series('{}'::timestamptz, '{}'::timestamptz, '{}'::interval)",
-                start_time.to_iso_string(),
-                end.to_iso_string(),
-                escape_literal(window_size)
-            )
-        } else if let Some(n) = num_windows {
-            format!(
-                "generate_series('{}'::timestamptz, '{}' + ({} - 1) * '{}'::interval, '{}'::interval)",
-                start_time.to_iso_string(),
-                start_time.to_iso_string(),
-                n,
-                escape_literal(window_size),
-                escape_literal(window_size)
-            )
-        } else {
-            return Err(PgFeatureError::InvalidParameter(
-                "Must specify either end_time or num_windows".to_string(),
-            ));
-        };
+    let series_clause = if let Some(end) = end_time {
+        format!(
+            "generate_series('{}'::timestamptz, '{}'::timestamptz, '{}'::interval)",
+            start_time.to_iso_string(),
+            end.to_iso_string(),
+            escape_literal(window_size)
+        )
+    } else if let Some(n) = num_windows {
+        format!(
+            "generate_series('{}'::timestamptz, '{}'::timestamptz + ({} - 1) * '{}'::interval, '{}'::interval)",
+            start_time.to_iso_string(),
+            start_time.to_iso_string(),
+            n,
+            escape_literal(window_size),
+            escape_literal(window_size)
+        )
+    } else {
+        return Err(PgFeatureError::InvalidParameter(
+            "Must specify either end_time or num_windows".to_string(),
+        ));
+    };
 
-        // Create the cutoffs table with cross join
-        let create_sql = format!(
-            "CREATE TABLE {} AS
-             SELECT t.{} AS {}, s AS cutoff_time
-             FROM {} t
-             CROSS JOIN {} s",
-            output_ref.sql_identifier(),
-            target_id,
-            target_id,
-            target_ref.sql_identifier(),
-            series_clause
-        );
-        Spi::run(&create_sql)?;
+    // No CASCADE: a feature matrix built on these cutoffs reads from the table,
+    // so replacing it must fail rather than silently drop the matrix
+    Spi::run(&format!(
+        "DROP TABLE IF EXISTS {}",
+        output_ref.sql_identifier()
+    ))?;
+    let id = quote_identifier(target_id);
+    Spi::run(&format!(
+        "CREATE TABLE {} AS
+         SELECT t.{} AS {}, s AS cutoff_time
+         FROM {} t
+         CROSS JOIN {} s",
+        output_ref.sql_identifier(),
+        id,
+        id,
+        target_ref.sql_identifier(),
+        series_clause
+    ))?;
 
-        // Get row count
-        let count_sql = format!("SELECT COUNT(*) FROM {}", output_ref.sql_identifier());
-        let mut result = client.select(&count_sql, None, &[])?;
-        let count = if let Some(row) = result.next() {
-            row.get::<i64>(1)?.unwrap_or(0)
-        } else {
-            0
-        };
-
-        Ok(count)
-    })?;
-
-    Ok(count)
+    Ok(Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*) FROM {}",
+        output_ref.sql_identifier()
+    ))?
+    .unwrap_or(0))
 }
 
 /// Auto-generate cutoff times from data
 ///
-/// Queries the min/max timestamps from time-indexed tables and generates
-/// evenly-spaced cutoff times at the specified interval.
+/// Queries the min/max timestamps from time-indexed child tables and writes
+/// every target id × every `interval` step between them to `output`.
 fn generate_auto_cutoffs(
     target: &TableRef,
     target_id: &str,
     interval: &str,
     relationships: &[Relationship],
-    time_indexes: &HashMap<String, String>,
-    output_table: &str,
+    time_indexes: &HashMap<TableRef, String>,
+    output: &TableRef,
 ) -> Result<i64, PgFeatureError> {
-    use crate::schema::quote_identifier;
-
-    // Find min/max timestamps from all time-indexed child tables
-    let mut union_parts: Vec<String> = Vec::new();
-
-    for rel in relationships {
-        if &rel.parent == target {
-            if let Some(time_col) = time_indexes.get(&rel.child.qualified_name()) {
-                union_parts.push(format!(
-                    "SELECT MIN({}) AS min_ts, MAX({}) AS max_ts FROM {}",
-                    quote_identifier(time_col),
-                    quote_identifier(time_col),
-                    rel.child.sql_identifier()
-                ));
-            }
-        }
-    }
+    let union_parts: Vec<String> = relationships
+        .iter()
+        .filter(|r| &r.parent == target)
+        .filter_map(|r| {
+            time_indexes.get(&r.child).map(|tc| {
+                format!(
+                    "SELECT MIN({c})::timestamptz AS min_ts, MAX({c})::timestamptz AS max_ts FROM {}",
+                    r.child.sql_identifier(),
+                    c = quote_identifier(tc)
+                )
+            })
+        })
+        .collect();
 
     if union_parts.is_empty() {
         return Err(PgFeatureError::InvalidParameter(
@@ -769,259 +909,45 @@ fn generate_auto_cutoffs(
         ));
     }
 
-    let output_ref = parse_table_ref(output_table)?;
+    let bounds_sql = format!(
+        "SELECT MIN(min_ts), MAX(max_ts) FROM ({}) b",
+        union_parts.join(" UNION ALL ")
+    );
+    let (min_ts, max_ts) =
+        Spi::get_two::<TimestampWithTimeZone, TimestampWithTimeZone>(&bounds_sql)?;
+    let (min_ts, max_ts) = match (min_ts, max_ts) {
+        (Some(min), Some(max)) => (min, max),
+        _ => {
+            return Err(PgFeatureError::InvalidParameter(
+                "Could not determine time bounds from data".to_string(),
+            ))
+        }
+    };
 
-    Spi::connect_mut(|client| {
-        // Find global min/max
-        let bounds_sql = format!(
-            "SELECT MIN(min_ts), MAX(max_ts) FROM ({})",
-            union_parts.join(" UNION ALL ")
-        );
-
-        let result = client.select(&bounds_sql, None, &[])?;
-        let (min_ts, max_ts): (Option<TimestampWithTimeZone>, Option<TimestampWithTimeZone>) =
-            if let Some(row) = result.into_iter().next() {
-                (row.get(1)?, row.get(2)?)
-            } else {
-                (None, None)
-            };
-
-        let (min_ts, max_ts) = match (min_ts, max_ts) {
-            (Some(min), Some(max)) => (min, max),
-            _ => {
-                return Err(PgFeatureError::InvalidParameter(
-                    "Could not determine time bounds from data".to_string(),
-                ))
-            }
-        };
-
-        // Drop existing table if exists
-        let drop_sql = format!(
-            "DROP TABLE IF EXISTS {} CASCADE",
-            output_ref.sql_identifier()
-        );
-        Spi::run(&drop_sql)?;
-
-        // Create the cutoffs table with cross join
-        let create_sql = format!(
-            "CREATE TABLE {} AS
-             SELECT t.{} AS {}, s AS cutoff_time
-             FROM {} t
-             CROSS JOIN generate_series('{}'::timestamptz, '{}'::timestamptz, '{}'::interval) s",
-            output_ref.sql_identifier(),
-            quote_identifier(target_id),
-            quote_identifier(target_id),
-            target.sql_identifier(),
-            min_ts.to_iso_string(),
-            max_ts.to_iso_string(),
-            escape_literal(interval)
-        );
-        Spi::run(&create_sql)?;
-
-        // Get row count
-        let count_sql = format!("SELECT COUNT(*) FROM {}", output_ref.sql_identifier());
-        let mut result = client.select(&count_sql, None, &[])?;
-        let count = if let Some(row) = result.next() {
-            row.get::<i64>(1)?.unwrap_or(0)
-        } else {
-            0
-        };
-
-        Ok(count)
-    })
-}
-
-/// Generate auxiliary views (_train and _live) for ML workflows
-///
-/// Creates:
-/// - {output}_train: View of main table excluding cutoff_time (ML-ready training data)
-/// - {output}_live: View with cutoff = now() for inference
-fn generate_auxiliary_views(
-    target: &TableRef,
-    target_id: &str,
-    features: &[FeatureSpec],
-    relationships: &[Relationship],
-    time_indexes: &HashMap<String, String>,
-    output: &TableRef,
-) -> Result<(), PgFeatureError> {
-    use crate::schema::quote_identifier;
-
-    // Get list of feature columns (everything except cutoff_time)
-    let mut feature_columns: Vec<String> = vec![quote_identifier(target_id)];
-    for feature in features {
-        feature_columns.push(quote_identifier(&feature.name));
-    }
-    let columns_sql = feature_columns.join(", ");
-
-    // Create _train view (excludes cutoff_time)
-    let train_view = format!("{}_train", output.name);
-    let train_sql = format!(
-        "CREATE OR REPLACE VIEW {}.{} AS SELECT {} FROM {}",
-        quote_identifier(&output.schema),
-        quote_identifier(&train_view),
-        columns_sql,
+    // Replacing the previous run's cutoffs also drops the matrix built on them
+    Spi::run(&format!(
+        "DROP TABLE IF EXISTS {} CASCADE",
         output.sql_identifier()
-    );
-    Spi::run(&train_sql)?;
-
-    // Create _live view (uses now() as cutoff)
-    // This requires regenerating the query with now() instead of cutoff table
-    let live_view = format!("{}_live", output.name);
-
-    // Build the live query using LATERAL joins with now() as cutoff
-    let live_sql = generate_live_view_sql(
-        target,
-        target_id,
-        features,
-        relationships,
-        time_indexes,
-        &output.schema,
-        &live_view,
-    )?;
-    Spi::run(&live_sql)?;
-
-    Ok(())
-}
-
-/// Generate SQL for the _live view (cutoff = now())
-fn generate_live_view_sql(
-    target: &TableRef,
-    target_id: &str,
-    features: &[FeatureSpec],
-    relationships: &[Relationship],
-    time_indexes: &HashMap<String, String>,
-    output_schema: &str,
-    view_name: &str,
-) -> Result<String, PgFeatureError> {
-    use crate::schema::quote_identifier;
-
-    // Collect child tables and their features grouped by window
-    let mut child_features: HashMap<String, Vec<&FeatureSpec>> = HashMap::new();
-    for feature in features {
-        if feature.feature_type == "aggregation" && feature.depth == 1 {
-            let key = format!(
-                "{}:{}",
-                feature.source_table.qualified_name(),
-                feature.window.as_deref().unwrap_or("all")
-            );
-            child_features.entry(key).or_default().push(feature);
-        }
-    }
-
-    // Build SELECT columns
-    let mut select_cols: Vec<String> = vec![format!("t.{}", quote_identifier(target_id))];
-
-    // Add transform features
-    for feature in features {
-        if feature.feature_type == "transform" {
-            select_cols.push(format!(
-                "{} AS {}",
-                feature
-                    .primitive
-                    .to_sql(&format!("t.{}", quote_identifier(&feature.source_column))),
-                quote_identifier(&feature.name)
-            ));
-        }
-    }
-
-    // Build LATERAL joins for aggregations
-    let mut lateral_joins: Vec<String> = Vec::new();
-    let mut lateral_idx = 0;
-
-    // Group features by (source_table, window)
-    let mut grouped: HashMap<(String, Option<String>), Vec<&FeatureSpec>> = HashMap::new();
-    for feature in features {
-        if feature.feature_type == "aggregation" && feature.depth == 1 {
-            let key = (
-                feature.source_table.qualified_name(),
-                feature.window.clone(),
-            );
-            grouped.entry(key).or_default().push(feature);
-        }
-    }
-
-    for ((table_name, window), feats) in grouped {
-        let table_ref = parse_table_ref(&table_name)?;
-        let rel = relationships
-            .iter()
-            .find(|r| r.child == table_ref)
-            .ok_or_else(|| {
-                PgFeatureError::TableNotFound(format!("Relationship for {} not found", table_name))
-            })?;
-
-        let time_col = time_indexes.get(&table_name);
-        let alias = format!("agg_{}", lateral_idx);
-
-        // Build aggregation expressions
-        let mut agg_exprs: Vec<String> = Vec::new();
-        for feat in &feats {
-            let expr = if feat.primitive.name() == "count" {
-                "COUNT(*)".to_string()
-            } else {
-                feat.primitive
-                    .to_sql(&format!("child.{}", quote_identifier(&feat.source_column)))
-            };
-            agg_exprs.push(format!("{} AS {}", expr, quote_identifier(&feat.name)));
-        }
-
-        // Build WHERE clause
-        let mut where_parts: Vec<String> = vec![format!(
-            "child.{} = t.{}",
-            quote_identifier(&rel.child_column),
-            quote_identifier(&rel.parent_column)
-        )];
-
-        if let Some(tc) = time_col {
-            // Add cutoff filter (now())
-            where_parts.push(format!("child.{} <= now()", quote_identifier(tc)));
-
-            // Add window filter if specified
-            if let Some(w) = &window {
-                where_parts.push(format!(
-                    "child.{} > (now() - '{}'::interval)",
-                    quote_identifier(tc),
-                    escape_literal(w)
-                ));
-            }
-        }
-
-        let lateral_sql = format!(
-            "LEFT JOIN LATERAL (\n    SELECT {}\n    FROM {} child\n    WHERE {}\n) {} ON true",
-            agg_exprs.join(", "),
-            table_ref.sql_identifier(),
-            where_parts.join(" AND "),
-            alias
-        );
-        lateral_joins.push(lateral_sql);
-
-        // Add to SELECT with COALESCE for COUNT
-        for feat in &feats {
-            let col_ref = format!("{}.{}", alias, quote_identifier(&feat.name));
-            if feat.primitive.name() == "count" {
-                select_cols.push(format!(
-                    "COALESCE({}, 0) AS {}",
-                    col_ref,
-                    quote_identifier(&feat.name)
-                ));
-            } else {
-                select_cols.push(format!("{} AS {}", col_ref, quote_identifier(&feat.name)));
-            }
-        }
-
-        lateral_idx += 1;
-    }
-
-    // Build final SQL
-    let sql = format!(
-        "CREATE OR REPLACE VIEW {}.{} AS\nSELECT {}\nFROM {} t\n{}",
-        quote_identifier(output_schema),
-        quote_identifier(view_name),
-        select_cols.join(",\n       "),
+    ))?;
+    let id = quote_identifier(target_id);
+    Spi::run(&format!(
+        "CREATE TABLE {} AS
+         SELECT t.{} AS {}, s AS cutoff_time
+         FROM {} t
+         CROSS JOIN generate_series('{}'::timestamptz, '{}'::timestamptz, '{}'::interval) s",
+        output.sql_identifier(),
+        id,
+        id,
         target.sql_identifier(),
-        lateral_joins.join("\n")
-    );
+        min_ts.to_iso_string(),
+        max_ts.to_iso_string(),
+        escape_literal(interval)
+    ))?;
 
-    Ok(sql)
+    Ok(
+        Spi::get_one::<i64>(&format!("SELECT COUNT(*) FROM {}", output.sql_identifier()))?
+            .unwrap_or(0),
+    )
 }
 
 /// List features for a project
@@ -1046,7 +972,7 @@ pub(crate) fn list_features_impl(
             SELECT feature_name, feature_type, primitive, base_column, source_table, depth, description
             FROM pgft.feature_definitions
             WHERE project_name = '{}'
-            ORDER BY depth, feature_name
+            ORDER BY id
             "#,
             escape_literal(project_name)
         );
@@ -1120,4 +1046,341 @@ pub(crate) fn explain_feature_impl(
     })?;
 
     Ok(explanation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::get_primitives_by_name;
+
+    fn t(name: &str) -> TableRef {
+        TableRef::new("public", name)
+    }
+
+    fn col(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            pg_type: PgType::from_data_type(data_type),
+            is_nullable: true,
+            ordinal_position: 0,
+        }
+    }
+
+    fn rel(id: i64, parent: &str, pcol: &str, child: &str, ccol: &str) -> Relationship {
+        Relationship {
+            id,
+            parent: t(parent),
+            parent_column: pcol.to_string(),
+            child: t(child),
+            child_column: ccol.to_string(),
+            name: None,
+        }
+    }
+
+    fn prims(names: &[&str], agg: bool) -> Vec<Prim> {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        get_primitives_by_name(&names, agg).unwrap()
+    }
+
+    /// customers <- orders <- items; orders has a time index
+    fn shop() -> (Vec<Relationship>, SchemaInfo) {
+        let rels = vec![
+            rel(1, "customers", "id", "orders", "customer_id"),
+            rel(2, "orders", "id", "items", "order_id"),
+        ];
+        let mut s = SchemaInfo::default();
+        s.columns.insert(
+            t("customers"),
+            vec![
+                col("id", "integer"),
+                col("signup", "date"),
+                col("name", "text"),
+            ],
+        );
+        s.columns.insert(
+            t("orders"),
+            vec![
+                col("id", "integer"),
+                col("customer_id", "integer"),
+                col("amount", "numeric"),
+                col("ordered_at", "timestamp with time zone"),
+                col("channel", "text"),
+            ],
+        );
+        s.columns.insert(
+            t("items"),
+            vec![
+                col("id", "bigint"),
+                col("order_id", "integer"),
+                col("qty", "integer"),
+            ],
+        );
+        s.primary_keys.insert(t("orders"), vec!["id".to_string()]);
+        s.primary_keys.insert(t("items"), vec!["id".to_string()]);
+        s.time_indexes.insert(t("orders"), "ordered_at".to_string());
+        (rels, s)
+    }
+
+    fn names(features: &[FeatureSpec]) -> Vec<&str> {
+        features.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    fn generate(depth: i32, aggs: &[&str], trans: &[&str], windows: &[&str]) -> Vec<FeatureSpec> {
+        let (rels, schema) = shop();
+        let windows: Vec<String> = windows.iter().map(|s| s.to_string()).collect();
+        generate_features(
+            &t("customers"),
+            "id",
+            &rels,
+            &schema,
+            &prims(aggs, true),
+            &prims(trans, false),
+            depth,
+            &windows,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_tables_filter_keeps_target() {
+        let (rels, _) = shop();
+        let kept =
+            filter_relationships(&t("customers"), rels, Some(&["orders".to_string()])).unwrap();
+        // customers <- orders is kept although customers is not listed; orders <- items is not
+        assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn test_tables_filter_rejects_bad_names() {
+        let (rels, _) = shop();
+        assert!(filter_relationships(&t("customers"), rels, Some(&["a.b.c".to_string()])).is_err());
+    }
+
+    #[test]
+    fn test_only_one_cutoff_mode() {
+        assert!(check_cutoff_modes(false, false, false).is_ok());
+        assert!(check_cutoff_modes(true, false, false).is_ok());
+        let err = check_cutoff_modes(true, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only one of cutoff_time, cutoff_times_table and cutoff_interval"));
+    }
+
+    #[test]
+    fn test_count_is_one_feature_per_relationship() {
+        let f = generate(1, &["count"], &[], &[]);
+        assert_eq!(names(&f), vec!["orders_COUNT"]);
+        assert_eq!(f[0].source_column, "customer_id");
+    }
+
+    #[test]
+    fn test_key_columns_are_not_aggregated() {
+        let f = generate(1, &["sum", "max"], &[], &[]);
+        // orders.id (pk) and orders.customer_id (fk) are keys; only amount is numeric
+        assert_eq!(names(&f), vec!["orders_SUM_amount", "orders_MAX_amount"]);
+    }
+
+    #[test]
+    fn test_transforms_skip_target_id() {
+        let f = generate(0, &["count"], &["year", "num_characters"], &[]);
+        assert_eq!(names(&f), vec!["signup_YEAR", "name_NUM_CHARACTERS"]);
+        assert!(f.iter().all(|f| f.feature_type() == "transform"));
+    }
+
+    #[test]
+    fn test_windows_only_for_time_indexed_children() {
+        let f = generate(2, &["count", "sum"], &[], &["30 days"]);
+        assert!(names(&f).contains(&"orders_SUM_amount_30d"));
+        assert!(names(&f).contains(&"orders_COUNT_30d"));
+        // depth-2 window: orders has a time index, so the path does
+        assert!(names(&f).contains(&"orders_SUM_items_SUM_qty_30d"));
+    }
+
+    #[test]
+    fn test_windows_skipped_without_time_index() {
+        let (mut rels, mut schema) = shop();
+        schema.time_indexes.clear();
+        rels.truncate(1);
+        let f = generate_features(
+            &t("customers"),
+            "id",
+            &rels,
+            &schema,
+            &prims(&["count"], true),
+            &[],
+            1,
+            &["30 days".to_string()],
+        )
+        .unwrap();
+        assert_eq!(names(&f), vec!["orders_COUNT"]);
+    }
+
+    #[test]
+    fn test_depth2_stacks_numeric_inner_under_numeric_outer() {
+        let f = generate(2, &["count", "sum", "mean", "mode"], &[], &[]);
+        let d2: Vec<&str> = f
+            .iter()
+            .filter(|f| f.depth == 2)
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            d2,
+            vec![
+                "orders_SUM_items_COUNT",
+                "orders_MEAN_items_COUNT",
+                "orders_SUM_items_SUM_qty",
+                "orders_MEAN_items_SUM_qty",
+                "orders_SUM_items_MEAN_qty",
+                "orders_MEAN_items_MEAN_qty",
+                // the mode of an integer column is numeric, so it stacks too
+                "orders_SUM_items_MODE_qty",
+                "orders_MEAN_items_MODE_qty",
+            ]
+        );
+        let stacked = f
+            .iter()
+            .find(|f| f.name == "orders_MEAN_items_SUM_qty")
+            .unwrap();
+        assert_eq!(stacked.primitive_label(), "mean(sum)");
+        assert_eq!(stacked.path.len(), 2);
+        assert_eq!(stacked.source_table, t("items"));
+        // count/mode are never outer
+        assert!(!d2
+            .iter()
+            .any(|n| n.starts_with("orders_COUNT_") || n.starts_with("orders_MODE_")));
+    }
+
+    #[test]
+    fn test_depth_one_has_no_depth2() {
+        let f = generate(1, &["count", "sum"], &[], &[]);
+        assert!(f.iter().all(|f| f.depth <= 1));
+    }
+
+    #[test]
+    fn test_time_primitives_need_time_index() {
+        let f = generate(2, &["time_since_last", "last", "mean"], &[], &[]);
+        let n = names(&f);
+        assert!(n.contains(&"orders_TIME_SINCE_LAST"));
+        assert!(n.contains(&"orders_LAST_amount"));
+        assert!(n.contains(&"orders_LAST_channel"));
+        // items has no time index: no time-based inner features
+        assert!(!n
+            .iter()
+            .any(|n| n.contains("items_TIME_SINCE_LAST") || n.contains("items_LAST")));
+    }
+
+    #[test]
+    fn test_generation_is_deterministic() {
+        let a = generate(
+            2,
+            &["count", "sum", "mean", "max"],
+            &["year"],
+            &["30 days", "90 days"],
+        );
+        let b = generate(
+            2,
+            &["count", "sum", "mean", "max"],
+            &["year"],
+            &["30 days", "90 days"],
+        );
+        assert_eq!(names(&a), names(&b));
+    }
+
+    #[test]
+    fn test_parallel_relationships_are_disambiguated() {
+        let rels = vec![
+            rel(1, "accounts", "id", "transfers", "from_account"),
+            rel(2, "accounts", "id", "transfers", "to_account"),
+        ];
+        let mut s = SchemaInfo::default();
+        s.columns.insert(t("accounts"), vec![col("id", "integer")]);
+        s.columns.insert(
+            t("transfers"),
+            vec![
+                col("from_account", "integer"),
+                col("to_account", "integer"),
+                col("amount", "numeric"),
+            ],
+        );
+        let f = generate_features(
+            &t("accounts"),
+            "id",
+            &rels,
+            &s,
+            &prims(&["count", "sum"], true),
+            &[],
+            2,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            names(&f),
+            vec![
+                "transfers_from_account_COUNT",
+                "transfers_from_account_SUM_amount",
+                "transfers_to_account_COUNT",
+                "transfers_to_account_SUM_amount",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fit_identifier() {
+        assert_eq!(fit_identifier("short"), "short");
+        let long = "a".repeat(80);
+        let fitted = fit_identifier(&long);
+        assert_eq!(fitted.len(), 63);
+        assert_ne!(fit_identifier(&"a".repeat(81)), fitted);
+        assert_eq!(fit_identifier(&long), fitted);
+    }
+
+    #[test]
+    fn test_duplicate_names_rejected() {
+        let year = prims(&["year"], false)[0];
+        let spec = |name: &str| FeatureSpec {
+            name: name.into(),
+            primitive: year,
+            inner: None,
+            source_table: t("c"),
+            source_column: "d".into(),
+            path: vec![],
+            depth: 0,
+            description: String::new(),
+            window: None,
+        };
+        assert!(finalize_names(&mut [spec("a"), spec("b")], "id").is_ok());
+        assert!(finalize_names(&mut [spec("a"), spec("a")], "id").is_err());
+        // may not shadow the id or cutoff_time columns
+        assert!(finalize_names(&mut [spec("cutoff_time")], "id").is_err());
+        assert!(finalize_names(&mut [spec("id")], "id").is_err());
+    }
+
+    #[test]
+    fn test_long_names_are_fitted() {
+        let year = prims(&["year"], false)[0];
+        let mut f = [FeatureSpec {
+            name: "x".repeat(70),
+            primitive: year,
+            inner: None,
+            source_table: t("c"),
+            source_column: "d".into(),
+            path: vec![],
+            depth: 0,
+            description: "desc".into(),
+            window: None,
+        }];
+        finalize_names(&mut f, "id").unwrap();
+        assert_eq!(f[0].name.len(), 63);
+        assert!(f[0].description.contains(&"x".repeat(70)));
+    }
+
+    #[test]
+    fn test_window_suffix() {
+        assert_eq!(window_to_suffix("30 days"), "30d");
+        assert_eq!(window_to_suffix("1 month"), "1m");
+        assert_eq!(window_to_suffix("3 months"), "3m");
+        assert_eq!(window_to_suffix("1 week"), "1w");
+        assert_eq!(window_to_suffix("1 year"), "1y");
+    }
 }

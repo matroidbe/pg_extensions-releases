@@ -1,0 +1,4 @@
+-- pg_ml 0.3.3 -> 0.3.4
+-- No SQL changes: the embedded Python sets sys.executable to the venv's
+-- Python (PYTHONEXECUTABLE), so joblib workers start on macOS; the embedded
+-- lockfile also resolves for macOS arm64 (design/pg_ml/python-environment.md).

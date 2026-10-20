@@ -66,6 +66,13 @@ create-venv: check-uv
 # Note: This is evaluated lazily, so venv must exist when install runs
 PYTHON_LIB_DIR = $(shell $(VENV_PATH)/bin/python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
 
+# RUSTFLAGS from the environment replaces the rustflags in .cargo/config.toml
+# rather than adding to them, so the macOS `-undefined dynamic_lookup` that
+# file provides must be repeated here or the cdylib fails to link.
+ifeq ($(shell uname -s),Darwin)
+EXTRA_RUSTFLAGS := -C link-arg=-Wl,-undefined,dynamic_lookup
+endif
+
 # Build and install extension
 # Uses rpath to embed Python library path into the .so
 # For system PostgreSQL: uses --sudo flag for pgrx to copy .so files
@@ -75,7 +82,7 @@ install: create-venv
 	@echo "==> Python lib directory: $(PYTHON_LIB_DIR)"
 	PYO3_PYTHON=$(VENV_PATH)/bin/python \
 	PG_ML_VENV_PATH=$(VENV_PATH) \
-	RUSTFLAGS="-C link-arg=-Wl,-rpath,$(PYTHON_LIB_DIR)" \
+	RUSTFLAGS="-C link-arg=-Wl,-rpath,$(PYTHON_LIB_DIR) $(EXTRA_RUSTFLAGS)" \
 	cargo pgrx install --pg-config=$(PG_CONFIG) --release $(if $(NEED_SUDO),--sudo,)
 	@if [ -n "$(IS_SYSTEM_PG)" ]; then \
 		echo "==> System PostgreSQL detected, setting venv ownership to $(PG_USER):$(PG_GROUP)..."; \

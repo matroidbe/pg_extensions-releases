@@ -43,12 +43,15 @@ log "syncing the build venv (uv sync --locked)"
 (cd "$EXT_DIR" && uv sync --locked -q)
 BUILD_PY="$EXT_DIR/.venv/bin/python"
 PY_LIBDIR=$("$BUILD_PY" -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+# RUSTFLAGS replaces .cargo/config.toml's rustflags; repeat its macOS flag.
+MACOS_RUSTFLAGS=""
+[[ "$(uname -s)" == Darwin ]] && MACOS_RUSTFLAGS=" -C link-arg=-Wl,-undefined,dynamic_lookup"
 
 make_scratch_tree "$PG_CONFIG_SRC" "$WORK/pg"
 unlink_extension pg_ml
 log "building and installing pg_ml into $WORK/pg"
 (cd "$EXT_DIR" && env -u PG_CONFIG PYO3_PYTHON="$BUILD_PY" PG_ML_VENV_PATH="$VENV" \
-    RUSTFLAGS="-C link-arg=-Wl,-rpath,$PY_LIBDIR" \
+    RUSTFLAGS="-C link-arg=-Wl,-rpath,$PY_LIBDIR$MACOS_RUSTFLAGS" \
     cargo pgrx install --pg-config "$SCRATCH_CONFIG" >"$WORK/install.log" 2>&1) \
     || { tail -30 "$WORK/install.log" >&2; fail "install (log: $WORK/install.log)"; }
 

@@ -53,7 +53,10 @@ SELECT pgft.remove_time_index('orders');
 
 ### discover_time_indexes
 
-Auto-discover time indexes by scanning for timestamp columns (created_at, updated_at, timestamp, etc.).
+Auto-discover time indexes: timestamp or date columns with a common time column name, one per table.
+Preference order: `created_at`, `occurred_at`, `event_time`, `event_timestamp`, `transaction_time`,
+`order_date`, `purchase_date`, `timestamp`, `datetime`, `date`, `time`, and `updated_at` last (it moves
+when a row changes). Tables that already have a time index are skipped.
 
 ```sql
 SELECT pgft.discover_time_indexes('public');
@@ -62,7 +65,7 @@ SELECT pgft.discover_time_indexes('public');
 **Parameters:**
 - `schema_name TEXT DEFAULT 'public'` - Schema to scan
 
-**Returns:** `INTEGER` - Number of time indexes discovered
+**Returns:** `INTEGER` - Number of time indexes registered
 
 ### add_relationship
 
@@ -106,7 +109,8 @@ SELECT pgft.remove_relationship(1);
 
 ### discover_relationships
 
-Auto-discover relationships from foreign key constraints.
+Auto-discover relationships from the foreign keys of tables in `schema_name` (the referenced table may
+be in any schema). Composite foreign keys are skipped: a relationship joins on one column.
 
 ```sql
 SELECT pgft.discover_relationships('public');
@@ -115,7 +119,7 @@ SELECT pgft.discover_relationships('public');
 **Parameters:**
 - `schema_name TEXT DEFAULT 'public'` - Schema to scan
 
-**Returns:** `INTEGER` - Number of relationships discovered
+**Returns:** `INTEGER` - Number of new relationships registered
 
 ### synthesize_features
 
@@ -157,19 +161,49 @@ SELECT * FROM pgft.synthesize_features(
 - `cutoff_time_column TEXT DEFAULT 'cutoff_time'` - Column name in cutoff table
 - `cutoff_interval TEXT DEFAULT NULL` - Interval for auto-generating cutoffs from data (e.g., '1 month')
 - `windows TEXT[] DEFAULT NULL` - Rolling window intervals for time-relative features (e.g., ['30 days', '90 days'])
-- `tables TEXT[] DEFAULT NULL` - Tables to include (NULL = all related)
-- `agg_primitives TEXT[] DEFAULT NULL` - Aggregation primitives (sum, mean, count, min, max, std)
-- `trans_primitives TEXT[] DEFAULT NULL` - Transform primitives (year, month, day, hour)
-- `max_depth INTEGER DEFAULT NULL` - Maximum feature depth
+- `tables TEXT[] DEFAULT NULL` - Related tables to include (NULL = all related); the target is always included
+- `agg_primitives TEXT[] DEFAULT NULL` - Aggregation primitives (see [Primitives](#primitives); unknown names are an error)
+- `trans_primitives TEXT[] DEFAULT NULL` - Transform primitives (see [Primitives](#primitives))
+- `max_depth INTEGER DEFAULT NULL` - Maximum feature depth (0-2; deeper behaves as 2)
 - `output_name TEXT DEFAULT NULL` - Name for output materialized view
 - `if_exists TEXT DEFAULT 'error'` - 'error' or 'replace'
+
+Pass at most one of `cutoff_time`, `cutoff_times_table` and `cutoff_interval`. `cutoff_interval` and
+every entry of `windows` must be positive intervals. The cutoff table needs the `target_id` column and
+the `cutoff_time_column`.
 
 **Returns:** `TABLE (project_name, feature_count, row_count, output_name)`
 
 **Output Objects (when using per-entity cutoffs):**
 - `{output_name}` - Materialized view with `cutoff_time` column (for train/test splitting, refresh with `REFRESH MATERIALIZED VIEW`)
 - `{output_name}_train` - View selecting from materialized view, excluding `cutoff_time` (ML ready, use `SELECT *`)
-- `{output_name}_live` - View with `cutoff = now()` (for real-time inference)
+- `{output_name}_live` - View with `cutoff = now()` (for real-time inference). Computed with exactly the
+  same SQL expressions as the matrix, so a model scores on the features it was trained on
+
+With `cutoff_interval`, the generated cutoffs are kept in `pgft."_cutoffs_<project_name>"` (the matrix
+reads from it) and replaced on the next run.
+
+**Cutoff semantics:**
+- A child row counts iff its time index is `<= cutoff`; a window `w` also requires `> cutoff - w`.
+  Without a cutoff, windows and `time_since*` are relative to `now()`
+- If the **target** has a time index, an entity only appears at cutoffs at or after its own time
+- Windows are only generated for child tables that have a time index
+- At depth 2, cutoff and windows apply to both the child and the grandchild rows
+
+**Feature names** (columns are in this order, deterministically):
+
+| Feature | Name | Example |
+|---------|------|---------|
+| transform of a target column | `{column}_{PRIM}` | `signup_date_YEAR` |
+| row count / time-index aggregation | `{child}_{PRIM}` | `orders_COUNT`, `orders_TIME_SINCE_LAST` |
+| column aggregation | `{child}_{PRIM}_{column}` | `orders_SUM_amount` |
+| depth 2 (stacked) | `{child}_{OUTER}_{grandchild}_{INNER}[_{column}]` | `orders_MEAN_order_items_SUM_quantity` |
+| windowed | name + `_{suffix}` | `orders_COUNT_30d` |
+
+`COUNT` counts rows (one feature per relationship). Primary keys and relationship key columns of
+child tables are never aggregated. When a parent has two relationships to the same table, `{child}`
+becomes `{child}_{fk_column}`. Names over 63 bytes are shortened with a hash suffix; the full name is
+kept in the feature's description.
 
 ### make_temporal_cutoffs
 
@@ -197,6 +231,10 @@ SELECT pgft.make_temporal_cutoffs(
 
 **Returns:** `BIGINT` - Number of cutoff rows created
 
+An existing `output_table` is replaced, unless a feature matrix was built on it: then the call fails
+(drop or rebuild that matrix first) instead of silently dropping the matrix. `num_windows` must be at
+least 1 and `window_size` positive.
+
 ### list_features
 
 List features generated for a project.
@@ -215,7 +253,7 @@ SELECT * FROM pgft.list_features('customer_features');
 Get human-readable explanation of how a feature was derived.
 
 ```sql
-SELECT pgft.explain_feature('customer_features', 'orders.SUM(amount)');
+SELECT pgft.explain_feature('customer_features', 'orders_SUM_amount');
 ```
 
 **Parameters:**
@@ -223,6 +261,46 @@ SELECT pgft.explain_feature('customer_features', 'orders.SUM(amount)');
 - `feature_name TEXT` - Feature name
 
 **Returns:** `TEXT` - Human-readable explanation
+
+### list_primitives
+
+List the available primitives.
+
+```sql
+SELECT * FROM pgft.list_primitives();
+```
+
+**Returns:** `TABLE (name, primitive_type, input, input_types, needs_time_index, description)`
+
+## Primitives
+
+**Aggregation** (applied to the rows of a child table, per target entity):
+
+| Name | Applies to | Description |
+|------|------------|-------------|
+| `count` | rows | Number of rows |
+| `sum`, `mean`, `std`, `median`, `min`, `max` | numeric columns | |
+| `mode` | int/numeric/bool/text columns | Most common value |
+| `num_unique` | int/numeric/bool/text/date/timestamp columns | Count of distinct values |
+| `percent_true`, `any`, `all` | boolean columns | |
+| `first`, `last` | int/numeric/bool/text columns, needs time index | Earliest / latest value |
+| `trend` | numeric columns, needs time index | Slope of a linear fit, change per day |
+| `time_since_last`, `time_since_first` | time index | Seconds from the latest / earliest row to the cutoff |
+| `avg_time_between` | time index | Average seconds between rows |
+
+At depth 2, an inner aggregation with a numeric result is aggregated again with `sum`, `mean`,
+`std`, `median`, `min` or `max` (when listed in `agg_primitives`).
+
+**Transform** (applied to target table columns):
+
+| Name | Applies to |
+|------|------------|
+| `year`, `quarter`, `month`, `week`, `day`, `weekday`, `is_weekend` | date/timestamp |
+| `hour`, `minute` | timestamp/time |
+| `time_since` | date/timestamp — seconds to the cutoff |
+| `absolute` | numeric |
+| `num_characters`, `num_words` | text |
+| `is_null` | any |
 
 ## Configuration
 

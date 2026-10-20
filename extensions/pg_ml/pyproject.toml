@@ -4,7 +4,45 @@ version = "0.1.0"
 description = "Python dependencies for pg_ml PostgreSQL extension"
 requires-python = ">=3.11,<3.13"  # Pin to 3.11-3.12 for PyCaret/catboost compatibility
 dependencies = [
-    "pycaret[full]>=3.3.0",
+    "pycaret[full]>=3.3.0 ; sys_platform == 'linux'",
+    # macOS arm64 (development only): pycaret[full] minus catboost. PyCaret 3.3
+    # pins catboost<1.2 on Darwin, and no catboost before 1.2 ships a macOS
+    # wheel for Python 3.11/3.12, so [full] is unsatisfiable there. This is
+    # [full]'s own list (PyCaret 3.3.2) without catboost; scikit-learn-intelex
+    # is x86-only and ray/tune-sklearn are skipped on 3.11 by PyCaret itself.
+    "pycaret>=3.3.0,<4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "shap~=0.44.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "interpret>=0.2.7 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "umap-learn>=0.5.2 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pyyaml ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "ydata-profiling>=4.3.1 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "explainerdashboard>=0.3.8 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "fairlearn==0.7.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "kmodes>=0.11.1 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlxtend>=0.19.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "statsforecast>=0.5.5,<1.6.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "hyperopt>=0.2.7 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "optuna>=3.0.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "optuna-integration ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "scikit-optimize>=0.9.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlflow>=2.0.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "gradio>=3.50.2 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "boto3>=1.24.56 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "fastapi ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "uvicorn>=0.17.6 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "m2cgen>=0.9.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "evidently~=0.4.16 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "dask>=2024.4.1 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "distributed>=2024.4.1 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "fugue[dask]~=0.8.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "flask ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "werkzeug>=2.2,<3.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pytest<8.0.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "moto<5.0.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "dash[testing] ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "xgboost>=1.1.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "ray[tune]>=1.0.0 ; python_version != '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "tune-sklearn>=0.2.1 ; python_version != '3.11' and sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlflow>=2.0,<2.10",  # Pin to 2.9.x for PyCaret 3.3 compatibility (2.10+ breaks _active_run_stack)
     "mapie>=0.8.0",  # Conformal prediction for prediction intervals
     "dask<2025",  # Pin to 2024.x; dask 2025+ removed dask.dataframe.core.DataFrame which sktime 0.26 needs
@@ -12,6 +50,7 @@ dependencies = [
 ]
 
 [tool.uv]
-# Only resolve for Linux since pg_ml is a PostgreSQL extension (Linux-only in production)
-environments = ["sys_platform == 'linux'"]
+# Linux is production. macOS arm64 is resolved too so pg_ml can be developed
+# and tested on Apple Silicon; see the darwin block in dependencies above.
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
