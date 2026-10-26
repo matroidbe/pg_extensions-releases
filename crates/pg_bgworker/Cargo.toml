@@ -17,3 +17,5 @@ pg18 = ["pgrx/pg18"]
 
 [dependencies]
 pgrx.workspace = true
+# pthread_sigmask: threads a worker creates must never receive a signal.
+libc = "0.2"

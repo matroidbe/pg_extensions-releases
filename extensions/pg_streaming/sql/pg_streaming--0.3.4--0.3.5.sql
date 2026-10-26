@@ -1,0 +1,3 @@
+-- pg_streaming 0.3.4 -> 0.3.5
+-- No SQL changes: threads the background worker creates for each tick (tokio's blocking pool, connector bridges)
+-- start with every signal blocked, so a SIGHUP no longer crashes the server.

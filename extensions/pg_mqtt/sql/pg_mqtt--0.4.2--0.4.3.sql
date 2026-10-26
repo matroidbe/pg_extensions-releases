@@ -1,0 +1,3 @@
+-- pg_mqtt 0.4.2 -> 0.4.3
+-- No SQL changes: threads the background worker creates for its server's tokio runtime
+-- start with every signal blocked, so a SIGHUP no longer crashes the server.

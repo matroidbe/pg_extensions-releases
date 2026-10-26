@@ -4,6 +4,33 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## v0.7.4 — 2026-10-26
+
+Extension versions: pg_kafka 0.3.4, pg_s3 0.3.4, pg_git 0.3.4, pg_delta 0.3.4,
+pg_mqtt 0.4.3, pg_ml 0.3.5, pg_ortools 0.3.5, pg_streaming 0.3.5. No SQL
+changes; each has an empty upgrade script.
+
+**A signal no longer crashes the server through a worker's threads.** pgrx's
+bgworker signal handlers call into PostgreSQL, and panic ("postgres FFI may not
+be called from multiple threads") when the kernel delivers the signal to any
+thread but the worker's main one. A SIGHUP is enough, and pg_aurum sends one on
+every pipeline deploy. On a rayon thread the panic aborts the process and the
+postmaster restarts every session on the server. Threads a worker creates now
+start with every signal blocked (`pg_bgworker::with_signals_blocked`):
+
+- pg_kafka, pg_s3, pg_mqtt and pg_git: their server's tokio runtime.
+- pg_ml and pg_ortools: each job (Python, BLAS, OpenMP and solver threads).
+- pg_delta and pg_streaming: each tick (tokio's blocking pool, connector bridges).
+
+**Linuxbrew bottles of pg_ml, pg_solid and pg_xarray (#179, #180).** The
+linux-amd64 bottles of these three are built on Linuxbrew, against the
+`matroidbe/eidos` tap's kegs (`eidos-python@3.11`, `eidos-opencascade@7.9`,
+`eidos-hdf5@1.14` and `eidos-netcdf@4.9`), as the darwin-arm64 ones are. pg_ml
+was never bottled on Linux before. The Debian bottles of pg_solid and
+pg_xarray could not run in the tap's PostgreSQL: pg_solid linked Debian's OCCT
+7.6, and pg_xarray had no NetCDF or GRIB readers. pg_solid now links
+`TKXSBase` for every OCCT, which GNU ld needs.
+
 ## v0.7.3 — 2026-10-20
 
 **pg_feature reworked against Featuretools (0.4.0, #168).** The matrix, `_train`

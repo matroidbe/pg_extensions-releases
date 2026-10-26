@@ -132,6 +132,11 @@ pub fn toolkits(version: Option<(u32, u32)>) -> Vec<&'static str> {
         "TKMesh",      // BRepMesh_IncrementalMesh for STL tessellation
         "TKOffset",    // Offset/shell operations (BRepOffsetAPI_MakeOffsetShape)
         "TKHLR",       // Hidden Line Removal for 2D projection
+        // Data-exchange base (XSControl_Reader, IFSelect_*, Interface_*). Still
+        // its own toolkit after the 7.8 rename. Without it ld64's
+        // dynamic_lookup hides the gap on macOS, but GNU ld fails pgrx's embed
+        // binary with "undefined symbol: vtable for XSControl_Reader".
+        "TKXSBase",
     ];
 
     if uses_tkde_dataexchange(version) {
@@ -139,9 +144,7 @@ pub fn toolkits(version: Option<(u32, u32)>) -> Vec<&'static str> {
         libs.push("TKDESTEP"); // STEP import/export (STEPControl_Reader/Writer)
         libs.push("TKDEIGES"); // IGES import/export (IGESControl_Reader/Writer)
     } else {
-        // OCCT < 7.8: per-protocol STEP toolkits, plus the shared data-exchange
-        // base (TKXSBase) that the TKDE* libraries later subsumed.
-        libs.push("TKXSBase"); // Data-exchange base (IFSelect_*, Interface_*)
+        // OCCT < 7.8: per-protocol STEP toolkits.
         libs.push("TKSTEPBase");
         libs.push("TKSTEPAttr");
         libs.push("TKSTEP209");
@@ -352,6 +355,10 @@ mod tests {
             assert!(
                 !libs.contains(&"TKSTEP"),
                 "{version:?} must not link the removed TKSTEP"
+            );
+            assert!(
+                libs.contains(&"TKXSBase"),
+                "{version:?} still needs the data-exchange base"
             );
         }
     }

@@ -1,0 +1,3 @@
+-- pg_ml 0.3.4 -> 0.3.5
+-- No SQL changes: threads the background worker creates for each training job (Python, BLAS and OpenMP threads)
+-- start with every signal blocked, so a SIGHUP no longer crashes the server.

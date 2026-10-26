@@ -73,7 +73,7 @@ Self-contained tools — no dependencies on other pg_extensions, useful in any c
 
 #### Prebuilt bottles (no compiler)
 
-Every release attaches a prebuilt bottle of each extension (except pg_ml) for
+Every release attaches a prebuilt bottle of each extension for
 PostgreSQL 18 on linux-amd64 (glibc 2.36+: Debian 12+, Ubuntu 24.04+, the
 official `postgres:18` images) to the
 [public release](https://github.com/matroidbe/pg_extensions-releases/releases).
@@ -85,6 +85,10 @@ the file name carries the extension's own version:
 pgx install --configure --set pg_kafka.database=app --bottle \
   https://github.com/matroidbe/pg_extensions-releases/releases/download/vX.Y.Z/pg_kafka-<version>-pg18-linux-amd64.tar.gz
 ```
+
+The linux-amd64 pg_ml bottle (from v0.7.3) is the exception to that host list: it embeds
+the (private) `matroidbe/eidos` tap's Python and runs only in that tap's Linuxbrew
+`eidos-postgresql@18`, with `eidos-python@3.11` installed.
 
 `--configure` writes the server settings the extension needs to a conf.d
 drop-in: `shared_preload_libraries`, and for extensions with background

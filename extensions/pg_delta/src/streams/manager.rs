@@ -322,7 +322,9 @@ pub fn run_stream_manager() -> Result<(), Box<dyn std::error::Error + Send + Syn
 
         // Process streams (only if not shutting down)
         if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            manager.tick();
+            // Threads created during the tick (tokio's blocking pool, a library's) must
+            // never receive a signal: pg_bgworker::with_signals_blocked.
+            pg_bgworker::with_signals_blocked(|| manager.tick());
         }
 
         // Idle wait — see comment at top of loop. Returns false on SIGTERM

@@ -122,9 +122,11 @@ pub extern "C-unwind" fn pg_streaming_executor_main(arg: pg_sys::Datum) {
         if BackgroundWorker::sigterm_received() {
             break;
         }
+        // Threads created during the tick (connector bridges, tokio's blocking
+        // pool) must never receive a signal: pg_bgworker::with_signals_blocked.
         let busy = loop_round(slot)
             && BackgroundWorker::transaction(std::panic::AssertUnwindSafe(|| {
-                run_executor_tick(worker_id, &mut compiled)
+                pg_bgworker::with_signals_blocked(|| run_executor_tick(worker_id, &mut compiled))
             }));
         wait = next_poll_wait(
             wait,

@@ -133,9 +133,72 @@ pub fn exit_for_restart() -> ! {
     unreachable!("proc_exit returned")
 }
 
+/// Run `f` with every signal blocked on this thread, so that the threads
+/// created while it runs (a tokio runtime, a rayon or OpenMP pool, Python's)
+/// are created with every signal blocked and never receive one.
+///
+/// A thread inherits the signal mask of the thread that creates it, and the
+/// kernel may deliver a process-directed signal to any thread that does not
+/// block it. pgrx's bgworker handlers (`attach_signal_handlers`) call into
+/// PostgreSQL, so on any thread but the main one they panic with "postgres FFI
+/// may not be called from multiple threads": on a rayon thread that aborts the
+/// process, and the postmaster then restarts every session on the server. A
+/// SIGHUP is enough, and pg_aurum sends one on every pipeline deploy.
+///
+/// A signal sent while `f` runs stays pending and is handled on this thread
+/// when the mask is restored, including when `f` unwinds. Wrap a worker's unit
+/// of work (one job, one tick), or the construction of a long-lived runtime.
+pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(libc::sigset_t);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: restores the mask saved below, on the same thread.
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+        }
+    }
+    // SAFETY: changes only this thread's own signal mask.
+    let _restore = unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+        Restore(old)
+    };
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocked(sig: libc::c_int) -> bool {
+        unsafe {
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+            libc::sigismember(&cur, sig) == 1
+        }
+    }
+
+    #[test]
+    fn a_thread_created_inside_inherits_the_block_and_the_caller_gets_its_mask_back() {
+        assert!(!blocked(libc::SIGHUP));
+        let child = with_signals_blocked(|| {
+            assert!(blocked(libc::SIGHUP));
+            std::thread::spawn(|| blocked(libc::SIGHUP) && blocked(libc::SIGTERM))
+        });
+        assert!(
+            child.join().unwrap(),
+            "a thread created inside must block signals"
+        );
+        assert!(!blocked(libc::SIGHUP), "the caller's mask must be restored");
+    }
+
+    #[test]
+    fn the_mask_is_restored_when_the_body_unwinds() {
+        let r = std::panic::catch_unwind(|| with_signals_blocked(|| panic!("boom")));
+        assert!(r.is_err());
+        assert!(!blocked(libc::SIGHUP));
+    }
 
     #[test]
     fn primary_setting_wins() {

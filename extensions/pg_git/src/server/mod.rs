@@ -38,10 +38,14 @@ pub fn run_server(host: &str, port: u16) -> Result<(), Box<dyn std::error::Error
     let (bridge, mut receiver): (SpiBridge, SpiReceiver) = SpiBridge::waking_worker(256);
     let bridge: Arc<SpiBridge> = Arc::new(bridge);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    // Its threads must never receive a signal: pgrx's handler panics off the
+    // main thread (pg_bgworker::with_signals_blocked).
+    let runtime = pg_bgworker::with_signals_blocked(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+    })?;
 
     let host_owned = host.to_string();
     let bridge_clone = bridge.clone();

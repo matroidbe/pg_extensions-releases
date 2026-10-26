@@ -440,7 +440,9 @@ pub extern "C-unwind" fn pg_ortools_solver_worker_main(_arg: pg_sys::Datum) {
                 let problem = job.problem_name.clone();
 
                 // Solve OUTSIDE the claim transaction; run_job manages its own.
-                if let Err(e) = run_job(job) {
+                // The solver's threads must never receive a signal:
+                // pg_bgworker::with_signals_blocked.
+                if let Err(e) = pg_bgworker::with_signals_blocked(|| run_job(job)) {
                     let msg = e.to_string();
                     pgrx::log!("pg_ortools_solver: job {} failed: {}", job_id, msg);
                     let _ = BackgroundWorker::transaction(|| jobs::fail_job(job_id, &msg));

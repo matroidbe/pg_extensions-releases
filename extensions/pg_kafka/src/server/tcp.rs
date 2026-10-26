@@ -116,10 +116,14 @@ pub fn run_server(
     let bridge = Arc::new(bridge);
 
     // Create the tokio runtime
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
+    // Its threads must never receive a signal: pgrx's handler panics off the
+    // main thread (pg_bgworker::with_signals_blocked).
+    let runtime = pg_bgworker::with_signals_blocked(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+    })?;
 
     // Spawn the server task
     let host_owned = host.to_string();

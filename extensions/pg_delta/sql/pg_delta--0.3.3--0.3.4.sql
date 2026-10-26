@@ -1,0 +1,3 @@
+-- pg_delta 0.3.3 -> 0.3.4
+-- No SQL changes: threads the background worker creates for each stream tick (tokio's blocking pool)
+-- start with every signal blocked, so a SIGHUP no longer crashes the server.

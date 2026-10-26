@@ -1,0 +1,3 @@
+-- pg_ortools 0.3.4 -> 0.3.5
+-- No SQL changes: threads the background worker creates for each solve job (solver threads)
+-- start with every signal blocked, so a SIGHUP no longer crashes the server.

@@ -920,7 +920,9 @@ pub extern "C-unwind" fn pg_ml_training_worker_main(_arg: pg_sys::Datum) {
                 let job_id = job.id;
                 let project = job.project_name.clone();
 
-                if let Err(e) = process_training_job(job) {
+                // Training's threads (Python, BLAS, OpenMP) must never receive a
+                // signal: pg_bgworker::with_signals_blocked.
+                if let Err(e) = pg_bgworker::with_signals_blocked(|| process_training_job(job)) {
                     let msg = e.to_string();
                     pgrx::log!("pg_ml_training: job {} failed: {}", job_id, msg);
                     if let Err(fail_err) = BackgroundWorker::transaction(|| fail_job(job_id, &msg))
