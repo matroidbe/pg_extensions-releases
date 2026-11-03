@@ -1,8 +1,8 @@
 //! MQTT-specific storage queries
 //!
 //! This module provides the high-level storage operations for MQTT:
-//! - Storing published messages
 //! - Managing subscriptions
+//! - Reading retained messages and the outbox
 //! - Session management
 //! - Topic wildcard matching
 
@@ -21,7 +21,40 @@ pub struct Subscription {
     pub client_id: String,
     pub topic_filter: String,
     pub qos: i16,
+    /// Forward the RETAIN flag as published instead of clearing it
+    pub retain_as_published: bool,
+    /// Do not deliver the client's own publishes (No Local)
+    pub no_local: bool,
+    /// When it was made, in microseconds since the epoch: a message reaching a
+    /// worker through the outbox goes only to subscriptions as old as itself
+    pub created_micros: i64,
 }
+
+/// A retained message from the database
+#[derive(Debug, Clone)]
+pub struct RetainedMessage {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: i16,
+    /// PUBLISH property block (codec::encode_publish_properties)
+    pub properties: Vec<u8>,
+}
+
+/// Every subscription of every client, in subscription_from_row's columns
+pub const SUBSCRIPTIONS_SQL: &str =
+    "SELECT client_id, topic_filter, qos, retain_as_published, no_local,
+            (extract(epoch FROM created_at) * 1000000)::bigint
+     FROM pgmqtt.subscriptions";
+
+/// Columns of the subscription queries, in subscription_from_row's order
+pub const SUBSCRIPTION_COLUMNS: [ColumnType; 6] = [
+    ColumnType::Text,
+    ColumnType::Text,
+    ColumnType::Int32,
+    ColumnType::Bool,
+    ColumnType::Bool,
+    ColumnType::Int64,
+];
 
 impl MqttStorageClient {
     /// Create a new MQTT storage client
@@ -29,53 +62,80 @@ impl MqttStorageClient {
         Self { bridge }
     }
 
-    /// Store a published message
-    pub async fn store_message(
-        &self,
-        topic: &str,
-        payload: Option<&[u8]>,
-        qos: i16,
-        retain: bool,
-    ) -> Result<i64, SpiError> {
-        let sql = "INSERT INTO pgmqtt.messages (topic, payload, qos, retain)
-                   VALUES ($1, $2, $3, $4)
-                   RETURNING message_id";
-
-        self.bridge
-            .query_one_i64(
-                sql,
-                vec![
-                    SpiParam::Text(Some(topic.to_string())),
-                    SpiParam::Bytea(payload.map(|p| p.to_vec())),
-                    SpiParam::Int4(Some(qos as i32)),
-                    SpiParam::Bool(Some(retain)),
-                ],
-            )
-            .await
-    }
-
-    /// Add or update a subscription for a client
+    /// Add or update a subscription for a client. Returns true when the
+    /// subscription is new, false when it replaced an existing one (MQTT 5
+    /// retain handling 1 sends retained messages only for new ones).
     pub async fn add_subscription(
         &self,
         client_id: &str,
         topic_filter: &str,
         qos: i16,
-    ) -> Result<(), SpiError> {
-        let sql = "INSERT INTO pgmqtt.subscriptions (client_id, topic_filter, qos)
-                   VALUES ($1, $2, $3)
+        retain_as_published: bool,
+        no_local: bool,
+    ) -> Result<bool, SpiError> {
+        let sql = "INSERT INTO pgmqtt.subscriptions
+                       (client_id, topic_filter, qos, retain_as_published, no_local)
+                   VALUES ($1, $2, $3, $4, $5)
                    ON CONFLICT (client_id, topic_filter)
-                   DO UPDATE SET qos = EXCLUDED.qos";
+                   DO UPDATE SET qos = EXCLUDED.qos,
+                                 retain_as_published = EXCLUDED.retain_as_published,
+                                 no_local = EXCLUDED.no_local
+                   RETURNING (xmax = 0)";
 
-        self.bridge
-            .execute(
+        let result = self
+            .bridge
+            .query(
                 sql,
                 vec![
                     SpiParam::Text(Some(client_id.to_string())),
                     SpiParam::Text(Some(topic_filter.to_string())),
                     SpiParam::Int4(Some(qos as i32)),
+                    SpiParam::Bool(Some(retain_as_published)),
+                    SpiParam::Bool(Some(no_local)),
+                ],
+                vec![ColumnType::Bool],
+            )
+            .await?;
+        Ok(result
+            .first()
+            .and_then(|row| row.get_bool(0))
+            .unwrap_or(true))
+    }
+
+    /// Retained messages whose topic matches a filter
+    ///
+    /// Filtered in Rust (`topic_matches`), like subscriptions.
+    pub async fn get_matching_retained(
+        &self,
+        topic_filter: &str,
+    ) -> Result<Vec<RetainedMessage>, SpiError> {
+        let result = self
+            .bridge
+            .query(
+                "SELECT topic, payload, qos, properties FROM pgmqtt.retained ORDER BY topic",
+                vec![],
+                vec![
+                    ColumnType::Text,
+                    ColumnType::Bytea,
+                    ColumnType::Int32,
+                    ColumnType::Bytea,
                 ],
             )
-            .await
+            .await?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let topic = row.get_string(0)?;
+                topic_matches(topic_filter, &topic).then(|| RetainedMessage {
+                    topic,
+                    payload: row.get_bytes(1).unwrap_or_default(),
+                    qos: row.get_i32(2).unwrap_or(0) as i16,
+                    properties: row.get_bytes(3).unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     /// Remove a subscription for a client
@@ -107,63 +167,14 @@ impl MqttStorageClient {
             .await
     }
 
-    /// Get all subscriptions that match a topic
-    ///
-    /// MQTT wildcards are matched in Rust (`topic_matches`):
-    /// - `+` matches exactly one topic level
-    /// - `#` matches zero or more topic levels (must be last)
-    pub async fn get_matching_subscriptions(
-        &self,
-        topic: &str,
-    ) -> Result<Vec<Subscription>, SpiError> {
-        // For simplicity in MVP, we fetch all subscriptions and filter in Rust
-        // This is not optimal for large subscription counts, but works for MVP
-        let mut subs = self.get_all_subscriptions().await?;
-        subs.retain(|s| topic_matches(&s.topic_filter, topic));
-        Ok(subs)
-    }
-
     /// Get every subscription of every client
     pub async fn get_all_subscriptions(&self) -> Result<Vec<Subscription>, SpiError> {
-        let sql = "SELECT client_id, topic_filter, qos FROM pgmqtt.subscriptions";
-
         let result = self
             .bridge
-            .query(
-                sql,
-                vec![],
-                vec![ColumnType::Text, ColumnType::Text, ColumnType::Int32],
-            )
+            .query(SUBSCRIPTIONS_SQL, vec![], SUBSCRIPTION_COLUMNS.to_vec())
             .await?;
 
-        Ok(result
-            .rows
-            .iter()
-            .map(|row| Subscription {
-                client_id: row.get_string(0).unwrap_or_default(),
-                topic_filter: row.get_string(1).unwrap_or_default(),
-                qos: row.get_i32(2).unwrap_or(0) as i16,
-            })
-            .collect())
-    }
-
-    /// Enqueue a message for the other workers (design/pg_mqtt/fanout.md)
-    pub async fn enqueue_outbox(
-        &self,
-        topic: &str,
-        payload: &[u8],
-        origin_worker: i32,
-    ) -> Result<(), SpiError> {
-        self.bridge
-            .execute(
-                fanout::ENQUEUE_SQL,
-                vec![
-                    SpiParam::Text(Some(topic.to_string())),
-                    SpiParam::Bytea(Some(payload.to_vec())),
-                    SpiParam::Int4(Some(origin_worker)),
-                ],
-            )
-            .await
+        Ok(result.rows.iter().map(subscription_from_row).collect())
     }
 
     /// Read outbox rows of transactions that finished since `cursor`, skipping
@@ -181,13 +192,31 @@ impl MqttStorageClient {
                     SpiParam::Text(cursor.map(|c| c.to_string())),
                     SpiParam::Int4(Some(worker_id)),
                 ],
-                vec![ColumnType::Text, ColumnType::Text, ColumnType::Bytea],
+                vec![
+                    ColumnType::Text,
+                    ColumnType::Text,
+                    ColumnType::Bytea,
+                    ColumnType::Int32,
+                    ColumnType::Bool,
+                    ColumnType::Bytea,
+                    ColumnType::Text,
+                    ColumnType::Int64,
+                ],
             )
             .await?;
         let rows = result
             .rows
             .iter()
-            .map(|r| (r.get_string(0), r.get_string(1), r.get_bytes(2)))
+            .map(|r| fanout::PollRow {
+                horizon: r.get_string(0),
+                topic: r.get_string(1),
+                payload: r.get_bytes(2),
+                qos: r.get_i32(3).ok(),
+                retain: r.get_bool(4),
+                properties: r.get_bytes(5),
+                origin_client: r.get_string(6),
+                created_micros: r.get_i64(7).ok(),
+            })
             .collect();
         fanout::parse_poll(rows).map_err(SpiError::TypeConversion)
     }
@@ -207,32 +236,20 @@ impl MqttStorageClient {
         &self,
         client_id: &str,
     ) -> Result<Vec<Subscription>, SpiError> {
-        let sql =
-            "SELECT client_id, topic_filter, qos FROM pgmqtt.subscriptions WHERE client_id = $1";
+        let sql = "SELECT client_id, topic_filter, qos, retain_as_published, no_local,
+                          (extract(epoch FROM created_at) * 1000000)::bigint
+                   FROM pgmqtt.subscriptions WHERE client_id = $1";
 
         let result = self
             .bridge
             .query(
                 sql,
                 vec![SpiParam::Text(Some(client_id.to_string()))],
-                vec![ColumnType::Text, ColumnType::Text, ColumnType::Int32],
+                SUBSCRIPTION_COLUMNS.to_vec(),
             )
             .await?;
 
-        let mut subs = Vec::new();
-        for row in &result.rows {
-            let client_id = row.get_string(0).unwrap_or_default();
-            let topic_filter = row.get_string(1).unwrap_or_default();
-            let qos = row.get_i32(2).unwrap_or(0) as i16;
-
-            subs.push(Subscription {
-                client_id,
-                topic_filter,
-                qos,
-            });
-        }
-
-        Ok(subs)
+        Ok(result.rows.iter().map(subscription_from_row).collect())
     }
 
     /// Create or update a client session
@@ -266,6 +283,18 @@ impl MqttStorageClient {
     }
 }
 
+/// A subscription from a SUBSCRIPTIONS_SQL row
+pub fn subscription_from_row(row: &super::SpiRow) -> Subscription {
+    Subscription {
+        client_id: row.get_string(0).unwrap_or_default(),
+        topic_filter: row.get_string(1).unwrap_or_default(),
+        qos: row.get_i32(2).unwrap_or(0) as i16,
+        retain_as_published: row.get_bool(3).unwrap_or(false),
+        no_local: row.get_bool(4).unwrap_or(false),
+        created_micros: row.get_i64(5).unwrap_or(0),
+    }
+}
+
 /// Check if a topic matches an MQTT topic filter
 ///
 /// MQTT topic filter wildcards:
@@ -276,6 +305,12 @@ impl MqttStorageClient {
 /// - `sensors/+/temperature` matches `sensors/room1/temperature`
 /// - `sensors/#` matches `sensors`, `sensors/room1`, `sensors/room1/temp`
 pub fn topic_matches(filter: &str, topic: &str) -> bool {
+    // A filter starting with a wildcard does not match a topic starting
+    // with $ (MQTT 5 4.7.2)
+    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+
     let filter_parts: Vec<&str> = filter.split('/').collect();
     let topic_parts: Vec<&str> = topic.split('/').collect();
 
@@ -375,6 +410,13 @@ mod tests {
         assert!(topic_matches("#", "anything"));
         assert!(topic_matches("#", "sensors/room1/temperature"));
         assert!(topic_matches("#", ""));
+    }
+
+    #[test]
+    fn test_wildcards_do_not_match_dollar_topics() {
+        assert!(!topic_matches("#", "$SYS/broker"));
+        assert!(!topic_matches("+/broker", "$SYS/broker"));
+        assert!(topic_matches("$SYS/#", "$SYS/broker"));
     }
 
     #[test]

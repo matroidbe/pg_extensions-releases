@@ -1,0 +1,82 @@
+# pg_mqtt's MQTT support profile, checked by run_paho.py against the Eclipse
+# Paho interoperability suites (interoperability/client_test5.py for MQTT 5,
+# client_test.py for MQTT 3.1.1).
+#
+# required: in the profile; the test must pass.
+# exempt:   not supported (yet); the reason says why and what the broker does
+#           instead. These are the backlog for full MQTT 5.
+#
+# The profile is what the UNS+ MVP needs: Sparkplug B edge nodes and host
+# applications, plain JSON devices, gateways that speak MQTT 3.1.1, and the
+# Eidos protocol plugin as a client.
+
+[profile]
+name = "uns-mvp"
+suite = "https://github.com/eclipse-paho/paho.mqtt.testing"
+suite_commit = "fdab9d2b1ce125385135e5d9f282a0ad315268cc"
+
+[suites.mqtt5]
+script = "client_test5.py"
+
+[suites.mqtt5.tests]
+# Connect, publish and subscribe at QoS 0, 1 and 2; a second CONNECT and a
+# wrong protocol name are refused
+test_basic = { status = "required" }
+# Retained messages at every QoS, with their user properties
+test_retained_message = { status = "required" }
+# The Will (with user properties) on keep-alive expiry
+test_will_message = { status = "required" }
+test_zero_length_clientid = { status = "required" }
+test_assigned_clientid = { status = "required" }
+# One delivery at the highest granted QoS for overlapping filters
+test_overlapping_subscriptions = { status = "required" }
+test_keepalive = { status = "required" }
+# Wildcards do not match $ topics
+test_dollar_topics = { status = "required" }
+test_unsubscribe = { status = "required" }
+test_user_properties = { status = "required" }
+# Payload format indicator and content type reach the subscriber
+test_payload_format = { status = "required" }
+# No Local, Retain As Published, Retain Handling 0/1/2
+test_subscribe_options = { status = "required" }
+# Response topic and correlation data reach the responder
+test_request_response = { status = "required" }
+# Server must not send more unacknowledged QoS 1/2 messages than the client's
+# Receive Maximum
+test_flow_control1 = { status = "required" }
+# Client exceeds the server's Receive Maximum: DISCONNECT 0x93
+test_flow_control2 = { status = "required" }
+# Topic Alias 0 (none allowed) is DISCONNECT 0x94
+test_client_topic_alias = { status = "required" }
+# Nothing larger than the client's Maximum Packet Size is sent
+test_maximum_packet_size = { status = "required" }
+
+test_offline_message_queueing = { status = "exempt", reason = "Persistent sessions: a session ends with its connection and nothing is queued for offline clients. Sparkplug edge nodes and hosts connect with Clean Start and Session Expiry 0. CONNACK answers a requested Session Expiry Interval with 0." }
+test_redelivery_on_reconnect = { status = "exempt", reason = "Persistent sessions: in-flight QoS 1/2 messages are not resent on reconnect, since the session ended with the connection." }
+test_session_expiry = { status = "exempt", reason = "Persistent sessions: CONNACK answers a Session Expiry Interval with 0 and Session Present is always 0." }
+test_publication_expiry = { status = "exempt", reason = "Persistent sessions: the test needs messages queued for an offline client." }
+test_will_delay = { status = "exempt", reason = "Persistent sessions: a Will goes out when its delay or its session ends, whichever is first, and sessions end with the connection, so a Will goes out at once." }
+test_subscribe_failure = { status = "exempt", reason = "Authorization: the test needs a topic filter the broker is configured to refuse (test/nosubscribe); pg_mqtt has no per-topic access control yet." }
+test_subscribe_identifiers = { status = "exempt", reason = "Subscription identifiers are not supported; CONNACK says so (Subscription Identifier Available 0)." }
+test_shared_subscriptions = { status = "exempt", reason = "Shared subscriptions are not supported; CONNACK says so and a $share/ filter is refused with 0x9E." }
+test_server_topic_alias = { status = "exempt", reason = "Server-to-client topic aliases are optional (MQTT 5 3.3.2.3.4: the server MAY use them); pg_mqtt sends full topic names." }
+test_server_keep_alive = { status = "exempt", reason = "Server Keep Alive is optional; the test expects the Paho test broker's policy of 60 s. pg_mqtt honours the client's keep-alive." }
+
+[suites.mqtt311]
+script = "client_test.py"
+
+[suites.mqtt311.tests]
+# Connect, publish and subscribe at QoS 0, 1 and 2
+testBasic = { status = "required" }
+test_retained_messages = { status = "required" }
+# A zero-length client id is refused with Clean Session 0, accepted with 1
+test_zero_length_clientid = { status = "required" }
+test_overlapping_subscriptions = { status = "required" }
+# The Will on keep-alive expiry
+test_keepalive = { status = "required" }
+test_dollar_topics = { status = "required" }
+test_unsubscribe = { status = "required" }
+
+test_offline_message_queueing = { status = "exempt", reason = "Persistent sessions: a session ends with its connection, whatever Clean Session says; nothing is queued for offline clients and CONNACK's Session Present is always 0." }
+test_redelivery_on_reconnect = { status = "exempt", reason = "Persistent sessions: in-flight QoS 1/2 messages are not resent on reconnect." }
+test_subscribe_failure = { status = "exempt", reason = "Authorization: the test needs a topic filter the broker is configured to refuse (test/nosubscribe); pg_mqtt has no per-topic access control yet." }

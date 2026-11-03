@@ -5,13 +5,15 @@
 //! - Packet type definitions
 //! - Protocol handlers
 
+pub mod client_queue;
 pub mod codec;
 pub mod handlers;
 pub mod types;
 
 pub use codec::{parse_packet, ProtocolError};
 pub use handlers::{
-    handle_connect, handle_disconnect, handle_pingreq, handle_publish, handle_subscribe,
-    handle_unsubscribe, ClientSession, MqttBrokerState,
+    check_publish, deliver_published, disconnect_for, end_session, handle_connect,
+    handle_disconnect, handle_pingreq, handle_subscribe, handle_unsubscribe, publish_will,
+    route_publish, ClientSession, Delivery, MqttBrokerState, Will, SERVER_RECEIVE_MAXIMUM,
 };
 pub use types::*;

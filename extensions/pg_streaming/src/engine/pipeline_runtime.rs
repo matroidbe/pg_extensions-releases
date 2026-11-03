@@ -5,6 +5,7 @@ use crate::connector::input::cdc::CdcInput;
 use crate::connector::input::http_paginated::HttpPaginatedSource;
 use crate::connector::input::kafka::KafkaInput;
 use crate::connector::input::modbus::ModbusSource;
+use crate::connector::input::opcua::OpcuaSource;
 use crate::connector::input::opendal_source::OpendalSource;
 use crate::connector::input::s7::S7Source;
 use crate::connector::input::table::TableInput;
@@ -136,6 +137,16 @@ impl CompiledPipeline {
                 let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
                     Box::new(move || Box::new(source));
                 let bridge = AsyncSourceBridge::new("input", factory);
+                (Box::new(bridge), TopicShape::Messages)
+            }
+            InputConfig::Opcua(raw_cfg) => {
+                let resolved = secrets::resolve(raw_cfg)
+                    .map_err(|e| format!("opcua input: secret resolution failed: {}", e))?;
+                let source = OpcuaSource::from_config(&resolved)?;
+                let factory: Box<dyn FnOnce() -> Box<dyn AsyncSource> + Send> =
+                    Box::new(move || Box::new(source));
+                let bridge = AsyncSourceBridge::new("input", factory);
+                // DataChange and link records are pre-wrapped in the Messages shape.
                 (Box::new(bridge), TopicShape::Messages)
             }
             InputConfig::Custom(c) => {

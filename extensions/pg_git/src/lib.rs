@@ -349,6 +349,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    /// With pg_git.default_repo_path unset, a repo without an explicit path
+    /// lands under the data directory, which the server can always create (#182).
+    #[pg_test]
+    fn test_git_init_default_path_is_under_data_directory() {
+        bootstrap_tables();
+        let data_dir = Spi::get_one::<String>("SELECT current_setting('data_directory')")
+            .unwrap()
+            .unwrap();
+        let expected = std::path::Path::new(&data_dir)
+            .join("pg_git")
+            .join("test_default");
+        let _ = std::fs::remove_dir_all(&expected);
+
+        crate::sql::git_init("test_default", None, None);
+
+        let stored =
+            Spi::get_one::<String>("SELECT path FROM pggit.repos WHERE id = 'test_default'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(std::path::Path::new(&stored), expected);
+        assert!(expected.join(".git").exists());
+        let _ = std::fs::remove_dir_all(&expected);
+    }
+
     #[pg_test]
     fn test_git_init() {
         bootstrap_tables();

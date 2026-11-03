@@ -4,6 +4,111 @@ All notable changes to this repository. A release tag (`vX.Y.Z`) names a
 snapshot of the whole repo; each extension also carries its own version in its
 `Cargo.toml` (`default_version` in the control file).
 
+## Unreleased
+
+## v0.7.5 — 2026-11-03
+
+Extension versions: pg_mqtt 0.4.4, pg_image 0.3.1, pg_git 0.3.5,
+pg_currency 0.3.1, pg_streaming 0.3.6. pg_mqtt's upgrade script adds columns,
+pg_image's recreates the PostGIS bridge; the others have empty upgrade scripts.
+
+**pg_streaming reads OPC UA (0.3.6).** A new `opcua` input connector
+subscribes to an OPC UA server (security none, anonymous). It emits one record
+per DataChange notification (`kind`, `name`, `node_id`, `namespace_uri`,
+`value`, `status`, `status_code`, `source_ts`, `server_ts`), plus records when
+the link comes up or is lost. Nodes are string NodeIds or browse paths from
+the Objects folder, resolved again on every connect. A lost session ends the
+stream, and the pipeline reconnects after `reconnect_interval`, up to
+`max_consecutive_failures`. Its crypto is pure Rust, with no OpenSSL.
+Design: design/pg_streaming/connectors.md.
+
+**pg_mqtt: a slow subscriber no longer loses QoS 1 and 2 messages silently.**
+Its queue used to drop the newest messages once 1,024 waited, whatever their
+QoS (a load test lost 186 QoS 1 messages to one subscriber of 64 publishers).
+Now each subscriber has one bounded queue (`pg_mqtt.max_queued_messages`,
+default 10,000): when it is full, the oldest QoS 0 message is dropped and
+counted, and a subscriber whose queue is full of QoS 1/2 messages is
+disconnected with 0x97 Quota exceeded instead of losing any. Publishers are
+never slowed down by a slow subscriber. Session takeover reaches the old
+connection even when its queue is full.
+
+**pg_mqtt: PUBLISHes are stored in batches.** One transaction per message
+capped a worker at about 2,000-3,000 messages a second. Connections now queue
+PUBLISHes for the worker's main thread, which stores whatever has queued in one
+transaction (group commit: no timer, batches grow with load) and answers each
+after the commit, so PUBACK/PUBREC and forwarding still follow storage. QoS 1
+went from about 2,800 to 28,700 messages a second with four clients, and to
+56,400 with eight, on a laptop. A row that does not fit its typed table now
+fails only its own message (0x80) instead of being dropped silently. A full
+queue stops the broker reading from publishers. `examples/mqtt_load.rs` is the
+load generator.
+
+**pg_mqtt 0.4.4: MQTT 3.1.1 and the MQTT 5 features a UNS needs.** What
+Sparkplug B needs from a broker (NDEATH as a Will, the host's retained STATE,
+QoS 1), and what the Eclipse Paho interoperability suites check for everyday
+clients:
+- MQTT 3.1.1 clients (protocol level 4) next to MQTT 5 ones: many gateways and
+  Sparkplug edge nodes speak 3.1.1. Messages cross versions; a 3.1.1
+  subscriber gets them without properties.
+- Last Will, published when a connection ends without DISCONNECT, on DISCONNECT
+  0x04, on a keep-alive timeout (now enforced: 1.5 × keep-alive) and on session
+  takeover (DISCONNECT 0x8E to the old connection).
+- Retained messages in `pgmqtt.retained`, sent to new subscriptions per Retain
+  Handling, with Retain As Published.
+- QoS 1 and 2 in both directions, within each side's Receive Maximum; a STRICT
+  typed topic that rejects a payload answers 0x99 instead of dropping it
+  silently.
+- PUBLISH and Will properties forwarded to subscribers, and No Local.
+- Wildcards no longer match `$` topics; invalid filters and `$share/` are
+  refused in the SUBACK.
+- Sessions end with their connection: CONNACK answers a Session Expiry Interval
+  with 0 and Session Present is always 0. Subscriptions used to outlive the
+  connection without anything being queued for them.
+- Correlation data (property 0x09) is read as binary, not UTF-8.
+
+`extensions/pg_mqtt/tests/compliance/` runs both Paho suites against a profile
+that lists, test by test, what is still missing (persistent sessions, shared
+subscriptions, subscription identifiers, topic aliases). The upgrade script adds
+`retained.qos`/`properties`, `subscriptions.retain_as_published`/`no_local` and
+`outbox.qos`/`retain`/`properties`/`origin_client`.
+
+**pg_solid and pg_xarray ship as Linuxbrew bottles again.** v0.7.4's
+linux-amd64 bottles of both were Debian builds: pg_solid linked Debian 12's
+OCCT 7.6, which an eidos install does not have, and pg_xarray had no NetCDF or
+GRIB reader. The release workflow now builds both on Linuxbrew, against the
+`matroidbe/eidos` tap's `eidos-opencascade@7.9`, `eidos-hdf5@1.14` and
+`eidos-netcdf@4.9`, next to pg_ml, and the Debian bottler skips all three.
+The Linuxbrew image now builds on Ubuntu 24.04 (glibc 2.39): the tap's Linux
+keg bottles need glibc 2.38+ at build time, which Debian 12 does not have. The
+ordinary bottles stay on Debian 12. v0.7.3's and v0.7.4's Linuxbrew builds of
+both were made by hand; v0.7.4's replaced its Debian assets on 2026-10-26.
+
+**Fixes from macOS reports.**
+- pg_image 0.3.1: `CREATE EXTENSION pg_image` no longer fails with `type
+  "geometry" does not exist` when PostGIS is already installed. The GPS bridge
+  now schema-qualifies PostGIS's names. `ALTER EXTENSION pg_image UPDATE` also
+  adds `img_gps_point`/`img_gps_pointz` to databases that got PostGIS after
+  pg_image (#181).
+- pg_git 0.3.5: with `pg_git.default_repo_path` unset, `git_init` without a
+  path creates the repo under `<data directory>/pg_git`, not `/var/lib/pg_git`.
+  The old path does not exist on macOS (#182).
+- pg_currency 0.3.1: `set_rate` on the base currency (`pgcurrency.base_currency`,
+  default USD) raises an error instead of storing a rate that conversions
+  ignore. To enter rates against EUR, set the GUC to `EUR` (#183).
+
+**darwin bottles declare the kegs they link (#165, #190).** The release
+workflow's pgx (pgbrew 04dd8ad) records each linked Homebrew keg in
+`bottle.json` `requires`: pg_solid needs `eidos-opencascade@7.9`, pg_xarray
+needs `eidos-hdf5@1.14` and `eidos-netcdf@4.9`, and pg_ml needs
+`eidos-python@3.11`. `pgx install --bottle` now refuses such a bottle when the
+keg is missing, or installs it with `--install-deps`, instead of
+`CREATE EXTENSION` failing with "Library not loaded". v0.7.4's darwin bottles
+have no `requires`.
+
+**CI links the system OpenSSL (#188).** `openssl-sys` picked up an OpenSSL 4
+from one runner's environment, and pg_delta's test binary could not load it.
+`setup-pgrx` now pins the distro's libssl-dev.
+
 ## v0.7.4 — 2026-10-26
 
 Extension versions: pg_kafka 0.3.4, pg_s3 0.3.4, pg_git 0.3.4, pg_delta 0.3.4,
@@ -22,14 +127,19 @@ start with every signal blocked (`pg_bgworker::with_signals_blocked`):
 - pg_ml and pg_ortools: each job (Python, BLAS, OpenMP and solver threads).
 - pg_delta and pg_streaming: each tick (tokio's blocking pool, connector bridges).
 
-**Linuxbrew bottles of pg_ml, pg_solid and pg_xarray (#179, #180).** The
-linux-amd64 bottles of these three are built on Linuxbrew, against the
-`matroidbe/eidos` tap's kegs (`eidos-python@3.11`, `eidos-opencascade@7.9`,
-`eidos-hdf5@1.14` and `eidos-netcdf@4.9`), as the darwin-arm64 ones are. pg_ml
-was never bottled on Linux before. The Debian bottles of pg_solid and
-pg_xarray could not run in the tap's PostgreSQL: pg_solid linked Debian's OCCT
-7.6, and pg_xarray had no NetCDF or GRIB readers. pg_solid now links
-`TKXSBase` for every OCCT, which GNU ld needs.
+**pg_ml is bottled for linux-amd64 (#179).** The release workflow builds it
+on Linuxbrew, against the `matroidbe/eidos` tap's `eidos-python@3.11` and
+`eidos-postgresql@18`, as the darwin-arm64 bottle is. v0.7.4's was built by
+hand from the tag: the workflow's Linuxbrew step failed twice (checkout's
+persisted token hid the private tap, then `brew tap` of a local path failed on
+overlayfs), both fixed after the release.
+
+**Linuxbrew recipes for pg_solid and pg_xarray (#180).**
+`build-linuxbrew-bottles.sh` builds them against the tap's
+`eidos-opencascade@7.9`, `eidos-hdf5@1.14` and `eidos-netcdf@4.9`. The release
+still ships their Debian bottles; the Linuxbrew ones are built by hand
+(design/bottles). pg_solid now links `TKXSBase` for every OCCT, which GNU ld
+needs.
 
 ## v0.7.3 — 2026-10-20
 

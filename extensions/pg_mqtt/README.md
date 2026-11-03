@@ -1,6 +1,6 @@
 # pg_mqtt
 
-MQTT 3.1.1 broker running inside PostgreSQL. IoT devices connect directly to your database.
+MQTT 5.0 and 3.1.1 broker running inside PostgreSQL. IoT devices connect directly to your database.
 
 ## Installation
 
@@ -86,6 +86,12 @@ SET pg_mqtt.enabled = true;
 
 -- Broker port (default: 1883)
 SET pg_mqtt.port = 1883;
+
+-- Messages one subscriber may have waiting (default: 10000). A subscriber
+-- that falls further behind loses its oldest QoS 0 messages; one whose queue
+-- is full of QoS 1/2 messages is disconnected (0x97 Quota exceeded) instead
+-- of losing them. Read when the workers start.
+ALTER SYSTEM SET pg_mqtt.max_queued_messages = 10000;
 ```
 
 ## Architecture
@@ -106,10 +112,32 @@ SET pg_mqtt.port = 1883;
 
 ## Features
 
-- MQTT 3.1.1 protocol support
-- QoS 0 message delivery
+- MQTT 5.0 and MQTT 3.1.1 clients, side by side (a 3.1.1 subscriber gets an MQTT 5
+  message without its properties)
+- QoS 0, 1 and 2: PUBACK for QoS 1, PUBREC/PUBREL/PUBCOMP for QoS 2 (a resent
+  QoS 2 PUBLISH is routed once), and a subscriber gets each message at the
+  lower of the published and the subscribed QoS, within its Receive Maximum
+- PUBLISH properties (user properties, content type, payload format, response
+  topic, correlation data, message expiry) reach subscribers, retained
+  messages included
+- Retained messages: a retained PUBLISH replaces the topic's retained message
+  (`pgmqtt.retained`), an empty one removes it, and a new subscription gets the
+  matching retained messages (Retain Handling, Retain As Published and No Local
+  honoured)
+- Last Will (with its properties): published when a connection ends without
+  DISCONNECT, on DISCONNECT with reason 0x04, on a keep-alive timeout
+  (1.5 × keep-alive) and when a new connection takes the client id over
+- Sessions end with their connection: CONNACK answers a Session Expiry Interval
+  with 0 and Session Present is always 0. Nothing is queued for offline clients.
+- Wildcard filters do not match `$` topics; invalid filters and `$share/`
+  (shared subscriptions are not supported) are refused in the SUBACK
+- Compliance profile: `tests/compliance/` runs the Eclipse Paho MQTT 5 and
+  3.1.1 interoperability suites against the broker
 - Wildcard subscriptions (+ and #)
-- Message persistence in PostgreSQL
+- Message persistence in PostgreSQL: PUBLISHes are stored in batches, one
+  transaction each, and acknowledged and forwarded only after the commit; a
+  full queue stops the broker reading from publishers (backpressure).
+  `examples/mqtt_load.rs` measures it.
 - SQL interface for publishing and querying
 - Session tracking
 

@@ -1,0 +1,3 @@
+-- pg_streaming 0.3.5 -> 0.3.6
+-- No SQL changes: new `opcua` input connector (one subscription per pipeline,
+-- one record per DataChange notification, link up/lost records).

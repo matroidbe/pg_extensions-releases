@@ -1,14 +1,11 @@
 //! Schema validation for the MQTT protocol path
 //!
-//! Provides async validation of MQTT payloads against JSON Schemas bound to topics.
-//! Uses the SPI bridge for database queries since this runs on tokio worker threads.
-
-use std::sync::Arc;
-
-use crate::storage::{ColumnType, SpiBridge, SpiError, SpiParam};
+//! Checks MQTT payloads against the JSON Schemas bound to their topics. The
+//! batch writer (`server/batch.rs`) reads the bindings of a batch's topics in
+//! one query and calls these pure functions for each message.
 
 /// Validation result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     Valid,
     Invalid(String),
@@ -16,188 +13,117 @@ pub enum ValidationResult {
 }
 
 /// Validation mode
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValidationMode {
     Strict,
     Log,
 }
 
-/// Topic schema info including optional source table
-#[derive(Debug, Clone)]
-pub struct TopicSchemaInfo {
-    pub schema_def: serde_json::Value,
-    pub source_table: Option<String>,
-    pub validation_mode: ValidationMode,
-}
-
-/// Validation error
-#[derive(Debug, thiserror::Error)]
-pub enum ValidationError {
-    #[error("SPI error: {0}")]
-    Spi(#[from] SpiError),
-    #[error("Schema compilation error: {0}")]
-    SchemaCompilation(String),
-    #[error("JSON parse error: {0}")]
-    JsonParse(String),
-}
-
-/// Async schema validator for the MQTT protocol path
-pub struct MqttSchemaValidator {
-    bridge: Arc<SpiBridge>,
-}
-
-impl MqttSchemaValidator {
-    pub fn new(bridge: Arc<SpiBridge>) -> Self {
-        Self { bridge }
-    }
-
-    /// Get topic schema info (schema definition, source table, validation mode)
-    pub async fn get_topic_info(
-        &self,
-        topic: &str,
-    ) -> Result<Option<TopicSchemaInfo>, ValidationError> {
-        let result = self
-            .bridge
-            .query(
-                r#"
-                SELECT s.schema_def::text, ts.source_table, ts.validation_mode
-                FROM pgmqtt.topic_schemas ts
-                JOIN pgmqtt.schemas s ON ts.schema_id = s.id
-                WHERE ts.topic = $1
-                "#,
-                vec![SpiParam::Text(Some(topic.to_string()))],
-                vec![ColumnType::Text, ColumnType::Text, ColumnType::Text],
-            )
-            .await?;
-
-        let row = match result.first() {
-            Some(row) => row,
-            None => return Ok(None),
-        };
-
-        let schema_text = match row.get_string(0) {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let schema_def: serde_json::Value = serde_json::from_str(&schema_text)
-            .map_err(|e| ValidationError::JsonParse(format!("Invalid schema JSON: {}", e)))?;
-
-        let source_table = row.get_string(1);
-
-        let validation_mode = match row.get_string(2).as_deref() {
+impl ValidationMode {
+    /// From `pgmqtt.topic_schemas.validation_mode`; anything but LOG is STRICT
+    pub fn from_column(value: Option<&str>) -> Self {
+        match value {
             Some("LOG") => ValidationMode::Log,
             _ => ValidationMode::Strict,
-        };
-
-        Ok(Some(TopicSchemaInfo {
-            schema_def,
-            source_table,
-            validation_mode,
-        }))
-    }
-
-    /// Validate a payload against the schema bound to a topic
-    pub async fn validate_payload(
-        &self,
-        topic: &str,
-        payload: &[u8],
-    ) -> Result<(ValidationResult, ValidationMode, Option<TopicSchemaInfo>), ValidationError> {
-        let info = match self.get_topic_info(topic).await? {
-            Some(info) => info,
-            None => return Ok((ValidationResult::NoSchema, ValidationMode::Strict, None)),
-        };
-
-        let mode = info.validation_mode.clone();
-
-        // Parse payload as UTF-8
-        let payload_str = match std::str::from_utf8(payload) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok((
-                    ValidationResult::Invalid(format!("Payload is not valid UTF-8: {}", e)),
-                    mode,
-                    Some(info),
-                ));
-            }
-        };
-
-        // Parse as JSON
-        let payload_json: serde_json::Value = match serde_json::from_str(payload_str) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok((
-                    ValidationResult::Invalid(format!("Payload is not valid JSON: {}", e)),
-                    mode,
-                    Some(info),
-                ));
-            }
-        };
-
-        // Compile schema and validate
-        match jsonschema::validator_for(&info.schema_def) {
-            Ok(validator) => {
-                if validator.is_valid(&payload_json) {
-                    Ok((ValidationResult::Valid, mode, Some(info)))
-                } else {
-                    let errors: Vec<String> = validator
-                        .iter_errors(&payload_json)
-                        .map(|e| format!("{}", e))
-                        .collect();
-                    Ok((
-                        ValidationResult::Invalid(format!(
-                            "Schema validation failed: {}",
-                            errors.join("; ")
-                        )),
-                        mode,
-                        Some(info),
-                    ))
-                }
-            }
-            Err(e) => Err(ValidationError::SchemaCompilation(format!("{}", e))),
         }
     }
+}
+
+/// A topic's binding: its schema, compiled, and where its messages go
+#[derive(Clone)]
+pub struct TopicBinding {
+    pub validator: std::sync::Arc<jsonschema::Validator>,
+    pub source_table: Option<String>,
+    pub mode: ValidationMode,
+}
+
+/// Compile a stored schema definition
+pub fn compile_schema(schema_text: &str) -> Result<jsonschema::Validator, String> {
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_text).map_err(|e| format!("invalid schema JSON: {e}"))?;
+    jsonschema::validator_for(&schema).map_err(|e| format!("invalid schema: {e}"))
+}
+
+/// Check a payload against a topic's schema. Returns the parsed JSON when it
+/// is valid JSON, valid or not against the schema.
+pub fn check_payload(
+    validator: &jsonschema::Validator,
+    payload: &[u8],
+) -> (ValidationResult, Option<serde_json::Value>) {
+    let payload_str = match std::str::from_utf8(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                ValidationResult::Invalid(format!("Payload is not valid UTF-8: {}", e)),
+                None,
+            )
+        }
+    };
+    let payload_json: serde_json::Value = match serde_json::from_str(payload_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                ValidationResult::Invalid(format!("Payload is not valid JSON: {}", e)),
+                None,
+            )
+        }
+    };
+    if validator.is_valid(&payload_json) {
+        return (ValidationResult::Valid, Some(payload_json));
+    }
+    let errors: Vec<String> = validator
+        .iter_errors(&payload_json)
+        .map(|e| format!("{}", e))
+        .collect();
+    (
+        ValidationResult::Invalid(format!("Schema validation failed: {}", errors.join("; "))),
+        Some(payload_json),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_validation_result_debug() {
-        let valid = ValidationResult::Valid;
-        let invalid = ValidationResult::Invalid("test error".to_string());
-        let no_schema = ValidationResult::NoSchema;
-        assert!(format!("{:?}", valid).contains("Valid"));
-        assert!(format!("{:?}", invalid).contains("Invalid"));
-        assert!(format!("{:?}", no_schema).contains("NoSchema"));
+    fn validator() -> jsonschema::Validator {
+        compile_schema(r#"{"type":"object","properties":{"v":{"type":"number"}},"required":["v"]}"#)
+            .unwrap()
     }
 
     #[test]
-    fn test_validation_mode_equality() {
-        assert_eq!(ValidationMode::Strict, ValidationMode::Strict);
-        assert_eq!(ValidationMode::Log, ValidationMode::Log);
-        assert_ne!(ValidationMode::Strict, ValidationMode::Log);
+    fn test_validation_mode_from_column() {
+        assert_eq!(
+            ValidationMode::from_column(Some("LOG")),
+            ValidationMode::Log
+        );
+        assert_eq!(
+            ValidationMode::from_column(Some("STRICT")),
+            ValidationMode::Strict
+        );
+        assert_eq!(ValidationMode::from_column(None), ValidationMode::Strict);
     }
 
     #[test]
-    fn test_validation_error_display() {
-        let err = ValidationError::JsonParse("bad json".to_string());
-        assert!(err.to_string().contains("JSON parse error"));
+    fn test_check_payload() {
+        let v = validator();
+        let (result, json) = check_payload(&v, br#"{"v": 1.5}"#);
+        assert_eq!(result, ValidationResult::Valid);
+        assert_eq!(json.unwrap()["v"], 1.5);
 
-        let err = ValidationError::SchemaCompilation("bad schema".to_string());
-        assert!(err.to_string().contains("Schema compilation error"));
+        let (result, json) = check_payload(&v, br#"{"v": "x"}"#);
+        assert!(matches!(result, ValidationResult::Invalid(_)));
+        assert!(json.is_some(), "valid JSON is returned for LOG mode");
+
+        let (result, json) = check_payload(&v, b"not json");
+        assert!(matches!(result, ValidationResult::Invalid(m) if m.contains("not valid JSON")));
+        assert!(json.is_none());
+
+        let (result, _) = check_payload(&v, &[0xff, 0xfe]);
+        assert!(matches!(result, ValidationResult::Invalid(m) if m.contains("UTF-8")));
     }
 
     #[test]
-    fn test_topic_schema_info_clone() {
-        let info = TopicSchemaInfo {
-            schema_def: serde_json::json!({"type": "object"}),
-            source_table: Some("pgmqtt.test".to_string()),
-            validation_mode: ValidationMode::Strict,
-        };
-        let cloned = info.clone();
-        assert_eq!(cloned.source_table, Some("pgmqtt.test".to_string()));
-        assert_eq!(cloned.validation_mode, ValidationMode::Strict);
+    fn test_compile_schema_rejects_bad_json() {
+        assert!(compile_schema("{").is_err());
     }
 }

@@ -1,6 +1,11 @@
 use pgrx::prelude::*;
 
-/// Set (or update) an exchange rate. UPSERT on (currency_code, valid_from, rate_type).
+/// Set (or update) an exchange rate: units of `currency_code` per 1 unit of
+/// the base currency (the `pgcurrency.base_currency` GUC, default USD).
+/// UPSERT on (currency_code, valid_from, rate_type).
+///
+/// The base currency's own rate is always 1, so setting it is an error rather
+/// than a row that conversions would silently ignore.
 #[pg_extern]
 pub fn set_rate(
     currency_code: &str,
@@ -9,6 +14,16 @@ pub fn set_rate(
     rate_type: default!(Option<&str>, "NULL"),
     source: default!(Option<&str>, "NULL"),
 ) {
+    let base = crate::get_base_currency();
+    if currency_code.eq_ignore_ascii_case(&base) {
+        pgrx::error!(
+            "pg_currency: '{}' is the base currency; its rate is always 1. \
+             Rates are units of a currency per 1 {}; to enter rates against another \
+             currency, set pgcurrency.base_currency",
+            base,
+            base
+        );
+    }
     Spi::run_with_args(
         r#"
         INSERT INTO pgcurrency.exchange_rate (currency_code, rate, valid_from, rate_type, source)

@@ -16,7 +16,7 @@ pub fn git_init(
 ) -> String {
     let repo_path = match path {
         Some(p) => PathBuf::from(p),
-        None => PathBuf::from(config::get_default_repo_path()).join(repo_id),
+        None => config::get_default_repo_path().join(repo_id),
     };
 
     let path_str = repo_path.to_string_lossy().to_string();

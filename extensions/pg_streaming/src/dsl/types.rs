@@ -57,6 +57,9 @@ pub enum InputConfig {
     /// Siemens S7 polling source. Config passed through; see
     /// `crate::connector::input::s7::S7SourceConfig`.
     S7(serde_json::Value),
+    /// OPC UA subscription source. Config passed through; see
+    /// `crate::connector::input::opcua::OpcuaSourceConfig`.
+    Opcua(serde_json::Value),
     /// Reference to a custom source registered via `pg_streaming_sdk`.
     Custom(CustomConnectorConfig),
     // Future phases: Webhook, Ldes, Mqtt, Broker, Generate

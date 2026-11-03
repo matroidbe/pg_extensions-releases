@@ -1,0 +1,3 @@
+-- pg_currency 0.3.0 -> 0.3.1
+-- No SQL changes: set_rate on the base currency (pgcurrency.base_currency) now raises an
+-- error instead of storing a row that conversions ignore (#183).

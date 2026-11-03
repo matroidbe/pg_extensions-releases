@@ -1,0 +1,3 @@
+-- pg_git 0.3.4 -> 0.3.5
+-- No SQL changes: with pg_git.default_repo_path unset, git_init without a path now
+-- creates repos under <data directory>/pg_git instead of /var/lib/pg_git (#182).

@@ -1,6 +1,6 @@
 [package]
 name = "pg_streaming"
-version = "0.3.5"
+version = "0.3.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -64,6 +64,8 @@ chrono.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 tokio-modbus = { version = "0.17", default-features = false, features = ["tcp"] }
 rust7 = "0.1"
+# OPC UA client (pure Rust; crypto via RustCrypto: rsa/aes/sha1/sha2/x509-cert, no OpenSSL).
+opcua = { package = "async-opcua", version = "0.19", default-features = false, features = ["client"] }
 hex.workspace = true
 url = { workspace = true }
 async-stream = "0.3"

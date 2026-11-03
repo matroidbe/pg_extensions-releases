@@ -48,6 +48,33 @@ impl TryFrom<u8> for PacketType {
     }
 }
 
+/// The MQTT version a connection speaks, fixed by its CONNECT (protocol level)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtocolVersion {
+    /// MQTT 3.1.1 (protocol level 4): no properties, no reason codes on
+    /// acknowledgements, and the server never sends DISCONNECT
+    V311,
+    /// MQTT 5.0 (protocol level 5)
+    #[default]
+    V5,
+}
+
+impl ProtocolVersion {
+    /// The version of a CONNECT's protocol level, if supported
+    pub fn from_level(level: u8) -> Option<Self> {
+        match level {
+            4 => Some(ProtocolVersion::V311),
+            5 => Some(ProtocolVersion::V5),
+            _ => None,
+        }
+    }
+
+    /// Whether packets carry MQTT 5 properties and reason codes
+    pub fn is_v5(self) -> bool {
+        self == ProtocolVersion::V5
+    }
+}
+
 /// MQTT QoS levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -92,8 +119,13 @@ pub enum ReasonCode {
     NotAuthorized = 0x87,
     ServerUnavailable = 0x88,
     ServerBusy = 0x89,
+    ReceiveMaximumExceeded = 0x93,
+    TopicAliasInvalid = 0x94,
     Banned = 0x8A,
     BadAuthenticationMethod = 0x8C,
+    KeepAliveTimeout = 0x8D,
+    SessionTakenOver = 0x8E,
+    TopicFilterInvalid = 0x8F,
     TopicNameInvalid = 0x90,
     PacketTooLarge = 0x95,
     QuotaExceeded = 0x97,
@@ -102,6 +134,7 @@ pub enum ReasonCode {
     QoSNotSupported = 0x9B,
     UseAnotherServer = 0x9C,
     ServerMoved = 0x9D,
+    SharedSubscriptionsNotSupported = 0x9E,
     ConnectionRateExceeded = 0x9F,
 }
 
@@ -191,6 +224,7 @@ pub struct WillProperties {
     pub content_type: Option<String>,
     pub response_topic: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
+    pub user_properties: Vec<(String, String)>,
 }
 
 /// CONNACK packet to client
@@ -248,6 +282,7 @@ pub struct PublishProperties {
     pub response_topic: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
     pub content_type: Option<String>,
+    pub user_properties: Vec<(String, String)>,
 }
 
 /// SUBSCRIBE packet
@@ -369,7 +404,7 @@ pub enum MqttPacket {
     Connack(ConnackPacket),
     Publish(PublishPacket),
     Puback { packet_id: u16 },
-    Pubrec { packet_id: u16 },
+    Pubrec { packet_id: u16, reason_code: u8 },
     Pubrel { packet_id: u16 },
     Pubcomp { packet_id: u16 },
     Subscribe(SubscribePacket),

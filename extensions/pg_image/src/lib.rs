@@ -179,24 +179,31 @@ fn img_gps_altitude(data: Option<&[u8]>) -> Option<f64> {
 pgrx::extension_sql!(
     r#"
 DO $bridge$
+DECLARE
+    gis text;
 BEGIN
-    -- Only create PostGIS bridge functions if PostGIS is available
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis') THEN
-        EXECUTE $fn$
-            CREATE OR REPLACE FUNCTION pgimg.img_gps_point(data bytea) RETURNS geometry AS $$
+    -- Only create PostGIS bridge functions if PostGIS is available. During
+    -- CREATE EXTENSION the search_path is pgimg alone, so every PostGIS name
+    -- is qualified with the schema PostGIS lives in.
+    SELECT extnamespace::regnamespace::text INTO gis
+    FROM pg_extension WHERE extname = 'postgis';
+
+    IF gis IS NOT NULL THEN
+        EXECUTE format($fn$
+            CREATE OR REPLACE FUNCTION pgimg.img_gps_point(data bytea) RETURNS %1$s.geometry AS $$
                 SELECT CASE
                     WHEN pgimg.img_gps_lon(data) IS NOT NULL AND pgimg.img_gps_lat(data) IS NOT NULL
-                    THEN ST_SetSRID(ST_MakePoint(pgimg.img_gps_lon(data), pgimg.img_gps_lat(data)), 4326)
+                    THEN %1$s.ST_SetSRID(%1$s.ST_MakePoint(pgimg.img_gps_lon(data), pgimg.img_gps_lat(data)), 4326)
                     ELSE NULL
                 END;
             $$ LANGUAGE SQL IMMUTABLE STRICT;
-        $fn$;
+        $fn$, gis);
 
-        EXECUTE $fn$
-            CREATE OR REPLACE FUNCTION pgimg.img_gps_pointz(data bytea) RETURNS geometry AS $$
+        EXECUTE format($fn$
+            CREATE OR REPLACE FUNCTION pgimg.img_gps_pointz(data bytea) RETURNS %1$s.geometry AS $$
                 SELECT CASE
                     WHEN pgimg.img_gps_lon(data) IS NOT NULL AND pgimg.img_gps_lat(data) IS NOT NULL
-                    THEN ST_SetSRID(ST_MakePoint(
+                    THEN %1$s.ST_SetSRID(%1$s.ST_MakePoint(
                         pgimg.img_gps_lon(data),
                         pgimg.img_gps_lat(data),
                         COALESCE(pgimg.img_gps_altitude(data), 0)
@@ -204,11 +211,11 @@ BEGIN
                     ELSE NULL
                 END;
             $$ LANGUAGE SQL IMMUTABLE STRICT;
-        $fn$;
+        $fn$, gis);
 
         RAISE NOTICE 'pg_image: PostGIS bridge functions created (img_gps_point, img_gps_pointz)';
     ELSE
-        RAISE NOTICE 'pg_image: PostGIS not found, skipping bridge functions. Install PostGIS and run CREATE EXTENSION pg_image again to enable.';
+        RAISE NOTICE 'pg_image: PostGIS not found, skipping bridge functions. Install PostGIS, then DROP and CREATE EXTENSION pg_image to enable them.';
     END IF;
 END
 $bridge$;

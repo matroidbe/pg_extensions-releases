@@ -130,6 +130,18 @@ fn validate_input(input: &InputConfig) -> Result<(), String> {
             crate::connector::input::s7::S7Source::from_config(cfg)
                 .map_err(|e| format!("input.{}", e))?;
         }
+        InputConfig::Opcua(cfg) => {
+            let obj = cfg
+                .as_object()
+                .ok_or_else(|| "input.opcua: config must be a JSON object".to_string())?;
+            for required in ["endpoint", "nodes"] {
+                if !obj.contains_key(required) {
+                    return Err(format!("input.opcua.{} is required", required));
+                }
+            }
+            crate::connector::input::opcua::OpcuaSource::from_config(cfg)
+                .map_err(|e| format!("input.{}", e))?;
+        }
         InputConfig::Custom(c) => {
             if c.name.is_empty() {
                 return Err("input.custom.name is required".to_string());

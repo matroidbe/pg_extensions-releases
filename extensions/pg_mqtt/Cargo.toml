@@ -1,11 +1,11 @@
 [package]
 name = "pg_mqtt"
-version = "0.4.3"
+version = "0.4.4"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "MQTT 5.0 broker backed by PostgreSQL tables"
+description = "MQTT 5.0 and 3.1.1 broker backed by PostgreSQL tables"
 
 [lib]
 crate-type = ["cdylib", "lib"]

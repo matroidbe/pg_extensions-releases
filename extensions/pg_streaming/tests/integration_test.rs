@@ -1420,6 +1420,171 @@ fn test_table_to_s7_pipeline() {
 }
 
 // =============================================================================
+// OPC UA Pipelines (require a live OPC UA server; set OPCUA_TEST_ENDPOINT,
+// e.g. the virtualplant twin: OPCUA_TEST_ENDPOINT=opc.tcp://127.0.0.1:4840)
+// =============================================================================
+
+/// OPC UA source → table sink: one subscription over a node id, a browse
+/// path and the server clock; DataChange and link records land as rows.
+/// Run with: OPCUA_TEST_ENDPOINT=opc.tcp://127.0.0.1:4840 \
+///   cargo test --test integration_test -- --ignored opcua
+/// Override the namespace with OPCUA_TEST_NAMESPACE (default: the
+/// fischertechnik twin's `urn:eidos:lab:training:training_factory`).
+#[test]
+#[ignore = "requires OPCUA_TEST_ENDPOINT pointing at an OPC UA server"]
+fn test_opcua_to_table_pipeline() {
+    skip_if_not_running!();
+    let Ok(endpoint) = std::env::var("OPCUA_TEST_ENDPOINT") else {
+        eprintln!("SKIPPED: OPCUA_TEST_ENDPOINT not set");
+        return;
+    };
+    let namespace = std::env::var("OPCUA_TEST_NAMESPACE")
+        .unwrap_or_else(|_| "urn:eidos:lab:training:training_factory".to_string());
+
+    cleanup_pipeline("it_opcua_src");
+    cleanup_table("it_opcua_readings");
+
+    execute(
+        "CREATE TABLE it_opcua_readings (
+            id            BIGSERIAL PRIMARY KEY,
+            kind          TEXT,
+            name          TEXT,
+            node_id       TEXT,
+            namespace_uri TEXT,
+            value         JSONB,
+            status        TEXT,
+            source_ts     TIMESTAMPTZ,
+            server_ts     TIMESTAMPTZ,
+            link          TEXT
+        )",
+    )
+    .unwrap();
+
+    execute(&format!(
+        "SELECT pgstreams.create_pipeline('it_opcua_src', $$
+        {{
+            \"input\": {{
+                \"opcua\": {{
+                    \"endpoint\": \"{endpoint}\",
+                    \"namespace_uri\": \"{namespace}\",
+                    \"publishing_interval\": \"200ms\",
+                    \"sampling_interval\": \"100ms\",
+                    \"nodes\": [
+                        \"s=hbw.state\",
+                        {{\"browse_path\": \"/training_factory/hbw/good_count\", \"name\": \"hbw_good\"}},
+                        {{\"node_id\": \"ns=0;i=2258\", \"name\": \"server_time\"}}
+                    ]
+                }}
+            }},
+            \"pipeline\": {{
+                \"processors\": [
+                    {{\"mapping\": {{
+                        \"kind\":          \"value_json->>'kind'\",
+                        \"name\":          \"value_json->>'name'\",
+                        \"node_id\":       \"value_json->>'node_id'\",
+                        \"namespace_uri\": \"value_json->>'namespace_uri'\",
+                        \"value\":         \"(value_json->'value')::text\",
+                        \"status\":        \"value_json->>'status'\",
+                        \"source_ts\":     \"(value_json->>'source_ts')::timestamptz\",
+                        \"server_ts\":     \"(value_json->>'server_ts')::timestamptz\",
+                        \"link\":          \"value_json->>'link'\"
+                    }}}}
+                ]
+            }},
+            \"output\": {{
+                \"table\": {{\"name\": \"public.it_opcua_readings\", \"mode\": \"append\"}}
+            }}
+        }}
+        $$::jsonb)",
+    ))
+    .unwrap();
+
+    execute("SELECT pgstreams.start('it_opcua_src')").unwrap();
+
+    // `value` goes through ::text: the table sink writes JSON scalars as bare
+    // SQL literals, and a quoted literal coerces into the JSONB column.
+    // Link up + the initial value of every node + server clock ticks.
+    wait_for_row_count("it_opcua_readings", 5, PROCESSING_TIMEOUT)
+        .expect("expected link and data change rows");
+
+    let link = query_one(
+        "SELECT count(*)::bigint FROM it_opcua_readings WHERE kind = 'link' AND link = 'up'",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(link, "1", "exactly one link-up record");
+
+    let rows = query_all(
+        "SELECT node_id, namespace_uri, status, (source_ts IS NOT NULL)::text, jsonb_typeof(value)
+         FROM it_opcua_readings WHERE name = 's=hbw.state' ORDER BY id LIMIT 1",
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1, "hbw.state initial value should land");
+    assert_eq!(rows[0][0], "s=hbw.state");
+    assert_eq!(rows[0][1], namespace);
+    assert_eq!(rows[0][2], "good");
+    assert_eq!(rows[0][3], "true");
+    assert_eq!(rows[0][4], "number");
+
+    let browsed = query_one(
+        "SELECT node_id FROM it_opcua_readings WHERE name = 'hbw_good' ORDER BY id LIMIT 1",
+    )
+    .unwrap();
+    assert_eq!(
+        browsed.as_deref(),
+        Some("s=hbw.good_count"),
+        "browse path resolves to the node id"
+    );
+
+    let clock = query_one(
+        "SELECT namespace_uri FROM it_opcua_readings WHERE name = 'server_time' ORDER BY id LIMIT 1",
+    )
+    .unwrap();
+    assert_eq!(clock.as_deref(), Some("http://opcfoundation.org/UA/"));
+
+    let state = query_one("SELECT state FROM pgstreams.pipelines WHERE name = 'it_opcua_src'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, "running");
+
+    cleanup_pipeline("it_opcua_src");
+    cleanup_table("it_opcua_readings");
+}
+
+/// Invalid OPC UA configs are rejected at create time (validate.rs path).
+#[test]
+fn test_opcua_invalid_config_rejected_at_create() {
+    skip_if_not_running!();
+
+    cleanup_pipeline("it_opcua_bad");
+    let result = execute(
+        "SELECT pgstreams.create_pipeline('it_opcua_bad', $$
+        {
+            \"input\": {
+                \"opcua\": {
+                    \"endpoint\": \"opc.tcp://127.0.0.1:4840\",
+                    \"security_mode\": \"sign_and_encrypt\",
+                    \"nodes\": [\"s=a\"]
+                }
+            },
+            \"pipeline\": {\"processors\": []},
+            \"output\": {\"drop\": {}}
+        }
+        $$::jsonb)",
+    );
+    assert!(
+        result.is_err(),
+        "unsupported security mode must be rejected"
+    );
+    let count =
+        query_one("SELECT count(*)::bigint FROM pgstreams.pipelines WHERE name = 'it_opcua_bad'")
+            .unwrap()
+            .unwrap();
+    assert_eq!(count, "0");
+    cleanup_pipeline("it_opcua_bad");
+}
+
+// =============================================================================
 // call output connector
 //
 // Mirrors the test plan in design/pg_streaming/call-sink.md. These have to be

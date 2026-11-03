@@ -156,11 +156,11 @@ pub fn read_properties(buf: &mut Cursor<&[u8]>) -> Result<Vec<(u8, PropertyValue
             // Variable byte integer properties
             0x0B => PropertyValue::VarInt(read_variable_int(buf)? as u32),
             // UTF-8 string properties
-            0x03 | 0x08 | 0x09 | 0x12 | 0x15 | 0x1A | 0x1C | 0x1F => {
+            0x03 | 0x08 | 0x12 | 0x15 | 0x1A | 0x1C | 0x1F => {
                 PropertyValue::String(read_string(buf)?)
             }
             // Binary data properties
-            0x16 => PropertyValue::Binary(read_binary(buf)?),
+            0x09 | 0x16 => PropertyValue::Binary(read_binary(buf)?),
             // String pair (user property)
             0x26 => {
                 let key = read_string(buf)?;
@@ -232,11 +232,10 @@ pub fn parse_connect(buf: &mut Cursor<&[u8]>) -> Result<ConnectPacket, ProtocolE
         )));
     }
 
-    // Protocol version
+    // Protocol version: 4 (MQTT 3.1.1) or 5 (MQTT 5.0)
     let protocol_version = read_u8(buf)?;
-    if protocol_version != 5 {
-        return Err(ProtocolError::UnsupportedVersion(protocol_version));
-    }
+    let version = ProtocolVersion::from_level(protocol_version)
+        .ok_or(ProtocolError::UnsupportedVersion(protocol_version))?;
 
     // Connect flags
     let flags_byte = read_u8(buf)?;
@@ -245,23 +244,26 @@ pub fn parse_connect(buf: &mut Cursor<&[u8]>) -> Result<ConnectPacket, ProtocolE
     // Keep alive
     let keep_alive = read_u16(buf)?;
 
-    // Properties
-    let raw_props = read_properties(buf)?;
-    let properties = parse_connect_properties(&raw_props);
+    // Properties (MQTT 5 only)
+    let properties = if version.is_v5() {
+        parse_connect_properties(&read_properties(buf)?)
+    } else {
+        ConnectProperties::default()
+    };
 
     // Payload
     let client_id = read_string(buf)?;
 
     // Will properties and payload
     let (will_properties, will_topic, will_payload) = if flags.will_flag {
-        let will_props = read_properties(buf)?;
+        let will_props = if version.is_v5() {
+            parse_will_properties(&read_properties(buf)?)
+        } else {
+            WillProperties::default()
+        };
         let topic = read_string(buf)?;
         let payload = read_binary(buf)?;
-        (
-            Some(parse_will_properties(&will_props)),
-            Some(topic),
-            Some(payload),
-        )
+        (Some(will_props), Some(topic), Some(payload))
     } else {
         (None, None, None)
     };
@@ -323,14 +325,38 @@ fn parse_will_properties(props: &[(u8, PropertyValue)]) -> WillProperties {
             (0x03, PropertyValue::String(s)) => result.content_type = Some(s.clone()),
             (0x08, PropertyValue::String(s)) => result.response_topic = Some(s.clone()),
             (0x09, PropertyValue::Binary(b)) => result.correlation_data = Some(b.clone()),
+            (0x26, PropertyValue::StringPair(k, v)) => {
+                result.user_properties.push((k.clone(), v.clone()))
+            }
             _ => {}
         }
     }
     result
 }
 
+/// The MQTT 3.1.1 CONNACK return code for a reason (MQTT 3.1.1 3.2.2.3)
+fn connack_return_code_v311(reason_code: ReasonCode) -> u8 {
+    match reason_code {
+        ReasonCode::Success => 0x00,
+        ReasonCode::UnsupportedProtocolVersion => 0x01,
+        ReasonCode::ClientIdentifierNotValid => 0x02,
+        ReasonCode::BadUserNameOrPassword => 0x04,
+        ReasonCode::NotAuthorized => 0x05,
+        _ => 0x03, // Server unavailable
+    }
+}
+
 /// Encode a CONNACK packet
-pub fn encode_connack(packet: &ConnackPacket) -> BytesMut {
+pub fn encode_connack(packet: &ConnackPacket, version: ProtocolVersion) -> BytesMut {
+    if !version.is_v5() {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8((PacketType::Connack as u8) << 4);
+        buf.put_u8(2);
+        buf.put_u8(u8::from(packet.session_present));
+        buf.put_u8(connack_return_code_v311(packet.reason_code));
+        return buf;
+    }
+
     let mut body = BytesMut::new();
 
     // Acknowledge flags
@@ -389,7 +415,11 @@ pub fn encode_connack(packet: &ConnackPacket) -> BytesMut {
 }
 
 /// Parse a PUBLISH packet
-pub fn parse_publish(buf: &mut Cursor<&[u8]>, flags: u8) -> Result<PublishPacket, ProtocolError> {
+pub fn parse_publish(
+    buf: &mut Cursor<&[u8]>,
+    flags: u8,
+    version: ProtocolVersion,
+) -> Result<PublishPacket, ProtocolError> {
     let dup = (flags & 0x08) != 0;
     let qos = QoS::try_from((flags >> 1) & 0x03)
         .map_err(|_| ProtocolError::Invalid("invalid QoS".to_string()))?;
@@ -403,8 +433,11 @@ pub fn parse_publish(buf: &mut Cursor<&[u8]>, flags: u8) -> Result<PublishPacket
         None
     };
 
-    let raw_props = read_properties(buf)?;
-    let properties = parse_publish_properties(&raw_props);
+    let properties = if version.is_v5() {
+        parse_publish_properties(&read_properties(buf)?)
+    } else {
+        PublishProperties::default()
+    };
 
     // Remaining bytes are the payload
     let payload = buf.chunk().to_vec();
@@ -430,14 +463,63 @@ fn parse_publish_properties(props: &[(u8, PropertyValue)]) -> PublishProperties 
             (0x08, PropertyValue::String(s)) => result.response_topic = Some(s.clone()),
             (0x09, PropertyValue::Binary(b)) => result.correlation_data = Some(b.clone()),
             (0x03, PropertyValue::String(s)) => result.content_type = Some(s.clone()),
+            (0x26, PropertyValue::StringPair(k, v)) => {
+                result.user_properties.push((k.clone(), v.clone()))
+            }
             _ => {}
         }
     }
     result
 }
 
-/// Encode a PUBLISH packet
-pub fn encode_publish(packet: &PublishPacket) -> BytesMut {
+/// Encode the properties a PUBLISH carries (MQTT 5 3.3.2.3)
+pub fn publish_properties_list(properties: &PublishProperties) -> Vec<(u8, PropertyValue)> {
+    let mut props = Vec::new();
+    if let Some(v) = properties.payload_format_indicator {
+        props.push((0x01, PropertyValue::Byte(v)));
+    }
+    if let Some(v) = properties.message_expiry_interval {
+        props.push((0x02, PropertyValue::FourByteInt(v)));
+    }
+    if let Some(v) = properties.topic_alias {
+        props.push((0x23, PropertyValue::TwoByteInt(v)));
+    }
+    if let Some(ref s) = properties.response_topic {
+        props.push((0x08, PropertyValue::String(s.clone())));
+    }
+    if let Some(ref b) = properties.correlation_data {
+        props.push((0x09, PropertyValue::Binary(b.clone())));
+    }
+    if let Some(ref s) = properties.content_type {
+        props.push((0x03, PropertyValue::String(s.clone())));
+    }
+    for (k, v) in &properties.user_properties {
+        props.push((0x26, PropertyValue::StringPair(k.clone(), v.clone())));
+    }
+    props
+}
+
+/// PUBLISH properties as stored next to a message (retained, outbox):
+/// the property block of the wire format
+pub fn encode_publish_properties(properties: &PublishProperties) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    write_properties(&mut buf, &publish_properties_list(properties));
+    buf.to_vec()
+}
+
+/// Inverse of encode_publish_properties; empty or unreadable bytes give no
+/// properties
+pub fn decode_publish_properties(bytes: &[u8]) -> PublishProperties {
+    if bytes.is_empty() {
+        return PublishProperties::default();
+    }
+    read_properties(&mut Cursor::new(bytes))
+        .map(|props| parse_publish_properties(&props))
+        .unwrap_or_default()
+}
+
+/// Encode a PUBLISH packet; MQTT 3.1.1 has no properties to carry
+pub fn encode_publish(packet: &PublishPacket, version: ProtocolVersion) -> BytesMut {
     let mut body = BytesMut::new();
 
     // Topic name
@@ -451,26 +533,9 @@ pub fn encode_publish(packet: &PublishPacket) -> BytesMut {
     }
 
     // Properties
-    let mut props = Vec::new();
-    if let Some(v) = packet.properties.payload_format_indicator {
-        props.push((0x01, PropertyValue::Byte(v)));
+    if version.is_v5() {
+        write_properties(&mut body, &publish_properties_list(&packet.properties));
     }
-    if let Some(v) = packet.properties.message_expiry_interval {
-        props.push((0x02, PropertyValue::FourByteInt(v)));
-    }
-    if let Some(v) = packet.properties.topic_alias {
-        props.push((0x23, PropertyValue::TwoByteInt(v)));
-    }
-    if let Some(ref s) = packet.properties.response_topic {
-        props.push((0x08, PropertyValue::String(s.clone())));
-    }
-    if let Some(ref b) = packet.properties.correlation_data {
-        props.push((0x09, PropertyValue::Binary(b.clone())));
-    }
-    if let Some(ref s) = packet.properties.content_type {
-        props.push((0x03, PropertyValue::String(s.clone())));
-    }
-    write_properties(&mut body, &props);
 
     // Payload
     body.put_slice(&packet.payload);
@@ -494,10 +559,17 @@ pub fn encode_publish(packet: &PublishPacket) -> BytesMut {
 }
 
 /// Parse a SUBSCRIBE packet
-pub fn parse_subscribe(buf: &mut Cursor<&[u8]>) -> Result<SubscribePacket, ProtocolError> {
+pub fn parse_subscribe(
+    buf: &mut Cursor<&[u8]>,
+    version: ProtocolVersion,
+) -> Result<SubscribePacket, ProtocolError> {
     let packet_id = read_u16(buf)?;
 
-    let raw_props = read_properties(buf)?;
+    let raw_props = if version.is_v5() {
+        read_properties(buf)?
+    } else {
+        Vec::new()
+    };
     let mut properties = SubscribeProperties::default();
     for (id, value) in &raw_props {
         if let (0x0B, PropertyValue::VarInt(v)) = (id, value) {
@@ -523,23 +595,31 @@ pub fn parse_subscribe(buf: &mut Cursor<&[u8]>) -> Result<SubscribePacket, Proto
     })
 }
 
-/// Encode a SUBACK packet
-pub fn encode_suback(packet: &SubackPacket) -> BytesMut {
+/// Encode a SUBACK packet. MQTT 3.1.1 has no properties and only the return
+/// codes 0x00-0x02 (granted QoS) and 0x80 (failure).
+pub fn encode_suback(packet: &SubackPacket, version: ProtocolVersion) -> BytesMut {
     let mut body = BytesMut::new();
 
     // Packet identifier
     body.put_u16(packet.packet_id);
 
     // Properties
-    let mut props = Vec::new();
-    if let Some(ref s) = packet.properties.reason_string {
-        props.push((0x1F, PropertyValue::String(s.clone())));
+    if version.is_v5() {
+        let mut props = Vec::new();
+        if let Some(ref s) = packet.properties.reason_string {
+            props.push((0x1F, PropertyValue::String(s.clone())));
+        }
+        write_properties(&mut body, &props);
     }
-    write_properties(&mut body, &props);
 
     // Reason codes
     for code in &packet.reason_codes {
-        body.put_u8((*code).into());
+        let code = u8::from(*code);
+        body.put_u8(if version.is_v5() || code < 0x80 {
+            code
+        } else {
+            0x80
+        });
     }
 
     // Build fixed header
@@ -552,10 +632,15 @@ pub fn encode_suback(packet: &SubackPacket) -> BytesMut {
 }
 
 /// Parse an UNSUBSCRIBE packet
-pub fn parse_unsubscribe(buf: &mut Cursor<&[u8]>) -> Result<UnsubscribePacket, ProtocolError> {
+pub fn parse_unsubscribe(
+    buf: &mut Cursor<&[u8]>,
+    version: ProtocolVersion,
+) -> Result<UnsubscribePacket, ProtocolError> {
     let packet_id = read_u16(buf)?;
 
-    let _raw_props = read_properties(buf)?;
+    if version.is_v5() {
+        read_properties(buf)?;
+    }
     let properties = UnsubscribeProperties::default();
 
     let mut topic_filters = Vec::new();
@@ -570,12 +655,20 @@ pub fn parse_unsubscribe(buf: &mut Cursor<&[u8]>) -> Result<UnsubscribePacket, P
     })
 }
 
-/// Encode an UNSUBACK packet
-pub fn encode_unsuback(packet: &UnsubackPacket) -> BytesMut {
+/// Encode an UNSUBACK packet; in MQTT 3.1.1 it is just the packet id
+pub fn encode_unsuback(packet: &UnsubackPacket, version: ProtocolVersion) -> BytesMut {
     let mut body = BytesMut::new();
 
     // Packet identifier
     body.put_u16(packet.packet_id);
+
+    if !version.is_v5() {
+        let mut packet_buf = BytesMut::new();
+        packet_buf.put_u8((PacketType::Unsuback as u8) << 4);
+        write_variable_int(&mut packet_buf, body.len());
+        packet_buf.put(body);
+        return packet_buf;
+    }
 
     // Properties
     let mut props = Vec::new();
@@ -608,7 +701,9 @@ pub fn parse_disconnect(buf: &mut Cursor<&[u8]>) -> Result<DisconnectPacket, Pro
             0x80 => ReasonCode::UnspecifiedError,
             0x81 => ReasonCode::MalformedPacket,
             0x82 => ReasonCode::ProtocolError,
-            0x8D => ReasonCode::ServerBusy,
+            0x89 => ReasonCode::ServerBusy,
+            0x8D => ReasonCode::KeepAliveTimeout,
+            0x8E => ReasonCode::SessionTakenOver,
             _ => ReasonCode::UnspecifiedError,
         }
     } else {
@@ -678,11 +773,82 @@ pub fn encode_pingresp() -> BytesMut {
     buf
 }
 
+/// Encode a PUBACK, PUBREC, PUBREL or PUBCOMP packet. On success the reason
+/// code and properties are omitted (remaining length 2); otherwise the reason
+/// code follows the packet id and the property length is omitted (remaining
+/// length 3). MQTT 3.1.1 has no reason code: always remaining length 2.
+fn encode_publish_ack(
+    packet_type: PacketType,
+    packet_id: u16,
+    reason_code: ReasonCode,
+    version: ProtocolVersion,
+) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(5);
+    // PUBREL's fixed header flags are 0010 (MQTT 5 3.6.1)
+    let flags = if packet_type == PacketType::Pubrel {
+        0x02
+    } else {
+        0x00
+    };
+    buf.put_u8(((packet_type as u8) << 4) | flags);
+    if reason_code == ReasonCode::Success || !version.is_v5() {
+        buf.put_u8(2);
+        buf.put_u16(packet_id);
+    } else {
+        buf.put_u8(3);
+        buf.put_u16(packet_id);
+        buf.put_u8(reason_code.into());
+    }
+    buf
+}
+
+/// Encode a PUBACK packet (QoS 1)
+pub fn encode_puback(
+    packet_id: u16,
+    reason_code: ReasonCode,
+    version: ProtocolVersion,
+) -> BytesMut {
+    encode_publish_ack(PacketType::Puback, packet_id, reason_code, version)
+}
+
+/// Encode a PUBREC packet (QoS 2, step 1)
+pub fn encode_pubrec(
+    packet_id: u16,
+    reason_code: ReasonCode,
+    version: ProtocolVersion,
+) -> BytesMut {
+    encode_publish_ack(PacketType::Pubrec, packet_id, reason_code, version)
+}
+
+/// Encode a PUBREL packet (QoS 2, step 2)
+pub fn encode_pubrel(packet_id: u16) -> BytesMut {
+    encode_publish_ack(
+        PacketType::Pubrel,
+        packet_id,
+        ReasonCode::Success,
+        ProtocolVersion::V5,
+    )
+}
+
+/// Encode a PUBCOMP packet (QoS 2, step 3)
+pub fn encode_pubcomp(packet_id: u16) -> BytesMut {
+    encode_publish_ack(
+        PacketType::Pubcomp,
+        packet_id,
+        ReasonCode::Success,
+        ProtocolVersion::V5,
+    )
+}
+
 /// Try to parse a complete MQTT packet from a buffer
 ///
 /// Returns Ok(Some((packet, bytes_consumed))) if a complete packet was parsed,
-/// Ok(None) if more data is needed, or Err on protocol error.
-pub fn parse_packet(data: &[u8]) -> Result<Option<(MqttPacket, usize)>, ProtocolError> {
+/// Ok(None) if more data is needed, or Err on protocol error. `version` is
+/// the connection's (from its CONNECT); a CONNECT carries its own.
+pub fn parse_packet(
+    data: &[u8],
+    version: ProtocolVersion,
+) -> Result<Option<(MqttPacket, usize)>, ProtocolError> {
     if data.is_empty() {
         return Ok(None);
     }
@@ -714,10 +880,14 @@ pub fn parse_packet(data: &[u8]) -> Result<Option<(MqttPacket, usize)>, Protocol
 
     let packet = match PacketType::try_from(packet_type) {
         Ok(PacketType::Connect) => MqttPacket::Connect(parse_connect(&mut body_cursor)?),
-        Ok(PacketType::Publish) => MqttPacket::Publish(parse_publish(&mut body_cursor, flags)?),
-        Ok(PacketType::Subscribe) => MqttPacket::Subscribe(parse_subscribe(&mut body_cursor)?),
+        Ok(PacketType::Publish) => {
+            MqttPacket::Publish(parse_publish(&mut body_cursor, flags, version)?)
+        }
+        Ok(PacketType::Subscribe) => {
+            MqttPacket::Subscribe(parse_subscribe(&mut body_cursor, version)?)
+        }
         Ok(PacketType::Unsubscribe) => {
-            MqttPacket::Unsubscribe(parse_unsubscribe(&mut body_cursor)?)
+            MqttPacket::Unsubscribe(parse_unsubscribe(&mut body_cursor, version)?)
         }
         Ok(PacketType::Pingreq) => MqttPacket::Pingreq,
         Ok(PacketType::Disconnect) => MqttPacket::Disconnect(parse_disconnect(&mut body_cursor)?),
@@ -727,7 +897,16 @@ pub fn parse_packet(data: &[u8]) -> Result<Option<(MqttPacket, usize)>, Protocol
         }
         Ok(PacketType::Pubrec) => {
             let packet_id = read_u16(&mut body_cursor)?;
-            MqttPacket::Pubrec { packet_id }
+            // Absent reason code means Success (0x00)
+            let reason_code = if body_cursor.has_remaining() {
+                read_u8(&mut body_cursor)?
+            } else {
+                0
+            };
+            MqttPacket::Pubrec {
+                packet_id,
+                reason_code,
+            }
         }
         Ok(PacketType::Pubrel) => {
             let packet_id = read_u16(&mut body_cursor)?;
@@ -817,5 +996,136 @@ mod tests {
     fn test_pingresp_encoding() {
         let buf = encode_pingresp();
         assert_eq!(&buf[..], &[0xD0, 0x00]); // PINGRESP with zero remaining length
+    }
+
+    #[test]
+    fn test_puback_encoding() {
+        let buf = encode_puback(0x1234, ReasonCode::Success, ProtocolVersion::V5);
+        assert_eq!(&buf[..], &[0x40, 0x02, 0x12, 0x34]);
+
+        let buf = encode_puback(7, ReasonCode::PayloadFormatInvalid, ProtocolVersion::V5);
+        assert_eq!(&buf[..], &[0x40, 0x03, 0x00, 0x07, 0x99]);
+
+        // What we send parses back as a PUBACK for the same packet id
+        let (packet, consumed) = parse_packet(&buf, ProtocolVersion::V5).unwrap().unwrap();
+        assert_eq!(consumed, 5);
+        assert!(matches!(packet, MqttPacket::Puback { packet_id: 7 }));
+    }
+
+    #[test]
+    fn test_qos2_ack_encoding() {
+        assert_eq!(
+            &encode_pubrec(9, ReasonCode::Success, ProtocolVersion::V5)[..],
+            &[0x50, 0x02, 0x00, 0x09]
+        );
+        assert_eq!(&encode_pubrel(9)[..], &[0x62, 0x02, 0x00, 0x09]);
+        assert_eq!(&encode_pubcomp(9)[..], &[0x70, 0x02, 0x00, 0x09]);
+
+        // A PUBREC with an error reason parses with it
+        let buf = encode_pubrec(9, ReasonCode::PayloadFormatInvalid, ProtocolVersion::V5);
+        let (packet, _) = parse_packet(&buf, ProtocolVersion::V5).unwrap().unwrap();
+        assert!(matches!(
+            packet,
+            MqttPacket::Pubrec {
+                packet_id: 9,
+                reason_code: 0x99
+            }
+        ));
+    }
+
+    #[test]
+    fn test_v311_connect_parses_without_properties() {
+        // CONNECT, level 4, clean session + Will QoS 1, keep-alive 30,
+        // client id "c", Will topic "w", Will payload "x"
+        let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x0E, 0x00, 0x1E];
+        body.extend_from_slice(&[0x00, 0x01, b'c', 0x00, 0x01, b'w', 0x00, 0x01, b'x']);
+        let mut packet = vec![0x10, body.len() as u8];
+        packet.extend_from_slice(&body);
+        let (parsed, _) = parse_packet(&packet, ProtocolVersion::V5).unwrap().unwrap();
+        let MqttPacket::Connect(connect) = parsed else {
+            panic!("not a CONNECT");
+        };
+        assert_eq!(connect.protocol_version, 4);
+        assert_eq!(connect.client_id, "c");
+        assert_eq!(connect.will_topic.as_deref(), Some("w"));
+        assert_eq!(connect.will_payload.as_deref(), Some(&b"x"[..]));
+        assert_eq!(connect.flags.will_qos, QoS::AtLeastOnce);
+    }
+
+    #[test]
+    fn test_v311_encodings_have_no_properties_or_reasons() {
+        let v4 = ProtocolVersion::V311;
+        let connack = ConnackPacket {
+            session_present: false,
+            reason_code: ReasonCode::ClientIdentifierNotValid,
+            properties: ConnackProperties {
+                receive_maximum: Some(10),
+                ..Default::default()
+            },
+        };
+        assert_eq!(&encode_connack(&connack, v4)[..], &[0x20, 0x02, 0x00, 0x02]);
+
+        let publish = PublishPacket {
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            topic: "t".into(),
+            packet_id: Some(5),
+            properties: PublishProperties {
+                content_type: Some("x".into()),
+                ..Default::default()
+            },
+            payload: b"p".to_vec(),
+        };
+        assert_eq!(
+            &encode_publish(&publish, v4)[..],
+            &[0x32, 0x06, 0x00, 0x01, b't', 0x00, 0x05, b'p']
+        );
+        let (parsed, _) = parse_packet(&encode_publish(&publish, v4), v4)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(parsed, MqttPacket::Publish(p) if p.payload == b"p"));
+
+        assert_eq!(
+            &encode_puback(5, ReasonCode::PayloadFormatInvalid, v4)[..],
+            &[0x40, 0x02, 0x00, 0x05]
+        );
+        let suback = SubackPacket {
+            packet_id: 1,
+            properties: SubackProperties::default(),
+            reason_codes: vec![ReasonCode::GrantedQoS2, ReasonCode::TopicFilterInvalid],
+        };
+        assert_eq!(
+            &encode_suback(&suback, v4)[..],
+            &[0x90, 0x04, 0x00, 0x01, 0x02, 0x80]
+        );
+        let unsuback = UnsubackPacket {
+            packet_id: 1,
+            properties: UnsubackProperties::default(),
+            reason_codes: vec![ReasonCode::Success],
+        };
+        assert_eq!(
+            &encode_unsuback(&unsuback, v4)[..],
+            &[0xB0, 0x02, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn test_publish_properties_roundtrip() {
+        let props = PublishProperties {
+            payload_format_indicator: Some(1),
+            content_type: Some("application/json".into()),
+            correlation_data: Some(vec![0xff, 0x00, 0x33]),
+            response_topic: Some("reply/here".into()),
+            user_properties: vec![("a".into(), "2".into()), ("c".into(), "3".into())],
+            ..Default::default()
+        };
+        let decoded = decode_publish_properties(&encode_publish_properties(&props));
+        assert_eq!(decoded.payload_format_indicator, Some(1));
+        assert_eq!(decoded.content_type.as_deref(), Some("application/json"));
+        assert_eq!(decoded.correlation_data, Some(vec![0xff, 0x00, 0x33]));
+        assert_eq!(decoded.response_topic.as_deref(), Some("reply/here"));
+        assert_eq!(decoded.user_properties, props.user_properties);
+        assert_eq!(decode_publish_properties(&[]).user_properties, vec![]);
     }
 }

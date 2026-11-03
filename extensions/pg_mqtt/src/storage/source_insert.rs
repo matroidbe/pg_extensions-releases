@@ -3,9 +3,7 @@
 //! Handles inserting MQTT payloads into typed topic backing tables
 //! by decomposing JSON into table columns.
 
-use std::sync::Arc;
-
-use super::spi_bridge::{ColumnType, SpiBridge, SpiError, SpiParam};
+use super::spi_bridge::{ColumnType, SpiError, SpiParam, SpiRow};
 
 /// Source insert error
 #[derive(Debug, thiserror::Error)]
@@ -31,143 +29,89 @@ pub struct ColumnInfo {
     pub udt_name: String,
 }
 
-/// Handles inserting messages into typed topic backing tables
-pub struct MqttSourceInserter {
-    bridge: Arc<SpiBridge>,
+/// The columns of a table, in rows `columns_from_rows` reads.
+/// $1: schema, $2: table.
+pub const TABLE_COLUMNS_SQL: &str =
+    "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text,
+            udt_schema::text, udt_name::text
+     FROM information_schema.columns
+     WHERE table_schema = $1 AND table_name = $2
+     ORDER BY ordinal_position";
+
+/// Column types of TABLE_COLUMNS_SQL's rows
+pub const TABLE_COLUMNS_TYPES: [ColumnType; 6] = [ColumnType::Text; 6];
+
+/// The parameters of TABLE_COLUMNS_SQL for a (possibly schema-qualified) table
+pub fn table_columns_params(source_table: &str) -> Vec<SpiParam> {
+    let (schema, table) = parse_table_name(source_table);
+    vec![
+        SpiParam::Text(Some(schema.to_string())),
+        SpiParam::Text(Some(table.to_string())),
+    ]
 }
 
-impl MqttSourceInserter {
-    pub fn new(bridge: Arc<SpiBridge>) -> Self {
-        Self { bridge }
-    }
+/// Read TABLE_COLUMNS_SQL's rows
+pub fn columns_from_rows(rows: &[SpiRow]) -> Vec<ColumnInfo> {
+    rows.iter()
+        .map(|row| ColumnInfo {
+            name: row.get_string(0).unwrap_or_default(),
+            data_type: row.get_string(1).unwrap_or_default(),
+            is_nullable: row.get_string(2).map(|s| s == "YES").unwrap_or(true),
+            column_default: row.get_string(3),
+            udt_schema: row.get_string(4).unwrap_or_default(),
+            udt_name: row.get_string(5).unwrap_or_default(),
+        })
+        .collect()
+}
 
-    /// Get column information for a source table
-    pub async fn get_table_columns(
-        &self,
-        source_table: &str,
-    ) -> Result<Vec<ColumnInfo>, SourceInsertError> {
-        let (schema, table) = parse_table_name(source_table);
+/// The INSERT that stores a JSON message in a typed topic's backing table:
+/// each top-level key becomes the column of the same name.
+pub fn build_insert(
+    source_table: &str,
+    columns: &[ColumnInfo],
+    json_value: &serde_json::Value,
+) -> Result<(String, Vec<SpiParam>), SourceInsertError> {
+    let json_obj = json_value
+        .as_object()
+        .ok_or_else(|| SourceInsertError::JsonParse("payload must be a JSON object".to_string()))?;
 
-        let result = self
-            .bridge
-            .query(
-                "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text,
-                        udt_schema::text, udt_name::text
-                 FROM information_schema.columns
-                 WHERE table_schema = $1 AND table_name = $2
-                 ORDER BY ordinal_position",
-                vec![
-                    SpiParam::Text(Some(schema.to_string())),
-                    SpiParam::Text(Some(table.to_string())),
-                ],
-                vec![
-                    ColumnType::Text,
-                    ColumnType::Text,
-                    ColumnType::Text,
-                    ColumnType::Text,
-                    ColumnType::Text,
-                    ColumnType::Text,
-                ],
-            )
-            .await?;
+    let mut insert_columns = Vec::new();
+    let mut insert_values = Vec::new();
+    let mut params = Vec::new();
 
-        let columns = result
-            .rows
-            .iter()
-            .map(|row| ColumnInfo {
-                name: row.get_string(0).unwrap_or_default(),
-                data_type: row.get_string(1).unwrap_or_default(),
-                is_nullable: row.get_string(2).map(|s| s == "YES").unwrap_or(true),
-                column_default: row.get_string(3),
-                udt_schema: row.get_string(4).unwrap_or_default(),
-                udt_name: row.get_string(5).unwrap_or_default(),
-            })
-            .collect();
-
-        Ok(columns)
-    }
-
-    /// Insert a JSON message into a typed topic's backing table
-    ///
-    /// Decomposes the JSON object into columns and executes a dynamic INSERT.
-    /// Returns the generated id.
-    pub async fn insert_message(
-        &self,
-        source_table: &str,
-        json_value: &serde_json::Value,
-    ) -> Result<i64, SourceInsertError> {
-        let columns = self.get_table_columns(source_table).await?;
-
-        let json_obj = json_value.as_object().ok_or_else(|| {
-            SourceInsertError::JsonParse("payload must be a JSON object".to_string())
-        })?;
-
-        let mut insert_columns = Vec::new();
-        let mut insert_values = Vec::new();
-        let mut params = Vec::new();
-        let mut param_idx = 1;
-
-        for col in &columns {
-            // Skip auto-increment columns (serial/bigserial)
-            if col
-                .column_default
-                .as_ref()
-                .map(|d| d.contains("nextval"))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            if let Some(val) = json_obj.get(&col.name) {
-                insert_columns.push(col.name.clone());
-                insert_values.push(typed_placeholder(param_idx, Some(col)));
-                params.push(json_value_to_spi_param(val, &col.data_type));
-                param_idx += 1;
-            } else if !col.is_nullable && col.column_default.is_none() {
-                return Err(SourceInsertError::MissingColumn(col.name.clone()));
-            }
+    for col in columns {
+        // Skip auto-increment columns (serial/bigserial)
+        if col
+            .column_default
+            .as_ref()
+            .map(|d| d.contains("nextval"))
+            .unwrap_or(false)
+        {
+            continue;
         }
 
-        if insert_columns.is_empty() {
-            return Err(SourceInsertError::JsonParse(
-                "no matching columns found in JSON".to_string(),
-            ));
-        }
-
-        // Check if the table has an 'id' column to use RETURNING
-        let has_id = columns.iter().any(|c| c.name == "id");
-
-        let query = if has_id {
-            format!(
-                "INSERT INTO {} ({}) VALUES ({}) RETURNING id",
-                source_table,
-                insert_columns.join(", "),
-                insert_values.join(", ")
-            )
-        } else {
-            format!(
-                "INSERT INTO {} ({}) VALUES ({})",
-                source_table,
-                insert_columns.join(", "),
-                insert_values.join(", ")
-            )
-        };
-
-        if has_id {
-            let result = self
-                .bridge
-                .query(&query, params, vec![ColumnType::Int64])
-                .await?;
-
-            result
-                .first()
-                .and_then(|r| r.get_i64(0).ok())
-                .ok_or(SourceInsertError::Spi(SpiError::NoRows))
-        } else {
-            self.bridge.query(&query, params, vec![]).await?;
-            Ok(0) // No id to return for tables without 'id' column
+        if let Some(val) = json_obj.get(&col.name) {
+            insert_columns.push(quote_ident(&col.name));
+            insert_values.push(typed_placeholder(params.len() + 1, Some(col)));
+            params.push(json_value_to_spi_param(val, &col.data_type));
+        } else if !col.is_nullable && col.column_default.is_none() {
+            return Err(SourceInsertError::MissingColumn(col.name.clone()));
         }
     }
+
+    if insert_columns.is_empty() {
+        return Err(SourceInsertError::JsonParse(
+            "no matching columns found in JSON".to_string(),
+        ));
+    }
+
+    let query = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        source_table,
+        insert_columns.join(", "),
+        insert_values.join(", ")
+    );
+    Ok((query, params))
 }
 
 /// Parse a table name into (schema, table)
@@ -338,6 +282,30 @@ mod tests {
     fn test_typed_placeholder_without_type_info() {
         assert_eq!(typed_placeholder(4, None), "$4");
         assert_eq!(typed_placeholder(5, Some(&col("x", "", ""))), "$5");
+    }
+
+    #[test]
+    fn test_build_insert() {
+        let mut id = col("id", "pg_catalog", "int8");
+        id.column_default = Some("nextval('t_id_seq'::regclass)".into());
+        let mut required = col("v", "pg_catalog", "float8");
+        required.is_nullable = false;
+        let columns = [id, required, col("note", "pg_catalog", "text")];
+
+        let (sql, params) =
+            build_insert("public.t", &columns, &json!({"v": 1.5, "other": 1})).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO public.t (\"v\") VALUES ($1::\"pg_catalog\".\"float8\")"
+        );
+        assert_eq!(params.len(), 1);
+
+        // A required column missing from the JSON
+        assert!(matches!(
+            build_insert("public.t", &columns, &json!({"note": "x"})),
+            Err(SourceInsertError::MissingColumn(c)) if c == "v"
+        ));
+        assert!(build_insert("public.t", &columns, &json!([1])).is_err());
     }
 
     #[test]

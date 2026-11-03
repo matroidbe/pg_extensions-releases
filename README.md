@@ -16,7 +16,7 @@ Self-contained tools — no dependencies on other pg_extensions, useful in any c
 | Extension | Description |
 |-----------|-------------|
 | [pg_kafka](extensions/pg_kafka/) | Kafka protocol server backed by PostgreSQL tables |
-| [pg_mqtt](extensions/pg_mqtt/) | MQTT 5.0 broker backed by PostgreSQL tables |
+| [pg_mqtt](extensions/pg_mqtt/) | MQTT 5.0 and 3.1.1 broker backed by PostgreSQL tables |
 | [pg_delta](extensions/pg_delta/) | Bidirectional streaming between PostgreSQL and Delta Lake |
 | [pg_s3](extensions/pg_s3/) | S3-compatible object storage with metadata in Postgres, binary on disk |
 | [pg_streaming](extensions/pg_streaming/) | Declarative stream-processing engine — sources, transforms, and sinks inside PostgreSQL |

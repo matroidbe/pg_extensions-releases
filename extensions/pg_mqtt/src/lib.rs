@@ -52,6 +52,8 @@ const DEFAULT_PORT: i32 = 1883;
 
 static PG_MQTT_PORT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(DEFAULT_PORT);
 static PG_MQTT_WORKER_COUNT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(4);
+static PG_MQTT_MAX_QUEUED_MESSAGES: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(crate::protocol::client_queue::DEFAULT_MAX_QUEUED as i32);
 static PG_MQTT_DATABASE: pgrx::GucSetting<Option<std::ffi::CString>> =
     pgrx::GucSetting::<Option<std::ffi::CString>>::new(None);
 
@@ -81,6 +83,9 @@ extension_sql!(
         topic_filter TEXT NOT NULL,
         qos SMALLINT DEFAULT 0,
         created_at TIMESTAMPTZ DEFAULT NOW(),
+        -- 0.4.4 columns come last: an upgrade can only append them
+        retain_as_published BOOLEAN NOT NULL DEFAULT false,
+        no_local BOOLEAN NOT NULL DEFAULT false,
         UNIQUE(client_id, topic_filter)
     );
 
@@ -98,7 +103,9 @@ extension_sql!(
     CREATE TABLE IF NOT EXISTS retained (
         topic TEXT PRIMARY KEY,
         payload BYTEA,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        qos SMALLINT NOT NULL DEFAULT 0,
+        properties BYTEA
     );
 
     -- Schema registry (for typed topics)
@@ -134,7 +141,11 @@ extension_sql!(
         topic TEXT NOT NULL,
         payload BYTEA,
         origin_worker INT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        qos SMALLINT NOT NULL DEFAULT 0,
+        retain BOOLEAN NOT NULL DEFAULT false,
+        properties BYTEA,
+        origin_client TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_outbox_xid ON outbox(xid);
     "#,
@@ -187,6 +198,17 @@ pub extern "C-unwind" fn _PG_init() {
         1,
         32,
         pgrx::GucContext::Sighup, // Use Sighup so extension can be loaded dynamically for tests
+        pgrx::GucFlags::default(),
+    );
+
+    pgrx::GucRegistry::define_int_guc(
+        c"pg_mqtt.max_queued_messages",
+        c"Messages one subscriber may have waiting",
+        c"A subscriber that falls this far behind loses its oldest QoS 0 messages; one whose queue is full of QoS 1 and 2 messages is disconnected (0x97 Quota exceeded) instead of losing them. Read when the workers start.",
+        &PG_MQTT_MAX_QUEUED_MESSAGES,
+        10,
+        10_000_000,
+        pgrx::GucContext::Sighup,
         pgrx::GucFlags::default(),
     );
 
@@ -271,7 +293,8 @@ pub extern "C-unwind" fn pg_mqtt_worker_main(arg: pg_sys::Datum) {
 
     // Run server with SPI bridge polling loop
     let worker_count = PG_MQTT_WORKER_COUNT.get();
-    match crate::server::run_server(DEFAULT_HOST, port, worker_id, worker_count) {
+    let max_queued = PG_MQTT_MAX_QUEUED_MESSAGES.get() as usize;
+    match crate::server::run_server(DEFAULT_HOST, port, worker_id, worker_count, max_queued) {
         // SIGTERM, or disabled by a reload
         Ok(()) => {
             pgrx::log!("pg_mqtt worker {}: shutting down", worker_id);
@@ -1014,7 +1037,16 @@ mod tests {
         let polled = execute_query_in_transaction(
             crate::server::fanout::POLL_SQL,
             &[SpiParam::Text(None), SpiParam::Int4(Some(0))],
-            &[ColumnType::Text, ColumnType::Text, ColumnType::Bytea],
+            &[
+                ColumnType::Text,
+                ColumnType::Text,
+                ColumnType::Bytea,
+                ColumnType::Int32,
+                ColumnType::Bool,
+                ColumnType::Bytea,
+                ColumnType::Text,
+                ColumnType::Int64,
+            ],
         )
         .unwrap();
         assert_eq!(polled.rows.len(), 1, "the horizon row");
@@ -1030,6 +1062,10 @@ mod tests {
                 SpiParam::Text(Some("idle/xid".into())),
                 SpiParam::Bytea(Some(b"x".to_vec())),
                 SpiParam::Int4(Some(0)),
+                SpiParam::Int4(Some(1)),
+                SpiParam::Bool(Some(false)),
+                SpiParam::Bytea(None),
+                SpiParam::Text(Some("publisher".into())),
             ],
             &[],
         )

@@ -432,6 +432,30 @@ mod tests {
         Spi::run("SELECT pgcurrency.get_rate('USD', 'EUR', '2026-01-15')").unwrap();
     }
 
+    /// The base currency's rate is always 1; a stored row would be silently
+    /// ignored, so set_rate refuses it (#183).
+    #[pg_test]
+    #[should_panic(expected = "'USD' is the base currency")]
+    fn test_set_rate_on_base_currency_errors() {
+        seed();
+        Spi::run("SELECT pgcurrency.set_rate('usd', 1.08, '2026-01-01')").unwrap();
+    }
+
+    /// The check follows the pgcurrency.base_currency GUC, so rates published
+    /// against EUR (ECB) load as-is once the base is EUR.
+    #[pg_test]
+    fn test_set_rate_follows_configured_base() {
+        seed();
+        Spi::run("SET LOCAL pgcurrency.base_currency = 'EUR'").unwrap();
+        Spi::run("SELECT pgcurrency.set_rate('USD', 1.08, '2026-01-01')").unwrap();
+        let usd: String = Spi::get_one(
+            "SELECT pgcurrency.convert(100, 'EUR', 'USD', '2026-06-01', NULL, true)::text",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(usd, "108.00");
+    }
+
     // =========================================================================
     // Phase 2: Conversion
     // =========================================================================
