@@ -135,17 +135,17 @@ pub fn clear_cache() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
     /// The key cache is process-global and the test harness runs tests on
     /// parallel threads, so one test's `clear_cache()` could empty the cache
     /// between another's update and its assertions. Every test holds this
-    /// lock for its whole body.
+    /// lock for its whole body — the jwt module's tests too.
     static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
-    fn exclusive_cache() -> MutexGuard<'static, ()> {
+    pub(crate) fn exclusive_cache() -> MutexGuard<'static, ()> {
         let guard = CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_cache();
         guard

@@ -78,11 +78,11 @@ mod tests {
     }
 
     /// Helper: load the test public key into the JWKS cache
-    fn setup_cache() {
+    fn setup_cache() -> std::sync::MutexGuard<'static, ()> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         use simple_asn1::{from_der, ASN1Block};
 
-        crate::jwks::clear_cache();
+        let guard = crate::jwks::tests::exclusive_cache();
 
         // Parse RSA public key PEM to extract n and e components
         let pem_str = std::str::from_utf8(TEST_PUBLIC_KEY).unwrap();
@@ -141,6 +141,7 @@ mod tests {
         });
 
         crate::jwks::update_cache_from_json(&jwks_json.to_string()).unwrap();
+        guard
     }
 
     fn now_secs() -> u64 {
@@ -152,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_decode_valid_rs256_token() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -181,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_decode_expired_token_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -198,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_decode_wrong_issuer_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -215,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_decode_correct_issuer_succeeds() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_decode_wrong_audience_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -248,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_decode_missing_kid_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_decode_unknown_kid_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",
@@ -290,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_decode_tampered_token_fails() {
-        setup_cache();
+        let _cache = setup_cache();
 
         let claims = json!({
             "sub": "alice",

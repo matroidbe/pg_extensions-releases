@@ -5,6 +5,7 @@ pub mod claims;
 pub mod ffi;
 pub mod jwks;
 pub mod jwt;
+pub mod rs256;
 pub mod validator;
 
 pgrx::pg_module_magic!();
@@ -180,6 +181,39 @@ fn oauth_refresh_jwks() -> bool {
     }
 }
 
+/// Generate an RS256 signing key: `{"private_pem": <PKCS#8 PEM>, "jwk": <public JWK>}`.
+/// The JWK's `kid` is its RFC 7638 SHA-256 thumbprint. The extension keeps no
+/// copy of the key; store `private_pem` somewhere only its owner can read.
+#[pg_extern(volatile)]
+fn jwt_rsa_generate(bits: default!(i32, 2048)) -> pgrx::JsonB {
+    let bits = usize::try_from(bits).unwrap_or(0);
+    match rs256::generate(bits) {
+        Ok(g) => pgrx::JsonB(serde_json::json!({
+            "private_pem": g.private_pem,
+            "jwk": g.jwk,
+        })),
+        Err(e) => pgrx::error!("jwt_rsa_generate: {}", e),
+    }
+}
+
+/// Sign `claims` as a compact RS256 JWS with header
+/// `{"alg":"RS256","typ":"JWT","kid":<kid>}`.
+#[pg_extern(immutable, parallel_safe)]
+fn jwt_sign_rs256(private_pem: &str, kid: &str, claims: pgrx::JsonB) -> String {
+    match rs256::sign(private_pem, kid, &claims.0) {
+        Ok(token) => token,
+        Err(e) => pgrx::error!("jwt_sign_rs256: {}", e),
+    }
+}
+
+/// True only if `token`'s header alg is RS256 and its signature verifies
+/// against the RSA public key in `jwk`. Signature only: no exp/iss/aud checks.
+/// Malformed input returns false rather than raising.
+#[pg_extern(immutable, parallel_safe)]
+fn jwt_verify_rs256(jwk: pgrx::JsonB, token: &str) -> bool {
+    rs256::verify(&jwk.0, token)
+}
+
 /// Return extension documentation.
 #[pg_extern]
 fn oauth_docs() -> &'static str {
@@ -214,5 +248,98 @@ mod tests {
         let obj = json.0.as_object().unwrap();
         assert!(obj.contains_key("cached_keys"));
         assert!(obj.contains_key("cache_age_seconds"));
+    }
+
+    fn generate() -> serde_json::Value {
+        Spi::get_one::<pgrx::JsonB>("SELECT eidos_oauth.jwt_rsa_generate()")
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    fn sign(key: &serde_json::Value, claims: &str) -> String {
+        Spi::get_one_with_args::<String>(
+            "SELECT eidos_oauth.jwt_sign_rs256($1, $2, $3::jsonb)",
+            &[
+                key["private_pem"].as_str().unwrap().into(),
+                key["jwk"]["kid"].as_str().unwrap().into(),
+                claims.into(),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn verify(jwk: &serde_json::Value, token: &str) -> bool {
+        Spi::get_one_with_args::<bool>(
+            "SELECT eidos_oauth.jwt_verify_rs256($1, $2)",
+            &[pgrx::JsonB(jwk.clone()).into(), token.into()],
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[pg_test]
+    fn test_jwt_rs256_round_trip_in_sql() {
+        let key = generate();
+        assert!(key["private_pem"]
+            .as_str()
+            .unwrap()
+            .starts_with("-----BEGIN PRIVATE KEY-----"));
+        let kid = key["jwk"]["kid"].as_str().unwrap();
+        assert_eq!(
+            kid,
+            crate::rs256::thumbprint(
+                key["jwk"]["n"].as_str().unwrap(),
+                key["jwk"]["e"].as_str().unwrap()
+            )
+        );
+        let token = sign(&key, r#"{"sub": "alice", "n": 1}"#);
+        assert!(verify(&key["jwk"], &token));
+
+        let other = generate();
+        assert!(!verify(&other["jwk"], &token));
+        assert!(!verify(&key["jwk"], "garbage"));
+        assert!(!verify(&serde_json::json!({"kty": "RSA"}), &token));
+    }
+
+    #[pg_test]
+    fn test_jwt_sign_and_verify_in_one_statement() {
+        let ok = Spi::get_one::<bool>(
+            "WITH k AS (SELECT eidos_oauth.jwt_rsa_generate(2048) AS k) \
+             SELECT eidos_oauth.jwt_verify_rs256(k->'jwk', \
+                    eidos_oauth.jwt_sign_rs256(k->>'private_pem', k->'jwk'->>'kid', \
+                                               '{\"sub\":\"bob\"}')) FROM k",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ok);
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "between 2048 and 4096")]
+    fn test_jwt_rsa_generate_refuses_1024_bits() {
+        let _ = Spi::get_one::<pgrx::JsonB>("SELECT eidos_oauth.jwt_rsa_generate(1024)");
+    }
+
+    #[pg_test]
+    #[should_panic(expected = "invalid RSA private key")]
+    fn test_jwt_sign_rs256_refuses_a_bad_key() {
+        let _ =
+            Spi::get_one::<String>("SELECT eidos_oauth.jwt_sign_rs256('nope', 'k', '{}'::jsonb)");
+    }
+
+    #[pg_test]
+    fn test_jwt_functions_volatility_and_strictness() {
+        let rows = Spi::get_one::<String>(
+            "SELECT string_agg(proname || ':' || provolatile::text || ':' || proisstrict::text || ':' || proparallel::text, ',' ORDER BY proname) \
+             FROM pg_proc WHERE pronamespace = 'eidos_oauth'::regnamespace AND proname LIKE 'jwt\\_%'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rows,
+            "jwt_rsa_generate:v:true:u,jwt_sign_rs256:i:true:s,jwt_verify_rs256:i:true:s"
+        );
     }
 }

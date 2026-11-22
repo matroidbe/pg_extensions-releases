@@ -6,6 +6,22 @@ snapshot of the whole repo; each extension also carries its own version in its
 
 ## Unreleased
 
+## v0.7.6 — 2026-11-22
+
+Extension versions: eidos_oauth 0.4.0. Its upgrade script adds three functions.
+
+**eidos_oauth signs tokens (0.4.0).** Three new functions let a database mint
+RS256 access tokens that other resource servers verify from a published JWKS
+(matroidbe/eidos#322). `jwt_rsa_generate(bits)` returns a PKCS#8 PEM private
+key and its public JWK, whose `kid` is the RFC 7638 thumbprint.
+`jwt_sign_rs256(private_pem, kid, claims)` returns a compact JWS.
+`jwt_verify_rs256(jwk, token)` checks the signature only and returns false,
+never an error, for anything other than a valid RS256 signature (`alg: none`
+and `HS256` included). The extension keeps no key: the caller passes it in.
+Signing uses ring, whose private-key operation is constant-time. The upgrade
+script adds the three functions. eidos_oauth's tests now run in CI, and its
+JWT tests no longer race the JWKS cache tests.
+
 ## v0.7.5 — 2026-11-03
 
 Extension versions: pg_mqtt 0.4.4, pg_image 0.3.1, pg_git 0.3.5,
